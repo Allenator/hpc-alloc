@@ -13,12 +13,22 @@ all="$*"
 case "$all" in
   *"-O exit"*) exit 0 ;;
   *"-O check"*)
-    if [ "$mode" = down ]; then echo "no master" >&2; exit 255; fi
+    case "$mode" in
+      down) echo "no master" >&2; exit 255 ;;
+      duo) [ -f "${HPCTEST_MARK:?}" ] && exit 0 || exit 1 ;;
+    esac
     exit 0 ;;
 esac
 
 if [ "$mode" = down ]; then
   echo "ssh: Could not resolve hostname bouchet.ycrc.yale.edu" >&2
+  exit 255
+fi
+
+# duo: auth fails until an SSH_ASKPASS attempt "approves" (creates the marker)
+if [ "$mode" = duo ] && [ ! -f "${HPCTEST_MARK:?}" ]; then
+  if [ -n "${SSH_ASKPASS:-}" ]; then touch "$HPCTEST_MARK"; exit 0; fi
+  echo "ab1234@bouchet.ycrc.yale.edu: Permission denied (keyboard-interactive)." >&2
   exit 255
 fi
 

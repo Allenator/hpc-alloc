@@ -191,6 +191,17 @@ mkstate '"r806u23n04"'
 hpc expiring status --json > "$work/out" 2>&1
 contains "expiring_soon flag" '"expiring_soon": true' "$work/out"
 
+echo "== scenario: Duo push auth (connect --push) =="
+mkstate null
+rm -f "$work/duo.mark"
+HPCTEST_MARK="$work/duo.mark" hpc duo connect > "$work/out" 2>&1
+check "without --push: exit 3" 3 $?
+rm -f "$work/duo.mark"
+HPCTEST_MARK="$work/duo.mark" hpc duo connect --push > "$work/out" 2>&1
+check "with --push: exit" 0 $?
+contains "push approved" "Duo approved" "$work/out"
+contains "master established" "login OK" "$work/out"
+
 echo "== scenario: avail digest =="
 mkstate null
 hpc running avail > "$work/out" 2>&1; check "avail exit" 0 $?

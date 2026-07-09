@@ -442,6 +442,32 @@ def try_login(cluster, interactive=None):
     return False
 
 
+def push_login(cluster, timeout=90):
+    """Authenticate without any terminal: an SSH_ASKPASS helper answers "1"
+    (Duo's push option) to the keyboard-interactive prompt, moving the second
+    factor entirely to the user's phone. No secret ever passes through here."""
+    alias = login_alias(cluster)
+    helper = CONFIG_DIR / "askpass-push.sh"
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    helper.write_text("#!/bin/sh\necho 1\n")
+    helper.chmod(0o755)
+    env = {**os.environ,
+           "SSH_ASKPASS": str(helper),
+           "SSH_ASKPASS_REQUIRE": "force",
+           "DISPLAY": os.environ.get("DISPLAY", ":0")}
+    info(f"requesting Duo push for {alias} — approve it on your phone...")
+    try:
+        r = subprocess.run(["ssh", "-o", "ConnectTimeout=30", "--", alias, "true"],
+                           env=env, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        die("Duo push not approved in time — try again with `hpc-alloc connect --push`",
+            code=EXIT_CONNLOST)
+    if r.returncode != 0:
+        die(f"push authentication failed: {r.stderr.strip() or 'denied'}", code=EXIT_CONNLOST)
+    _verified.add(cluster)
+    info("Duo approved — connection established")
+
+
 def ensure_login(cluster):
     if try_login(cluster):
         return
@@ -1199,6 +1225,8 @@ def cmd_connect(args):
     if args.reset:
         heal_connections(state, cluster)
         info("closed login and compute-node master connections; swept dead sockets")
+    if args.push and not try_login(cluster, interactive=False):
+        push_login(cluster)
     ensure_login(cluster)
     r = login_run(cluster, "hostname")
     info(f"login OK: {r.stdout.strip()} (multiplexed — no Duo again for ~4h of idle)")
@@ -1512,6 +1540,8 @@ def main():
     cn = sub.add_parser("connect", help="(re)establish and health-check connections; Duo happens here")
     cn.add_argument("--cluster", help=f"cluster name (default: {DEFAULT_CLUSTER})")
     cn.add_argument("--reset", action="store_true", help="tear down all masters and dead sockets first")
+    cn.add_argument("--push", action="store_true",
+                    help="authenticate via Duo push (no terminal needed — approve on your phone)")
     cn.set_defaults(func=cmd_connect)
 
     pt = sub.add_parser("partitions", help="list partitions with limits, GRES, and feature tags (sinfo)")

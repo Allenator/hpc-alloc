@@ -7,7 +7,7 @@ description: Allocate and use Yale YCRC compute nodes (Bouchet) for development 
 
 `hpc-alloc` allocates a Bouchet compute node by submitting a sleeper batch job (`sbatch --wrap 'sleep infinity'`) — this works on **every** partition, unlike `salloc`, which public clusters only allow on `devel`/`gpu_devel`. Once the job starts, the CLI writes an SSH alias (e.g. `bouchet-dev`) that ProxyJumps through the login node to the compute node. Both connections are multiplexed: Duo MFA is prompted at most once per ~4h, and repeated `hpc-alloc ssh <name> -- CMD` calls are near-instant (no per-command handshake), so prefer many small commands over one giant script.
 
-**Exit code 3 means the connection to the cluster was lost and re-auth needs a human**: do not retry — tell the user to check the VPN and run `hpc-alloc connect` in their terminal (Duo prompt), then resume where you left off. Jobs and allocations survive connection drops; state is never lost to a network blip.
+**Exit code 3 means the connection to the cluster was lost and re-auth needs the human's second factor**: do not blind-retry. Either tell the user to run `hpc-alloc connect` in their terminal, or — after telling them to expect a Duo push on their phone — run `hpc-alloc connect --push` yourself and let them approve it. Never send pushes repeatedly without the user's awareness (push fatigue). Jobs and allocations survive connection drops; state is never lost to a network blip.
 
 ## Prerequisites
 
@@ -30,7 +30,7 @@ description: Allocate and use Yale YCRC compute nodes (Bouchet) for development 
 | `hpc-alloc cancel JOBID` | Cancel an hpc-alloc job by id (refuses jobs it didn't create). |
 | `hpc-alloc down [name\|--all]` | Cancel allocation(s) and remove SSH aliases. |
 | `hpc-alloc partitions [--json]` | Partition list with limits, GPU GRES names, and `-C` feature tags. |
-| `hpc-alloc connect [--reset]` | (Re)establish + health-check all connections; Duo prompt happens here. User-run only. |
+| `hpc-alloc connect [--reset] [--push]` | (Re)establish + health-check all connections. `--push` authenticates via Duo push — agent-runnable: tell the user to approve on their phone. Without `--push`, user-run only (terminal Duo prompt). |
 
 For rare queries with no subcommand, run raw Slurm commands over the login alias: `ssh bouchet-login -- 'sinfo ...'`.
 
@@ -77,4 +77,4 @@ YCRC monitors GPU jobs and **cancels ones whose GPUs sit idle** (warning email a
 - Never call `scancel` directly — use `hpc-alloc cancel JOBID` / `hpc-alloc down NAME`, which refuse jobs hpc-alloc didn't create.
 - Walltime is a hard deadline and cannot be extended — sync results out before it hits (`status` flags `expiring_soon`).
 - Cluster `scratch` storage purges files after 60 days; keep anything important in `project` or home.
-- On exit code 3: stop, ask the user to run `hpc-alloc connect`, then resume. On a stuck or dead job: `hpc-alloc why` first, then act on its diagnosis.
+- On exit code 3: stop; either ask the user to run `hpc-alloc connect`, or announce and run `hpc-alloc connect --push` (they approve on their phone), then resume. On a stuck or dead job: `hpc-alloc why` first, then act on its diagnosis.
