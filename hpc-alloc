@@ -75,9 +75,11 @@ hpc-alloc's sbatch-sleeper mechanism works on all of them):
   bigmem       max 1 day; up to 8TB/user
   devel        max 6h; 4 CPUs/user        gpu_devel  max 6h; 2 GPUs/user
   scavenge / scavenge_gpu   preemptable; max 1 day
-GPU syntax: --gpus TYPE:N (e.g. h200:1, rtx_5000_ada:2). Check free capacity
-with `hpc-alloc avail`; exact GRES names with `hpc-alloc partitions`.
-Default memory is 5120MB/CPU.
+GPU syntax: --gpus TYPE:N. GRES names (verified on Bouchet): h200, b200,
+rtx_5000_ada, rtx_pro_6000_blackwell, l40s. Check free capacity with
+`hpc-alloc avail`; live GRES names with `hpc-alloc partitions`.
+Default memory is 5120MB/CPU. Note: sinfo shows 'infinite' time limits for
+QoS-limited partitions; the caps above come from YCRC policy/QoS.
 
 YCRC cancels jobs whose GPUs sit idle (warning email at ~30 min). GPU allocations
 self-release after 30 idle minutes by default (--idle-timeout, 0 to disable);
@@ -329,6 +331,21 @@ def ensure_include():
 # ------------------------------------------------------------- ssh plumbing
 
 _verified = set()  # clusters whose login connection was probed OK this run
+_last_probe = None  # result of the most recent fresh probe ('ok'|'auth'|'net')
+
+
+def can_prompt():
+    """Whether interactive auth (Duo) can reach the user. ssh prompts via
+    /dev/tty, not stdin — so a shell with piped stdin but a controlling
+    terminal (e.g. Claude Code's `!` commands) can still authenticate."""
+    if sys.stdin.isatty():
+        return True
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR)
+        os.close(fd)
+        return True
+    except OSError:
+        return False
 
 
 def master_alive(cluster):
@@ -399,10 +416,11 @@ def probe(alias, timeout=15):
 
 def try_login(cluster, interactive=None):
     """Establish/verify the login master. Returns bool; never exits."""
+    global _last_probe
     if cluster in _verified:
         return True
     if interactive is None:
-        interactive = sys.stdin.isatty()
+        interactive = can_prompt()
     alias = login_alias(cluster)
     if master_alive(cluster):
         if probe(alias) == "ok":
@@ -411,11 +429,12 @@ def try_login(cluster, interactive=None):
         info(f"connection to {alias} is stale (VPN drop or sleep?) — resetting")
         heal_connections(load_state(), cluster)
     st = probe(alias)  # fresh attempt; succeeds if no interactive auth needed
+    _last_probe = st
     if st == "ok":
         _verified.add(cluster)
         return True
     if st == "auth" and interactive:
-        info(f"connecting to {alias} (you may get a Duo MFA prompt)...")
+        info(f"connecting to {alias} (answer the Duo prompt in your terminal)...")
         r = subprocess.run(["ssh", "-o", "ConnectTimeout=30", "--", alias, "true"])
         if r.returncode == 0:
             _verified.add(cluster)
@@ -426,15 +445,19 @@ def try_login(cluster, interactive=None):
 def ensure_login(cluster):
     if try_login(cluster):
         return
-    if not sys.stdin.isatty():
-        die(f"cannot reach {login_alias(cluster)} and cannot answer a Duo prompt here.\n"
-            "  Run `hpc-alloc connect` in a terminal, then retry.", code=EXIT_CONNLOST)
-    die(
-        f"could not connect to {login_alias(cluster)}. Check that:\n"
-        "  - the Yale VPN is connected\n"
-        f"  - your SSH public key is uploaded at {KEY_UPLOADER} (takes a few minutes to propagate)\n"
-        "  - your NetID in `hpc-alloc setup` is correct", code=EXIT_CONNLOST,
-    )
+    if _last_probe == "auth":
+        if not can_prompt():
+            die(f"{login_alias(cluster)} is reachable but needs interactive (Duo) auth.\n"
+                "  Run `hpc-alloc connect` in a terminal, then retry.", code=EXIT_CONNLOST)
+        die("authentication failed. Check that:\n"
+            f"  - the right public key is uploaded at {KEY_UPLOADER} "
+            f"(pinned: {cfg('ssh', 'identity_file') or 'none — ssh default order'})\n"
+            "  - the Duo prompt was approved\n"
+            "  - the NetID is correct (see `hpc-alloc config` and the managed ssh_config)",
+            code=EXIT_CONNLOST)
+    die(f"cannot reach {login_alias(cluster)} — is the Yale VPN connected?\n"
+        "  (verify host/NetID via `hpc-alloc config` and ~/.config/hpc-alloc/ssh_config)",
+        code=EXIT_CONNLOST)
 
 
 def login_run(cluster, remote_cmd, check=True, timeout=60, _retry=True):
@@ -744,7 +767,7 @@ def wait_for_running(alloc, timeout):
                 live = squeue_query(cluster, [jobid])
             except ConnectionLost as e:
                 info(f"connection lost while waiting ({e}) — job {jobid} stays queued regardless")
-                if not sys.stdin.isatty():
+                if not can_prompt():
                     die("reconnect (VPN, then `hpc-alloc connect`), then run `hpc-alloc status` "
                         "to finish SSH setup", code=EXIT_CONNLOST)
                 if not wait_reconnect(cluster):
@@ -964,8 +987,9 @@ def cmd_ssh(args):
     check_node_reachable(state, alloc)
     alias = alloc_alias(alloc)
     if command:
-        cmd = " ".join(shlex.quote(c) for c in command)
-        os.execvp("ssh", ["ssh", "-o", "BatchMode=yes", "--", alias, cmd])
+        # Space-join like ssh itself: the remote shell interprets the result,
+        # so `hpc-alloc ssh dev -- 'cd proj && make'` works as written.
+        os.execvp("ssh", ["ssh", "-o", "BatchMode=yes", "--", alias, " ".join(command)])
     os.execvp("ssh", ["ssh", "--", alias])
 
 
@@ -983,7 +1007,7 @@ def cmd_sync(args):
         src, dst = f"{alias}:{src}", dst
     else:
         src, dst = src, f"{alias}:{dst}"
-    rsync = ["rsync", "-az", "--info=stats1", "-e", "ssh"]
+    rsync = ["rsync", "-az", "-e", "ssh"]  # no --info/--stats: macOS ships openrsync
     if args.delete:
         rsync.append("--delete")
     rsync += [src, dst]
@@ -1049,7 +1073,7 @@ def stream_job(cluster, jobid, logpath):
                 live = squeue_query(cluster, [jobid])
             except ConnectionLost as e:
                 info(f"connection lost ({e}) — job {jobid} keeps running; log: ~/{logpath}")
-                if not sys.stdin.isatty():
+                if not can_prompt():
                     die(f"reconnect, then reattach with `hpc-alloc logs {jobid} -f`",
                         code=EXIT_CONNLOST)
                 if not wait_reconnect(cluster):
@@ -1364,12 +1388,13 @@ def cmd_why(args):
                 result["diagnosis"] = ("exited normally (for a GPU allocation this can be the "
                                        "idle watchdog self-releasing — check the log)")
             else:
-                result["diagnosis"] = f"{jstate} (exit {exitcode})"
+                result["diagnosis"] = f"{jstate} (exit {exitcode.split(':')[0]})"
             r = login_run(cluster,
                           f"tail -n 15 {REMOTE_LOG_DIR}/run-{jobid}.log "
                           f"{REMOTE_LOG_DIR}/{jobid}.log 2>/dev/null || true", check=False)
-            if r.stdout.strip():
-                detail += ["--- log tail ---"] + r.stdout.strip().splitlines()[-15:]
+            tail = [l for l in r.stdout.strip().splitlines() if not l.startswith("==>")]
+            if tail:
+                detail += ["--- log tail ---"] + tail[-15:]
         else:
             result["diagnosis"] = "no accounting record found for this job id"
     result["detail"] = detail

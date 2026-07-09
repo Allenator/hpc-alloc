@@ -56,7 +56,7 @@ YCRC monitors GPU jobs and **cancels ones whose GPUs sit idle** (warning email a
 ## Choosing resources (Bouchet)
 
 - CPU work: `day` (max 1 day; the built-in default partition) or `week` (max 7 days, 96 CPUs/user).
-- GPU work: `-G TYPE:N` alone picks the configured GPU partition (built-in: `gpu`); specific GPUs: `-p gpu_h200 -G h200:1`, `-p gpu_b200 -G b200:1`, `-p gpu_rtx6000`, or `-G rtx_5000_ada:1` on `gpu`. GPU partitions max 2 days.
+- GPU work: `-G TYPE:N` alone picks the configured GPU partition (built-in: `gpu`). Verified GRES names: `h200`, `b200`, `rtx_5000_ada` (on `gpu`), `rtx_pro_6000_blackwell` (on `gpu_rtx6000`), `l40s` (scavenge only). E.g. `-p gpu_h200 -G h200:1`. GPU partitions max 2 days (QoS-enforced; `sinfo` shows "infinite").
 - Big memory: `-p bigmem --mem 512G` (max 1 day). Memory defaults to 5120MB per CPU — set `--mem` explicitly for memory-hungry work.
 - Verify GPU GRES names and `-C` feature tags with `hpc-alloc partitions`; shorter `-t` improves queue position (backfill), and for `run` over-requesting time costs only queue position, never held resources.
 - Request modestly (a dev node, not a production run): more resources = longer queue wait.
