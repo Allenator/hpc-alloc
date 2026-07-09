@@ -35,6 +35,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 CONFIG_DIR = Path.home() / ".config" / "hpc-alloc"
+CONFIG_TOML = CONFIG_DIR / "config.toml"
 STATE_FILE = CONFIG_DIR / "state.json"
 LOCK_FILE = CONFIG_DIR / ".lock"
 SSH_CONFIG = CONFIG_DIR / "ssh_config"
@@ -82,6 +83,10 @@ YCRC cancels jobs whose GPUs sit idle (warning email at ~30 min). GPU allocation
 self-release after 30 idle minutes by default (--idle-timeout, 0 to disable);
 prefer `hpc-alloc run` for GPU work so GPUs are only held while computing.
 
+Defaults (cluster, partition, time, cpus, mem, idle-timeout) and the pinned SSH
+key live in ~/.config/hpc-alloc/config.toml (see config.example.toml in the
+repo; `hpc-alloc setup` creates it). CLI flags always win.
+
 Exit codes: 0 ok; 1 error; 3 connection lost — reconnect the VPN if needed,
 run `hpc-alloc connect` in a terminal (Duo), then retry."""
 
@@ -98,6 +103,118 @@ def info(msg):
 def die(msg, code=1):
     print(f"hpc-alloc: error: {msg}", file=sys.stderr)
     sys.exit(code)
+
+
+# ---------------------------------------------------------------- config
+
+CONFIG_TEMPLATE = """\
+# hpc-alloc configuration. Precedence: CLI flags > this file > built-in defaults.
+# Values shown commented out are the built-in defaults.
+
+[defaults]
+# cluster = "bouchet"      # used when --cluster is omitted
+# partition = "day"        # partition for CPU work
+# gpu_partition = "gpu"    # partition when --gpus is set without -p
+# time = "4:00:00"         # walltime, Slurm format
+# cpus = 2
+# mem = "16G"              # per-node memory (unset: Slurm's 5120MB per CPU)
+# idle_timeout = 30        # GPU allocs self-release after this many idle minutes (0 disables)
+
+[ssh]
+# Pin the key used for the clusters. Without this, ssh offers every key it has
+# and the server may hit "Too many authentication failures" before the right one.
+identity_file = "{identity_file}"
+
+# Per-cluster overrides. The section name after "cluster." is the --cluster value.
+[cluster.bouchet]
+# host = "bouchet.ycrc.yale.edu"   # default: <name>.ycrc.yale.edu
+# partition = "day"
+# gpu_partition = "gpu"
+"""
+
+
+def parse_toml_subset(text):
+    """Minimal TOML for this config's shape — [dotted.sections] and
+    key = "string" | integer | true/false. Fallback for Python < 3.11
+    (no tomllib); keep the config file to this subset if your python3 is old."""
+    data = {}
+    section = data
+    for ln, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = data
+            for part in line[1:-1].split("."):
+                section = section.setdefault(part.strip().strip('"'), {})
+            continue
+        key, eq, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if not eq or not key or not val:
+            die(f"{CONFIG_TOML} line {ln}: cannot parse: {raw}")
+        if val[0] in "\"'":
+            end = val.find(val[0], 1)
+            if end < 0:
+                die(f"{CONFIG_TOML} line {ln}: unterminated string: {raw}")
+            section[key] = val[1:end]
+            continue
+        val = val.split("#", 1)[0].strip()
+        if val.lower() in ("true", "false"):
+            section[key] = val.lower() == "true"
+            continue
+        try:
+            section[key] = int(val)
+        except ValueError:
+            die(f"{CONFIG_TOML} line {ln}: unsupported value (use the string/int/bool "
+                f"subset for Python < 3.11): {raw}")
+    return data
+
+
+def load_config():
+    if not CONFIG_TOML.exists():
+        return {}
+    text = CONFIG_TOML.read_text()
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        return parse_toml_subset(text)
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        die(f"invalid {CONFIG_TOML}: {e}")
+
+
+CONFIG = load_config()
+
+
+def cfg(*path, default=None):
+    d = CONFIG
+    for k in path:
+        if not isinstance(d, dict) or k not in d:
+            return default
+        d = d[k]
+    return d
+
+
+def cfg_int(value, name):
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        die(f"{CONFIG_TOML}: {name} must be an integer, got {value!r}")
+
+
+def resolve_common(args):
+    """Fill options the CLI left unset from config.toml, then built-ins."""
+    if getattr(args, "cluster", "") is None:
+        args.cluster = cfg("defaults", "cluster") or DEFAULT_CLUSTER
+    if getattr(args, "time", "") is None:
+        args.time = cfg("defaults", "time") or DEFAULT_TIME
+    if getattr(args, "cpus", "") is None:
+        args.cpus = cfg_int(cfg("defaults", "cpus"), "defaults.cpus") or DEFAULT_CPUS
+    if getattr(args, "mem", "") is None:
+        args.mem = cfg("defaults", "mem")
 
 
 # ---------------------------------------------------------------- state
@@ -154,15 +271,18 @@ def alloc_alias(alloc):
 def rebuild_ssh_config(state):
     """Regenerate the managed ssh_config from state. Idempotent."""
     netid = state.get("netid") or "NETID"
+    ident = cfg("ssh", "identity_file")
+    id_lines = [f"    IdentityFile {ident}", "    IdentitiesOnly yes"] if ident else []
     lines = [
         "# Managed by hpc-alloc — regenerated on every change; do not edit by hand.",
         "",
     ]
-    for cluster, cfg in sorted(state.get("clusters", {}).items()):
+    for cluster, ccfg in sorted(state.get("clusters", {}).items()):
         lines += [
             f"Host {login_alias(cluster)}",
-            f"    HostName {cfg['host']}",
+            f"    HostName {ccfg['host']}",
             f"    User {netid}",
+            *id_lines,
             "    ControlMaster auto",
             "    ControlPath ~/.ssh/hpc-alloc-%C",
             "    ControlPersist 4h",
@@ -178,6 +298,7 @@ def rebuild_ssh_config(state):
             f"Host {alloc_alias(alloc)}",
             f"    HostName {alloc['node']}",
             f"    User {netid}",
+            *id_lines,
             f"    ProxyJump {login_alias(alloc['cluster'])}",
             "    ControlMaster auto",
             "    ControlPath ~/.ssh/hpc-alloc-%C",
@@ -447,6 +568,7 @@ def classify_node_state(s):
 # ------------------------------------------------------------- subcommands
 
 def cmd_setup(args):
+    global CONFIG
     prelim = load_state()
     netid = args.netid or prelim.get("netid")
     if not netid and sys.stdin.isatty():
@@ -454,7 +576,7 @@ def cmd_setup(args):
     if not netid:
         die("NetID required: hpc-alloc setup --netid YOUR_NETID")
     cluster = args.cluster
-    host = args.host or f"{cluster}.ycrc.yale.edu"
+    host = args.host or cfg("cluster", cluster, "host") or f"{cluster}.ycrc.yale.edu"
 
     # SSH key: reuse an existing default key, otherwise generate ed25519.
     pubkey = None
@@ -472,6 +594,16 @@ def cmd_setup(args):
             genargs += ["-N", ""]
         subprocess.run(genargs, check=True)
         pubkey = keyfile.with_suffix(".pub")
+
+    if not CONFIG_TOML.exists():
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        keypath = str(pubkey)[: -len(".pub")]
+        home = str(Path.home())
+        if keypath.startswith(home + "/"):
+            keypath = "~" + keypath[len(home):]
+        CONFIG_TOML.write_text(CONFIG_TEMPLATE.format(identity_file=keypath))
+        CONFIG = load_config()  # so this run's ssh_config already pins the key
+        info(f"wrote {CONFIG_TOML} (defaults + pinned SSH key; edit to taste)")
 
     with locked_state() as state:
         state["netid"] = netid
@@ -534,10 +666,12 @@ def submit_prefix():
 def pick_partition(args):
     if args.partition:
         return args.partition
+    ccfg = cfg("cluster", args.cluster, default={})
     if args.gpus:
-        info(f"--gpus given without --partition; using '{DEFAULT_GPU_PARTITION}'")
-        return DEFAULT_GPU_PARTITION
-    return DEFAULT_PARTITION
+        part = ccfg.get("gpu_partition") or cfg("defaults", "gpu_partition") or DEFAULT_GPU_PARTITION
+        info(f"--gpus given without --partition; using '{part}'")
+        return part
+    return ccfg.get("partition") or cfg("defaults", "partition") or DEFAULT_PARTITION
 
 
 def cmd_up(args):
@@ -549,7 +683,9 @@ def cmd_up(args):
     idle = args.idle_timeout
     if args.gpus:
         if idle is None:
-            idle = DEFAULT_GPU_IDLE_MINUTES
+            idle = cfg_int(cfg("defaults", "idle_timeout"), "defaults.idle_timeout")
+            if idle is None:
+                idle = DEFAULT_GPU_IDLE_MINUTES
         if idle == 0:
             idle = None
     elif idle:
@@ -1212,13 +1348,11 @@ def cmd_why(args):
 # ------------------------------------------------------------------- main
 
 def add_resource_flags(sp):
-    sp.add_argument("--cluster", default=DEFAULT_CLUSTER)
+    sp.add_argument("--cluster", help=f"cluster name (default: {DEFAULT_CLUSTER})")
     sp.add_argument("-p", "--partition", help=f"Slurm partition (default: {DEFAULT_PARTITION}, "
                                               f"or {DEFAULT_GPU_PARTITION} if --gpus is set)")
-    sp.add_argument("-t", "--time", default=DEFAULT_TIME,
-                    help=f"walltime, Slurm format (default: {DEFAULT_TIME})")
-    sp.add_argument("-c", "--cpus", type=int, default=DEFAULT_CPUS,
-                    help=f"CPUs (default: {DEFAULT_CPUS})")
+    sp.add_argument("-t", "--time", help=f"walltime, Slurm format (default: {DEFAULT_TIME})")
+    sp.add_argument("-c", "--cpus", type=int, help=f"CPUs (default: {DEFAULT_CPUS})")
     sp.add_argument("--mem", help="memory per node, e.g. 64G (default: 5120MB per CPU)")
     sp.add_argument("-G", "--gpus", help="GPUs, e.g. 1 or h200:1 or rtx_5000_ada:2")
     sp.add_argument("-C", "--constraint", help="node feature constraint, e.g. 'h200|b200'")
@@ -1236,7 +1370,7 @@ def main():
 
     sp = sub.add_parser("setup", help="one-time configuration (NetID, SSH key, ssh_config)")
     sp.add_argument("--netid", help="Yale NetID")
-    sp.add_argument("--cluster", default=DEFAULT_CLUSTER, help=f"cluster name (default: {DEFAULT_CLUSTER})")
+    sp.add_argument("--cluster", help=f"cluster name (default: {DEFAULT_CLUSTER})")
     sp.add_argument("--host", help="login hostname (default: <cluster>.ycrc.yale.edu)")
     sp.set_defaults(func=cmd_setup)
 
@@ -1267,14 +1401,14 @@ def main():
     st.set_defaults(func=cmd_status)
 
     av = sub.add_parser("avail", help="free capacity digest: idle CPUs and free GPUs by type per partition")
-    av.add_argument("--cluster", default=DEFAULT_CLUSTER)
+    av.add_argument("--cluster", help=f"cluster name (default: {DEFAULT_CLUSTER})")
     av.add_argument("-p", "--partition", help="limit to one partition")
     av.add_argument("--json", action="store_true", help="machine-readable output")
     av.set_defaults(func=cmd_avail)
 
     wh = sub.add_parser("why", help="diagnose a job: why pending, how it's doing, or why it died")
     wh.add_argument("target", nargs="?", help="allocation name or job id (default: sole/dev allocation)")
-    wh.add_argument("--cluster", default=DEFAULT_CLUSTER)
+    wh.add_argument("--cluster", help=f"cluster name (default: {DEFAULT_CLUSTER})")
     wh.add_argument("--json", action="store_true", help="machine-readable output")
     wh.set_defaults(func=cmd_why)
 
@@ -1296,12 +1430,12 @@ def main():
     lg.add_argument("-f", "--follow", action="store_true",
                     help="stream until the job ends (exit code mirrors the job)")
     lg.add_argument("-n", "--lines", type=int, default=100, help="lines to show (default: 100)")
-    lg.add_argument("--cluster", default=DEFAULT_CLUSTER)
+    lg.add_argument("--cluster", help=f"cluster name (default: {DEFAULT_CLUSTER})")
     lg.set_defaults(func=cmd_logs)
 
     cc = sub.add_parser("cancel", help="cancel an hpc-alloc job by id (refuses foreign jobs)")
     cc.add_argument("jobid", help="Slurm job id (from `hpc-alloc status`)")
-    cc.add_argument("--cluster", default=DEFAULT_CLUSTER)
+    cc.add_argument("--cluster", help=f"cluster name (default: {DEFAULT_CLUSTER})")
     cc.set_defaults(func=cmd_cancel)
 
     dn = sub.add_parser("down", help="cancel allocation(s) and clean up SSH aliases")
@@ -1310,16 +1444,17 @@ def main():
     dn.set_defaults(func=cmd_down)
 
     cn = sub.add_parser("connect", help="(re)establish and health-check connections; Duo happens here")
-    cn.add_argument("--cluster", default=DEFAULT_CLUSTER)
+    cn.add_argument("--cluster", help=f"cluster name (default: {DEFAULT_CLUSTER})")
     cn.add_argument("--reset", action="store_true", help="tear down all masters and dead sockets first")
     cn.set_defaults(func=cmd_connect)
 
     pt = sub.add_parser("partitions", help="list partitions with limits, GRES, and feature tags (sinfo)")
-    pt.add_argument("--cluster", default=DEFAULT_CLUSTER)
+    pt.add_argument("--cluster", help=f"cluster name (default: {DEFAULT_CLUSTER})")
     pt.add_argument("--json", action="store_true", help="machine-readable output")
     pt.set_defaults(func=cmd_partitions)
 
     args = p.parse_args()
+    resolve_common(args)
 
     def sigterm_to_interrupt(signum, frame):
         # SIGTERM (how agents/task-runners stop a backgrounded run) behaves like

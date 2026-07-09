@@ -75,6 +75,16 @@ hpc-alloc down h200
 
 `hpc-alloc up --dry-run ...` prints the exact `sbatch` command without connecting. `hpc-alloc partitions` shows live partition limits, GPU GRES names, and `-C` feature tags. `status`, `avail`, `why`, and `partitions` all take `--json` for machine consumption. `hpc-alloc --help` includes a Bouchet partition cheatsheet.
 
+## Configuration
+
+Optional TOML config at `~/.config/hpc-alloc/config.toml` — `hpc-alloc setup` creates it (pinning your SSH key), or copy [`config.example.toml`](config.example.toml). Precedence: **CLI flags > config file > built-in defaults.**
+
+- `[defaults]` — `cluster`, `partition`, `gpu_partition`, `time`, `cpus`, `mem`, `idle_timeout`: what you usually want, so you stop retyping flags.
+- `[ssh] identity_file` — pins the key with `IdentityFile` + `IdentitiesOnly` in the generated SSH config. Without this, ssh offers every key it knows and the server can hit "Too many authentication failures" before trying the right one.
+- `[cluster.<name>]` — per-cluster `host` and partition overrides, for clusters whose partition layout differs from Bouchet's.
+
+The division of labor: config.toml = who you are and what you usually want (yours to edit); `state.json` = what currently exists (tool-owned); flags = this invocation's exceptions. Parsing uses `tomllib` on Python ≥ 3.11 and falls back to a built-in subset parser (strings/ints/bools, dotted sections) on older interpreters.
+
 ## Bouchet quick reference
 
 | Partition | Max time | Notes |

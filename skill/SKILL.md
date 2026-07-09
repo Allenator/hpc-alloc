@@ -33,6 +33,8 @@ description: Allocate and use Yale YCRC compute nodes (Bouchet) for development 
 
 For rare queries with no subcommand, run raw Slurm commands over the login alias: `ssh bouchet-login -- 'sinfo ...'`.
 
+The user may have defaults (cluster/partition/time/cpus/mem/idle-timeout) set in `~/.config/hpc-alloc/config.toml` — omitted flags use those, and explicit flags always win. Don't assume the built-in defaults apply; a bare `hpc-alloc up` may reflect the user's configured preferences, which is usually what they want.
+
 ## GPU etiquette (important)
 
 YCRC monitors GPU jobs and **cancels ones whose GPUs sit idle** (warning email at ~30 min; repeat offenses risk account suspension). Never try to defeat this with fake GPU load. Instead:

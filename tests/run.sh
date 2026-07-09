@@ -65,6 +65,59 @@ out="$(hpc running run --dry-run -G h200:1 -- python train.py --epochs 5 2>/dev/
 case "$out" in *"--wrap 'python train.py --epochs 5'"*) echo "  ok: run captures command";;
   *) echo "  FAIL: run command capture"; fails=$((fails + 1));; esac
 
+echo "== unit: toml fallback parser =="
+python3 - "$cli" <<'PY' || fails=$((fails + 1))
+import sys
+m = {}
+exec(open(sys.argv[1]).read().split("if __name__")[0], m)
+d = m["parse_toml_subset"]('''
+# comment
+[defaults]
+partition = "week"   # trailing comment
+cpus = 8
+flag = true
+[cluster.bouchet]
+host = "bouchet.ycrc.yale.edu"
+''')
+assert d == {"defaults": {"partition": "week", "cpus": 8, "flag": True},
+             "cluster": {"bouchet": {"host": "bouchet.ycrc.yale.edu"}}}, d
+print("  ok: toml subset parser")
+PY
+
+echo "== config: precedence and identity pinning =="
+mkstate null
+cat > "$work/home/.config/hpc-alloc/config.toml" <<'EOF'
+[defaults]
+partition = "week"
+cpus = 8
+idle_timeout = 45
+[ssh]
+identity_file = "~/.ssh/id_test"
+[cluster.bouchet]
+gpu_partition = "gpu_h200"
+EOF
+out="$(hpc running up --dry-run 2>/dev/null)"
+case "$out" in *"--partition=week"*) echo "  ok: config partition default";;
+  *) echo "  FAIL: config partition ($out)"; fails=$((fails + 1));; esac
+case "$out" in *"--cpus-per-task=8"*) echo "  ok: config cpus default";;
+  *) echo "  FAIL: config cpus"; fails=$((fails + 1));; esac
+out="$(hpc running up --dry-run -p day -c 2 2>/dev/null)"
+case "$out" in *"--partition=day"*) echo "  ok: CLI flag beats config";;
+  *) echo "  FAIL: flag precedence"; fails=$((fails + 1));; esac
+out="$(hpc running up --dry-run -G 1 2>/dev/null)"
+case "$out" in *"--partition=gpu_h200"*) echo "  ok: per-cluster gpu_partition";;
+  *) echo "  FAIL: per-cluster gpu_partition ($out)"; fails=$((fails + 1));; esac
+case "$out" in *"self-releases after 45 min"*) echo "  ok: config idle_timeout";;
+  *) echo "  FAIL: config idle_timeout"; fails=$((fails + 1));; esac
+HOME="$work/home" python3 -c "
+m = {}
+exec(open('$cli').read().split('if __name__')[0], m)
+m['save_state'](m['load_state']())"
+contains "IdentityFile in ssh_config" "IdentityFile ~/.ssh/id_test" \
+  "$work/home/.config/hpc-alloc/ssh_config"
+contains "IdentitiesOnly in ssh_config" "IdentitiesOnly yes" \
+  "$work/home/.config/hpc-alloc/ssh_config"
+
 echo "== scenario: network down (state must survive) =="
 mkstate '"r806u23n04"'
 hpc down status > "$work/out" 2>&1; check "exit code" 3 $?

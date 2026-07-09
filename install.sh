@@ -20,3 +20,4 @@ echo "linked $skills_dir/hpc-alloc -> $here/skill"
 
 echo
 echo "Next: hpc-alloc setup --netid YOUR_NETID"
+echo "      (creates ~/.config/hpc-alloc/config.toml — see config.example.toml for options)"

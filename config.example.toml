@@ -1,0 +1,23 @@
+# hpc-alloc configuration. Precedence: CLI flags > this file > built-in defaults.
+# Copy to ~/.config/hpc-alloc/config.toml (or let `hpc-alloc setup` create it).
+# Values shown commented out are the built-in defaults.
+
+[defaults]
+# cluster = "bouchet"      # used when --cluster is omitted
+# partition = "day"        # partition for CPU work
+# gpu_partition = "gpu"    # partition when --gpus is set without -p
+# time = "4:00:00"         # walltime, Slurm format
+# cpus = 2
+# mem = "16G"              # per-node memory (unset: Slurm's 5120MB per CPU)
+# idle_timeout = 30        # GPU allocs self-release after this many idle minutes (0 disables)
+
+[ssh]
+# Pin the key used for the clusters. Without this, ssh offers every key it has
+# and the server may hit "Too many authentication failures" before the right one.
+identity_file = "~/.ssh/id_ed25519"
+
+# Per-cluster overrides. The section name after "cluster." is the --cluster value.
+[cluster.bouchet]
+# host = "bouchet.ycrc.yale.edu"   # default: <name>.ycrc.yale.edu
+# partition = "day"
+# gpu_partition = "gpu"
