@@ -117,6 +117,21 @@ contains "IdentityFile in ssh_config" "IdentityFile ~/.ssh/id_test" \
   "$work/home/.config/hpc-alloc/ssh_config"
 contains "IdentitiesOnly in ssh_config" "IdentitiesOnly yes" \
   "$work/home/.config/hpc-alloc/ssh_config"
+hpc running config > "$work/out" 2>&1; check "config exit" 0 $?
+contains "config shows configured value" "week" "$work/out"
+contains "config shows provenance" "[config]" "$work/out"
+hpc running config --json > "$work/out" 2>&1
+python3 -c "
+import json; d = json.load(open('$work/out'))
+assert d['defaults']['partition'] == {'value': 'week', 'source': 'config'}
+assert d['defaults']['time']['source'] == 'builtin'
+assert d['cluster_overrides']['bouchet']['gpu_partition'] == 'gpu_h200'
+assert d['ssh_identity_file'] == '~/.ssh/id_test'
+print('  ok: config json provenance')" || fails=$((fails + 1))
+mkstate null   # no config.toml
+hpc running config > "$work/out" 2>&1
+contains "absent config reported" "absent" "$work/out"
+contains "builtins flagged" "[builtin]" "$work/out"
 
 echo "== scenario: network down (state must survive) =="
 mkstate '"r806u23n04"'

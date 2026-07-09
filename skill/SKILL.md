@@ -19,6 +19,7 @@ description: Allocate and use Yale YCRC compute nodes (Bouchet) for development 
 | Command | Purpose |
 |---|---|
 | `hpc-alloc status --json` | Allocations + run jobs (state, node, alias, `time_left`, `expiring_soon`, live `gpu_util`). **Always run this first.** |
+| `hpc-alloc config --json` | Effective defaults: the user's config.toml merged over built-ins, with provenance. No cluster contact. |
 | `hpc-alloc avail [--json] [-p PART]` | Free capacity digest: idle CPUs and free GPUs by type per partition. **Run before requesting GPUs.** |
 | `hpc-alloc up [--name N] [-p PART] [-t TIME] [-c CPUS] [--mem M] [-G GPUS] [--idle-timeout MIN]` | Allocate a dev node; blocks until it starts (`--no-wait` for busy partitions). |
 | `hpc-alloc run [resources] [--chdir DIR] [--detach] -- CMD...` | Run CMD as a batch job. Foreground streams output and mirrors the exit code; `--detach` returns immediately. **Preferred for GPU work.** |
@@ -33,7 +34,15 @@ description: Allocate and use Yale YCRC compute nodes (Bouchet) for development 
 
 For rare queries with no subcommand, run raw Slurm commands over the login alias: `ssh bouchet-login -- 'sinfo ...'`.
 
-The user may have defaults (cluster/partition/time/cpus/mem/idle-timeout) set in `~/.config/hpc-alloc/config.toml` — omitted flags use those, and explicit flags always win. Don't assume the built-in defaults apply; a bare `hpc-alloc up` may reflect the user's configured preferences, which is usually what they want.
+## Defaults discipline
+
+The user's `~/.config/hpc-alloc/config.toml` may change any default (cluster, partition, time, cpus, mem, idle-timeout), so this document never tells you what a default *is* — only what the built-in fallback would be.
+
+1. **Pass only the flags the task actually requires** (e.g. `-G h200:1` for GPU work, `--mem` for a memory-hungry job); leave the rest unset so the user's configured preferences apply. Don't copy fully-flagged examples verbatim.
+2. **Need to know an effective value before acting** (e.g. to tell the user what will happen)? Run `hpc-alloc config --json`.
+3. **Trust the echo over any prediction**: `up` and `run` print the actual partition, walltime, and idle-timeout used at submission — that output is the ground truth for what happened.
+
+Cluster-side facts in this skill — partition time limits, the ~30-min idle-GPU warning policy, the scratch purge, exit-code meanings, job-name prefixes — are invariants that no config changes.
 
 ## GPU etiquette (important)
 
@@ -41,13 +50,13 @@ YCRC monitors GPU jobs and **cancels ones whose GPUs sit idle** (warning email a
 
 - **Two-tier pattern (default for GPU work):** keep the persistent dev allocation on a CPU partition (`hpc-alloc up -p day`) for editing/builds, and execute GPU work with `hpc-alloc run -G h200:1 -- ...` so GPUs are held only while computing.
 - Check `hpc-alloc avail` first; if the GPU type you want shows 0 free, prefer `run` (it queues) over holding a node, or pick another type/partition.
-- Direct GPU allocations (`up -G ...`) self-release after 30 min of GPU idleness by default, matching YCRC's warning threshold (`--idle-timeout MIN` to change, `0` to disable — only with the user's explicit OK). Warn the user when `status` shows a GPU allocation with low `gpu_util`.
+- Direct GPU allocations (`up -G ...`) self-release after a period of GPU idleness (built-in default 30 min, matching YCRC's warning threshold; the user's config may change it). `--idle-timeout MIN` overrides per-allocation; `0` disables — only with the user's explicit OK. Warn the user when `status` shows a GPU allocation with low `gpu_util`.
 - For quick interactive GPU debugging, `-p gpu_devel` is the intended partition (6h, 2 GPUs).
 
 ## Choosing resources (Bouchet)
 
-- CPU work: `-p day` (max 1 day, default) or `-p week` (max 7 days, 96 CPUs/user).
-- GPU work: `-G TYPE:N` defaults to partition `gpu`; specific GPUs: `-p gpu_h200 -G h200:1`, `-p gpu_b200 -G b200:1`, `-p gpu_rtx6000`, or `-G rtx_5000_ada:1` on `gpu`. GPU partitions max 2 days.
+- CPU work: `day` (max 1 day; the built-in default partition) or `week` (max 7 days, 96 CPUs/user).
+- GPU work: `-G TYPE:N` alone picks the configured GPU partition (built-in: `gpu`); specific GPUs: `-p gpu_h200 -G h200:1`, `-p gpu_b200 -G b200:1`, `-p gpu_rtx6000`, or `-G rtx_5000_ada:1` on `gpu`. GPU partitions max 2 days.
 - Big memory: `-p bigmem --mem 512G` (max 1 day). Memory defaults to 5120MB per CPU — set `--mem` explicitly for memory-hungry work.
 - Verify GPU GRES names and `-C` feature tags with `hpc-alloc partitions`; shorter `-t` improves queue position (backfill), and for `run` over-requesting time costs only queue position, never held resources.
 - Request modestly (a dev node, not a production run): more resources = longer queue wait.
@@ -55,7 +64,7 @@ YCRC monitors GPU jobs and **cancels ones whose GPUs sit idle** (warning email a
 ## Typical workflow
 
 1. `hpc-alloc status --json` — reuse a live allocation if its resources fit; don't stack duplicates. Warn the user about anything `expiring_soon`.
-2. Dev seat: `hpc-alloc up --name dev -p day -c 4 -t 8:00:00`. If PENDING for long, run `hpc-alloc why dev`, then consider `--no-wait` or a different partition.
+2. Dev seat: `hpc-alloc up --name dev`, adding flags only for needs beyond the user's defaults (e.g. `-t 8:00:00` for a long session, `-c 8` for parallel builds). If PENDING for long, run `hpc-alloc why dev`, then consider `--no-wait` or a different partition.
 3. Push code: `hpc-alloc sync dev ./project '~/project'` (incremental; re-run after edits).
 4. Build/test on the dev node: `hpc-alloc ssh dev -- 'cd ~/project && make test'`. Load software with `module load ...` (e.g. `module load miniconda`) inside the command — nodes start with a bare environment.
 5. GPU execution: check `hpc-alloc avail`, then `hpc-alloc run -p gpu_h200 -G h200:1 -c 8 --mem 64G --chdir '~/project' -- python train.py`. For long jobs use `--detach` (or a backgrounded foreground run) and follow with `hpc-alloc logs <jobid> -f`; the job survives client death either way.

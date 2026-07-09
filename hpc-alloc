@@ -1031,10 +1031,11 @@ def cmd_run(args):
         die(f"unexpected sbatch output: {r.stdout.strip()}")
     logpath = f"{REMOTE_LOG_DIR}/run-{jobid}.log"
     if args.detach:
-        info(f"submitted run job {jobid} on {partition} (log: ~/{logpath})")
+        info(f"submitted run job {jobid} on {partition} ({args.time} limit, log: ~/{logpath})")
         info(f"follow with `hpc-alloc logs {jobid} -f`, cancel with `hpc-alloc cancel {jobid}`")
         return
-    info(f"submitted run job {jobid} on {partition} (log: ~/{logpath}); Ctrl-C cancels it")
+    info(f"submitted run job {jobid} on {partition} ({args.time} limit, log: ~/{logpath}); "
+         "Ctrl-C cancels it")
     stream_job(cluster, jobid, logpath)
 
 
@@ -1255,6 +1256,42 @@ def cmd_avail(args):
                          f"{p['cpus_idle']}/{p['cpus_total']}", gpus))
 
 
+def cmd_config(args):
+    """Show effective defaults (config.toml merged over built-ins). No network."""
+    builtins = {
+        "cluster": DEFAULT_CLUSTER, "partition": DEFAULT_PARTITION,
+        "gpu_partition": DEFAULT_GPU_PARTITION, "time": DEFAULT_TIME,
+        "cpus": DEFAULT_CPUS, "mem": None, "idle_timeout": DEFAULT_GPU_IDLE_MINUTES,
+    }
+    defaults = {}
+    for key, builtin in builtins.items():
+        v = cfg("defaults", key)
+        defaults[key] = {"value": v if v is not None else builtin,
+                         "source": "config" if v is not None else "builtin"}
+    ident = cfg("ssh", "identity_file")
+    out = {
+        "config_file": str(CONFIG_TOML),
+        "config_exists": CONFIG_TOML.exists(),
+        "defaults": defaults,
+        "ssh_identity_file": ident,
+        "cluster_overrides": cfg("cluster", default={}),
+    }
+    if args.json:
+        print(json.dumps(out, indent=2))
+        return
+    info(f"config file: {CONFIG_TOML}"
+         + ("" if out["config_exists"] else " (absent — all values are built-ins)"))
+    for key, d in defaults.items():
+        val = d["value"] if d["value"] is not None else "(Slurm default: 5120MB per CPU)"
+        print(f"  {key:<15} {str(val):<28} [{d['source']}]")
+    print(f"  {'identity_file':<15} "
+          f"{ident or '(not pinned — ssh offers every key)':<28} "
+          f"[{'config' if ident else 'builtin'}]")
+    for cname, over in sorted((out["cluster_overrides"] or {}).items()):
+        pairs = ", ".join(f"{k}={v}" for k, v in over.items())
+        print(f"  cluster.{cname}: {pairs}")
+
+
 def cmd_why(args):
     """One-shot diagnosis of a pending, running, or dead job."""
     state = load_state()
@@ -1442,6 +1479,10 @@ def main():
     dn.add_argument("name", nargs="?", help="allocation name")
     dn.add_argument("--all", action="store_true", help="cancel all allocations")
     dn.set_defaults(func=cmd_down)
+
+    cf = sub.add_parser("config", help="show effective defaults (config.toml merged over built-ins)")
+    cf.add_argument("--json", action="store_true", help="machine-readable output")
+    cf.set_defaults(func=cmd_config)
 
     cn = sub.add_parser("connect", help="(re)establish and health-check connections; Duo happens here")
     cn.add_argument("--cluster", help=f"cluster name (default: {DEFAULT_CLUSTER})")

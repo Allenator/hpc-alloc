@@ -83,7 +83,7 @@ Optional TOML config at `~/.config/hpc-alloc/config.toml` — `hpc-alloc setup` 
 - `[ssh] identity_file` — pins the key with `IdentityFile` + `IdentitiesOnly` in the generated SSH config. Without this, ssh offers every key it knows and the server can hit "Too many authentication failures" before trying the right one.
 - `[cluster.<name>]` — per-cluster `host` and partition overrides, for clusters whose partition layout differs from Bouchet's.
 
-The division of labor: config.toml = who you are and what you usually want (yours to edit); `state.json` = what currently exists (tool-owned); flags = this invocation's exceptions. Parsing uses `tomllib` on Python ≥ 3.11 and falls back to a built-in subset parser (strings/ints/bools, dotted sections) on older interpreters.
+The division of labor: config.toml = who you are and what you usually want (yours to edit); `state.json` = what currently exists (tool-owned); flags = this invocation's exceptions. `hpc-alloc config` prints the effective merged defaults with provenance (`--json` for agents), and every submission echoes the actual partition/walltime/idle-timeout it used. Parsing uses `tomllib` on Python ≥ 3.11 and falls back to a built-in subset parser (strings/ints/bools, dotted sections) on older interpreters.
 
 ## Bouchet quick reference
 
