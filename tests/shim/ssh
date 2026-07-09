@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Fake ssh for hpc-alloc tests. Behavior is selected via HPCTEST_MODE:
+#   down        every connection fails (VPN off / unresolvable)
+#   squeue-err  connection fine, slurmctld erroring
+#   gone        queue empty (job 9123 finished; sacct says TIMEOUT)
+#   running     alloc 9123 + run job 9200 + foreign job 9300 all RUNNING
+#   pending-qos 9123 PENDING on a QOS cap
+#   expiring    9123 RUNNING with 12 minutes left
+# scancel invocations are appended to $HPCTEST_LOG.
+mode="${HPCTEST_MODE:?set HPCTEST_MODE}"
+all="$*"
+
+case "$all" in
+  *"-O exit"*) exit 0 ;;
+  *"-O check"*)
+    if [ "$mode" = down ]; then echo "no master" >&2; exit 255; fi
+    exit 0 ;;
+esac
+
+if [ "$mode" = down ]; then
+  echo "ssh: Could not resolve hostname bouchet.ycrc.yale.edu" >&2
+  exit 255
+fi
+
+case "$all" in
+  *sbatch*) echo 7777 ;;
+  *scancel*) echo "SCANCEL: $all" >> "${HPCTEST_LOG:-/dev/null}" ;;
+  *"squeue --me"*)
+    case "$mode" in
+      squeue-err) echo "slurm_load_jobs error: Unable to contact slurm controller" >&2; exit 1 ;;
+      gone) ;;
+      running)
+        printf '9123|RUNNING|r806u23n04|None|3:59:00|gpu_h200|hpcalloc-h200\n'
+        printf '9200|RUNNING|r801u01n01|None|1:00:00|gpu|hpcalloc-run\n'
+        printf '9300|RUNNING|r802u02n02|None|2:00:00|day|myjob\n' ;;
+      pending-qos) echo '9123|PENDING||QOSMaxGRESPerUser|8:00:00|gpu_h200|hpcalloc-h200' ;;
+      expiring) echo '9123|RUNNING|r806u23n04|None|0:12:00|gpu_h200|hpcalloc-h200' ;;
+    esac ;;
+  *"--start"*) echo "2026-07-09T18:00:00" ;;
+  *sprio*) printf 'JOBID PRIORITY AGE FAIRSHARE\n9123 1200 300 900\n' ;;
+  *"show reservation"*)
+    echo "ReservationName=maint StartTime=2026-07-12T08:00:00 EndTime=2026-07-12T20:00:00 Nodes=ALL" ;;
+  *sacct*)
+    if [ "$mode" = gone ]; then echo "TIMEOUT|0:0|8:00:01|8:00:00"
+    else echo "COMPLETED|0:0|0:10:00|4:00:00"; fi ;;
+  *"sinfo -h -N -O"*)
+    cat <<'SINFO'
+gpu_h200 mix r801n01 gpu:h200:8 gpu:h200:6(IDX:0-5) 32/32/0/64
+gpu_h200 idle r801n02 gpu:h200:8 gpu:h200:0 0/64/0/64
+gpu_h200 drain r801n03 gpu:h200:8 gpu:h200:0 0/0/64/64
+day alloc r802n01 (null) (null) 64/0/0/64
+day idle r802n02 (null) (null) 0/64/0/64
+SINFO
+    ;;
+  *"sinfo -o"*)
+    printf 'PARTITION|AVAIL|TIMELIMIT|NODES|CPUS|MEMORY|GRES|AVAIL_FEATURES\n'
+    printf 'day*|up|1-00:00:00|76|64|990000|(null)|era,nogpu\n'
+    printf 'gpu_h200|up|2-00:00:00|7|64|990000|gpu:h200:8|h200\n' ;;
+  *nvidia-smi*) printf '42\n17\n' ;;
+  *'printf "%s" "$HOME"'*) printf '/home/ab1234' ;;
+  *"for f in"*) echo ".hpc-alloc/run-9200.log" ;;
+  *tail*) echo "epoch 1: loss 0.42" ;;
+  *hostname*) echo "login1.bouchet" ;;
+esac
+exit 0
