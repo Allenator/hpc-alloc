@@ -153,6 +153,23 @@ squeue_rows() {
   return 0
 }
 
+stream_content() {  # the canonical log file a streamed job "wrote"
+  if [ "$mode" = flap ] && [ "$(cat "$HPCTEST_COUNT" 2>/dev/null || echo 0)" -ge 3 ]; then
+    printf 'epoch 1: loss 0.42\nafter-blip\n'  # grows after the queue blip
+  else
+    printf 'epoch 1: loss 0.42\n'
+  fi
+}
+
+tail_chunk() {  # honor the CLI's `tail -c +N` byte offset (stream correctness)
+  case "$all" in
+    *"tail -c +"*)
+      off=$(printf '%s\n' "$all" | sed -n 's/.*tail -c +\([0-9]*\).*/\1/p')
+      tail -c +"${off:-1}" ;;
+    *) : ;;  # pend-phase poll (`true` placeholder): nothing may be streamed
+  esac
+}
+
 case "$all" in
   *sbatch*) echo 7777 ;;
   *scancel*)
@@ -161,11 +178,7 @@ case "$all" in
   *"squeue --me"*"printf OK"*)  # stream_job's combined queue+log poll
     squeue_rows || exit 1
     printf 'OK\036'
-    if [ "$mode" = flap ] && [ "$(cat "$HPCTEST_COUNT" 2>/dev/null || echo 0)" -ge 3 ]; then
-      echo "after-blip"  # content only reachable if the stream survives the blip
-    else
-      echo "epoch 1: loss 0.42"
-    fi ;;
+    stream_content | tail_chunk ;;
   *"squeue --me"*)
     squeue_rows || exit 1
     printf '\036'; remote_now ;;
@@ -201,7 +214,8 @@ SINFO
     printf '42\n17\n' ;;
   *'printf "%s" "$HOME"'*) printf '/home/ab1234' ;;
   *"for f in"*) echo ".hpc-alloc/run-9200.log" ;;
-  *tail*) echo "epoch 1: loss 0.42" ;;
+  *"tail -c +"*) stream_content | tail_chunk ;;  # stream_job's final read
+  *tail*) echo "epoch 1: loss 0.42" ;;           # cmd_logs' `tail -n`
   *hostname*) echo "login1.bouchet" ;;
 esac
 exit 0

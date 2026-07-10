@@ -468,8 +468,8 @@ def ensure_include():
                  existing, re.MULTILINE):
         return
     header = f"# hpc-alloc managed hosts\n{INCLUDE_LINE}\n\n"
-    USER_SSH_CONFIG.write_text(header + existing)
-    USER_SSH_CONFIG.chmod(0o600)
+    # atomic: a crash mid-write must not truncate the user's own ssh config
+    atomic_write_600(USER_SSH_CONFIG, header + existing)
     info(f"added '{INCLUDE_LINE}' to {USER_SSH_CONFIG}")
 
 
@@ -623,9 +623,10 @@ def key_in_agent(key):
     pub = Path(str(key) + ".pub")
     fp = subprocess.run(["ssh-keygen", "-lf", str(pub if pub.exists() else key)],
                         capture_output=True, text=True)
-    if fp.returncode != 0 or not fp.stdout.split():
+    toks = fp.stdout.split()
+    if fp.returncode != 0 or len(toks) < 2:
         return False
-    fingerprint = fp.stdout.split()[1]
+    fingerprint = toks[1]
     agent = subprocess.run(["ssh-add", "-l"], capture_output=True, text=True)
     return agent.returncode == 0 and fingerprint in agent.stdout
 
@@ -1194,12 +1195,14 @@ def cmd_up(args):
         else:
             st["allocs"][name] = alloc
     if lost_to:
+        outcome = f"could NOT cancel duplicate job {jobid} — run `hpc-alloc cancel {jobid}`"
         try:
             cancelled, _ = cancel_job(cluster, jobid)
-        except SystemExit:  # ensure_login die()d; its diagnosis is already printed
-            cancelled = False
-        outcome = (f"cancelled this duplicate submission (job {jobid})" if cancelled else
-                   f"could NOT cancel duplicate job {jobid} — run `hpc-alloc cancel {jobid}`")
+            if cancelled:
+                outcome = f"cancelled this duplicate submission (job {jobid})"
+        except SystemExit:  # ensure_login die()d — keep ITS exit code (e.g. 3, retryable)
+            info(f"error: allocation '{name}' was created concurrently (job {lost_to}); {outcome}")
+            raise
         die(f"allocation '{name}' was created concurrently (job {lost_to}); {outcome}")
     extra = f", self-releases after {idle} idle GPU minutes" if idle else ""
     info(f"submitted job {jobid} on {cluster} (partition {partition}, {args.time}{extra})")
@@ -1284,7 +1287,7 @@ def wait_for_running(alloc, timeout):
                 return
             time.sleep(5)
     except KeyboardInterrupt:
-        print()
+        print(file=sys.stderr)  # newline after ^C — stdout may be piped/JSON
         info(f"interrupted — job {jobid} is still in the queue.")
         info(f"`hpc-alloc status` to check on it, `hpc-alloc down {name}` to cancel.")
         sys.exit(130)
@@ -1518,9 +1521,11 @@ def check_node_reachable(state, alloc):
 
 def split_ssh_args(state, tokens):
     """`hpc-alloc ssh [NAME] [-- CMD...]`: first token is a name only if it
-    matches an existing allocation; everything else is the remote command."""
+    matches an existing allocation; everything else is the remote command.
+    A LEADING `--` forces everything after it to be the command, so a command
+    that happens to start with an allocation's name is still runnable."""
     if tokens and tokens[0] == "--":
-        tokens = tokens[1:]
+        return None, tokens[1:]
     name = None
     if tokens and tokens[0] in state["allocs"]:
         name, tokens = tokens[0], tokens[1:]
@@ -1591,6 +1596,9 @@ def cmd_run(args):
         home = remote_home(cluster, state)
         logfile = f"{home}/{REMOTE_LOG_DIR}/run-%j.log"
         if args.chdir and args.chdir.startswith("~"):  # Slurm --chdir doesn't expand ~
+            if not re.fullmatch(r"~(/.*)?", args.chdir):
+                die(f"--chdir {args.chdir!r}: '~user' paths aren't supported — use "
+                    "'~/...' (your own home) or an absolute path")
             rest = args.chdir[1:].lstrip("/")
             args.chdir = f"{home}/{rest}" if rest else home
 
@@ -1696,7 +1704,7 @@ def stream_job(cluster, jobid, logpath, cancel_on_interrupt=False, verdict=False
                 misses = 0
             time.sleep(3)
     except KeyboardInterrupt:
-        print()
+        print(file=sys.stderr)  # newline after ^C — stdout is the streamed log
         if not cancel_on_interrupt:
             info(f"detached — job {jobid} keeps running (reattach: `hpc-alloc logs {jobid} -f`, "
                  f"cancel: `hpc-alloc cancel {jobid}`)")
@@ -2218,7 +2226,8 @@ def main():
     lg = sub.add_parser("logs", help="show or follow a job's log (allocation name or job id)")
     lg.add_argument("target", help="allocation name or job id")
     lg.add_argument("-f", "--follow", action="store_true",
-                    help="stream until the job ends (exit code mirrors the job)")
+                    help="stream until the job ends (always exits 0 after a clean "
+                         "stream; Ctrl-C detaches without cancelling)")
     lg.add_argument("-n", "--lines", type=int, default=100, help="lines to show (default: 100)")
     lg.add_argument("--cluster", help=f"cluster name (default: {DEFAULT_CLUSTER})")
     lg.set_defaults(func=cmd_logs)
@@ -2262,7 +2271,7 @@ def main():
     try:
         args.func(args)
     except KeyboardInterrupt:
-        print()
+        print(file=sys.stderr)  # newline after ^C — stdout may be piped/JSON
         sys.exit(130)
     except BrokenPipeError:
         # downstream reader (| head) closed the pipe: not an error, not a traceback

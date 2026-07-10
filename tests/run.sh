@@ -54,6 +54,8 @@ assert m["classify_node_state"]("drain") == "other"
 s = {"allocs": {"h200": {}, "dev": {}}}
 assert m["split_ssh_args"](s, ["h200", "--", "ls", "-la"]) == ("h200", ["ls", "-la"])
 assert m["split_ssh_args"](s, ["--", "ls"]) == (None, ["ls"])
+# a leading -- forces the command interpretation even for alloc-name lookalikes
+assert m["split_ssh_args"](s, ["--", "h200", "-v"]) == (None, ["h200", "-v"])
 print("  ok: timeleft/gres/state/ssh-args helpers")
 PY
 
@@ -172,7 +174,7 @@ assert kinds == {'9200': 'run', '9400': 'orphan', '9500': 'recent',
                  '9600': 'other-machine', '9650': 'other-machine'}, kinds
 assert [r['orphan'] for r in d['runs']] == [r['kind'] == 'orphan' for r in d['runs']]
 owners = {r['jobid']: r['owner'] for r in d['runs']}
-assert owners['9600'] == 'othermachine' and owners['9300'] is None if '9300' in owners else True
+assert owners['9600'] == 'othermachine' and '9300' not in owners, owners
 assert d['allocs'][0]['gpu_util'] == 42
 print('  ok: json kinds incl. other-machine ownership, stdout pure, gpu_util=42')" || fails=$((fails + 1))
 hpc running up --dry-run --name run > "$work/out" 2>&1
@@ -187,6 +189,9 @@ out="$(hpc running run --dry-run -- python -c 'x = 1' 2>/dev/null)"
 case "$out" in *"--wrap 'python -c x = 1'"*) echo "  FAIL: run argv boundaries lost"; fails=$((fails + 1));;
   *"x = 1"*) echo "  ok: run preserves argv quoting";;
   *) echo "  FAIL: run command missing"; fails=$((fails + 1));; esac
+hpc running run --chdir '~bob/proj' -- echo hi > "$work/out" 2>&1
+check "~user chdir rejected (Slurm won't expand it)" 1 $?
+contains "clear ~user guidance" "'~user' paths aren't supported" "$work/out"
 echo 'partition = week' > "$work/home/.config/hpc-alloc/config.toml"   # invalid TOML
 hpc running up --dry-run > "$work/out" 2>&1; check "invalid config tolerated" 0 $?
 contains "config warning printed" "ignoring config.toml" "$work/out"
@@ -451,6 +456,9 @@ rm -f "$work/flap.n"
 HPCTEST_COUNT="$work/flap.n" hpc flap run -- echo hi > "$work/out" 2>&1
 check "run survives a one-poll queue blip (exit 0)" 0 $?
 contains "stream continued after the blip" "after-blip" "$work/out"
+check "log content streamed exactly once (byte offsets honored)" \
+  1 "$(grep -c 'epoch 1' "$work/out")"
+check "post-blip content not duplicated either" 1 "$(grep -c 'after-blip' "$work/out")"
 
 echo "== stage-B: ownership by persisted id, not hostname =="
 mkstate null
