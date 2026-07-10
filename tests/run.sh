@@ -291,6 +291,36 @@ contains "log content" "epoch 1: loss 0.42" "$work/out"
 hpc pending-qos logs 9123 > "$work/out" 2>&1
 check "logs refuses to touch a pending job's file (NFS cache)" 1 $?
 contains "explains and points at -f" "no log to show yet" "$work/out"
+hpc pending-qos logs h200 > "$work/out" 2>&1
+check "logs NAME target gets the same pending guard" 1 $?
+contains "name-target guidance" "no log to show yet" "$work/out"
+
+echo "== stage-J: dry-run identity, corrupt state, symlinked ssh config =="
+rm -rf "$work/home" && mkdir -p "$work/home"
+c1="$(hpc running up --dry-run 2>/dev/null | grep -o 'hpc-alloc:[a-f0-9]*:[A-Za-z0-9_-]*' | head -1)"
+c2="$(hpc running up --dry-run 2>/dev/null | grep -o 'hpc-alloc:[a-f0-9]*:[A-Za-z0-9_-]*' | head -1)"
+check "dry-run ownership tag is deterministic (id persisted)" "$c1" "$c2"
+id3=$(python3 -c "import json;print(json.load(open('$work/home/.config/hpc-alloc/state.json'))['machine_id'])")
+case "$c1" in *"$id3"*) echo "  ok: dry-run used the persisted id";;
+  *) echo "  FAIL: dry-run id not persisted ($c1 vs $id3)"; fails=$((fails + 1));; esac
+printf 'GARBAGE{{{' > "$work/home/.config/hpc-alloc/state.json"
+hpc running up --dry-run > "$work/out" 2>&1
+check "corrupt state dies cleanly (exit 1)" 1 $?
+contains "clear corruption message" "corrupt" "$work/out"
+if grep -q "Traceback" "$work/out"; then
+  echo "  FAIL: raw traceback leaked"; fails=$((fails + 1))
+else echo "  ok: no traceback"; fi
+rm -rf "$work/home" && mkdir -p "$work/home/.ssh" "$work/home/dotfiles"
+printf '# my dotfiles ssh config\n' > "$work/home/dotfiles/sshconfig"
+ln -s "$work/home/dotfiles/sshconfig" "$work/home/.ssh/config"
+HOME="$work/home" python3 -c "
+m = {}
+exec(open('$cli').read().split('if __name__')[0], m)
+m['ensure_include']()"
+if [ -L "$work/home/.ssh/config" ]; then echo "  ok: symlinked ~/.ssh/config preserved"
+else echo "  FAIL: symlink clobbered into a regular file"; fails=$((fails + 1)); fi
+contains "Include written through the link" "Include ~/.config/hpc-alloc/ssh_config" \
+  "$work/home/dotfiles/sshconfig"
 
 echo "== stage-D: multi-cluster degradation (offline stand-in; no live 2nd cluster) =="
 mkstate2() {  # two clusters; one alloc on each; grace is unreachable in twocluster mode

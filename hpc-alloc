@@ -338,8 +338,13 @@ def resolve_common(args):
 
 def load_state():
     if STATE_FILE.exists():
-        with open(STATE_FILE) as f:
-            return json.load(f)
+        try:
+            with open(STATE_FILE) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            die(f"{STATE_FILE} is unreadable or corrupt ({e}).\n"
+                "  Fix or remove it — jobs on the cluster are unaffected, and\n"
+                "  `hpc-alloc setup` + `hpc-alloc status` rediscover them.")
     return {"netid": None, "clusters": {}, "allocs": {}}
 
 
@@ -384,25 +389,26 @@ def require_setup(state):
         die("not configured yet — run `hpc-alloc setup --netid YOUR_NETID` first")
 
 
-def machine_id(state=None, persist=True):
+def machine_id(state=None):
     """This machine's ownership id: 12 random hex chars generated once and kept
-    in state.json. Must not be called while holding locked_state (it takes the
-    lock itself when it needs to persist a fresh id)."""
+    in state.json — ALWAYS persisted, even for dry runs: the printed sbatch
+    line must be exactly what a real submission would send, and a pasted
+    command must create a job this machine actually owns. Must not be called
+    while holding locked_state (it takes the lock itself to persist)."""
     state = state if state is not None else load_state()
     mid = state.get("machine_id")
     if mid:
         return mid
     mid = os.urandom(6).hex()
-    if persist:
-        with locked_state() as st:
-            mid = st.setdefault("machine_id", mid)  # a concurrent generator wins
-        state["machine_id"] = mid
+    with locked_state() as st:
+        mid = st.setdefault("machine_id", mid)  # a concurrent generator wins
+    state["machine_id"] = mid
     return mid
 
 
-def machine_tag(persist=True):
+def machine_tag():
     """The --comment ownership tag for jobs submitted by this machine."""
-    return f"hpc-alloc:{machine_id(persist=persist)}:{MACHINE_HOST}"
+    return f"hpc-alloc:{machine_id()}:{MACHINE_HOST}"
 
 
 def login_alias(cluster):
@@ -469,8 +475,10 @@ def ensure_include():
                  existing, re.MULTILINE):
         return
     header = f"# hpc-alloc managed hosts\n{INCLUDE_LINE}\n\n"
-    # atomic: a crash mid-write must not truncate the user's own ssh config
-    atomic_write_600(USER_SSH_CONFIG, header + existing)
+    # atomic, THROUGH any symlink: a crash mid-write must not truncate the
+    # user's config, and replace() on the symlink path itself would silently
+    # convert a dotfiles-managed link into an independent regular file
+    atomic_write_600(USER_SSH_CONFIG.resolve(), header + existing)
     info(f"added '{INCLUDE_LINE}' to {USER_SSH_CONFIG}")
 
 
@@ -1107,7 +1115,7 @@ def submit_prefix():
 
 def build_submit(args, jobname, logfile, partition, wrap, chdir=None):
     """The complete remote sbatch command line (shared by up and run)."""
-    sbatch = resource_args(args, jobname, logfile, machine_tag(persist=not args.dry_run))
+    sbatch = resource_args(args, jobname, logfile, machine_tag())
     sbatch.append(f"--partition={partition}")
     if chdir:
         sbatch.append(f"--chdir={chdir}")
@@ -1962,6 +1970,11 @@ def cmd_logs(args):
         alloc = state["allocs"][target]
         cluster, jobid = alloc["cluster"], alloc["jobid"]
         logpath = f"{REMOTE_LOG_DIR}/{jobid}.log"
+        if not args.follow:
+            # the pending guard below needs the queue row for NAME targets too
+            # (streaming handles pending safely on its own; a plain tail of a
+            # not-yet-created log would poison the NFS negative-lookup cache)
+            q0 = squeue_all(cluster).get(jobid)
     elif target.isdigit():
         jobid = target
         cluster, q0, _ = locate_job(state, jobid, cluster)
