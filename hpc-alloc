@@ -231,6 +231,8 @@ def cfg(*path, default=None):
 def cfg_int(value, name):
     if value is None:
         return None
+    if isinstance(value, bool):  # int(True) == 1 would silently pass
+        die(f"{CONFIG_TOML}: {name} must be an integer, got {str(value).lower()}")
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -256,10 +258,15 @@ def resolve_common(args):
     cluster = getattr(args, "cluster", None)
     if getattr(args, "time", "") is None:
         args.time = resolve_option("time", cluster, DEFAULT_TIME)[0]
+        if not isinstance(args.time, str):
+            die(f'{CONFIG_TOML}: time must be a quoted Slurm duration like "4:00:00", '
+                f"got {args.time!r} (a bare TOML integer would mean MINUTES to Slurm)")
     if getattr(args, "cpus", "") is None:
         args.cpus = cfg_int(resolve_option("cpus", cluster)[0], "cpus") or DEFAULT_CPUS
     if getattr(args, "mem", "") is None:
         args.mem = resolve_option("mem", cluster)[0]
+        if args.mem is not None and not isinstance(args.mem, str):
+            die(f'{CONFIG_TOML}: mem must be a quoted string like "64G", got {args.mem!r}')
 
 
 # ---------------------------------------------------------------- state
@@ -840,6 +847,20 @@ def pick_partition(args):
     return resolve_option("partition", args.cluster, DEFAULT_PARTITION)[0]
 
 
+def submit_job(cluster, remote_cmd):
+    """sbatch --parsable submit; returns the jobid. An interrupt mid-round-trip
+    may leave a queued job behind — say so instead of exiting silently."""
+    try:
+        r = login_run(cluster, remote_cmd)
+    except KeyboardInterrupt:
+        die("interrupted during submission — a job MAY already be queued; run "
+            "`hpc-alloc status` (an untracked job appears in the runs list)", code=130)
+    jobid = r.stdout.strip().split(";")[0]
+    if not jobid.isdigit():
+        die(f"unexpected sbatch output: {r.stdout.strip()}")
+    return jobid
+
+
 def cmd_up(args):
     name = args.name
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name) or name in ("login", "run"):
@@ -878,10 +899,7 @@ def cmd_up(args):
             die(f"allocation '{name}' already exists (job {existing['jobid']}, {q[0]}). "
                 f"Use --name for a second one, or `hpc-alloc down {name}`.")
 
-    r = login_run(cluster, remote_cmd)
-    jobid = r.stdout.strip().split(";")[0]
-    if not jobid.isdigit():
-        die(f"unexpected sbatch output: {r.stdout.strip()}")
+    jobid = submit_job(cluster, remote_cmd)
     alloc = {
         "name": name, "cluster": cluster, "jobid": jobid, "node": None,
         "partition": partition, "time": args.time, "gpus": args.gpus,
@@ -1253,10 +1271,7 @@ def cmd_run(args):
         print(remote_cmd)
         return
 
-    r = login_run(cluster, remote_cmd)
-    jobid = r.stdout.strip().split(";")[0]
-    if not jobid.isdigit():
-        die(f"unexpected sbatch output: {r.stdout.strip()}")
+    jobid = submit_job(cluster, remote_cmd)
     logpath = f"{REMOTE_LOG_DIR}/run-{jobid}.log"
     if args.detach:
         info(f"submitted run job {jobid} on {partition} ({args.time} limit, log: ~/{logpath})")
@@ -1582,6 +1597,10 @@ def cmd_config(args):
           f"{ident or '(not pinned — ssh offers every key)':<28} "
           f"[{'config' if ident else 'builtin'}]")
     for cname, over in sorted((out["cluster_overrides"] or {}).items()):
+        if not isinstance(over, dict):  # e.g. `[cluster]` with `bouchet = "host"`
+            print(f"  cluster.{cname}: IGNORED — expected a [cluster.{cname}] table, "
+                  f"got {over!r}")
+            continue
         if not over:  # section exists but everything is commented out
             continue
         pairs = ", ".join(f"{k}={v}" for k, v in over.items())
@@ -1808,6 +1827,10 @@ def main():
     except KeyboardInterrupt:
         print()
         sys.exit(130)
+    except BrokenPipeError:
+        # downstream reader (| head) closed the pipe: not an error, not a traceback
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(141)  # 128+SIGPIPE, distinct from job-failure exit codes
     except ConnectionLost as e:
         die(f"lost connection to the cluster ({e}).\n"
             "  Reconnect the VPN if needed, run `hpc-alloc connect` in a terminal, then retry.",

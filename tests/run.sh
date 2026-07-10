@@ -210,6 +210,21 @@ hpc gone logs 9123 -f > "$work/out" 2>&1
 check "logs -f is a watcher: exit 0 even for non-COMPLETED job" 0 $?
 contains "outcome still reported informationally" "TIMEOUT" "$work/out"
 
+echo "== stage-4: config input hardening =="
+mkstate null
+printf '[defaults]\nidle_timeout = true\n' > "$work/home/.config/hpc-alloc/config.toml"
+hpc running up --dry-run -G 1 > "$work/out" 2>&1
+check "bool idle_timeout rejected" 1 $?
+contains "clear type message" "must be an integer, got true" "$work/out"
+printf '[defaults]\ntime = 8\n' > "$work/home/.config/hpc-alloc/config.toml"
+hpc running up --dry-run > "$work/out" 2>&1
+check "integer time rejected" 1 $?
+contains "duration guidance" "quoted Slurm duration" "$work/out"
+printf '[cluster]\nbouchet = "bouchet.ycrc.yale.edu"\n' > "$work/home/.config/hpc-alloc/config.toml"
+hpc running config > "$work/out" 2>&1
+check "non-table [cluster] value survives" 0 $?
+contains "misuse explained" "IGNORED" "$work/out"
+
 echo "== scenario: cancel safety =="
 mkstate '"r806u23n04"'; : > "$HPCTEST_LOG"
 hpc running cancel 9200 > "$work/out" 2>&1; check "cancel own run job" 0 $?
