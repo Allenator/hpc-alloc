@@ -185,7 +185,7 @@ hpc running up --dry-run > "$work/out" 2>&1; check "invalid config tolerated" 0 
 contains "config warning printed" "ignoring config.toml" "$work/out"
 mkstate '"r806u23n04"'
 HPCTEST_SCANCEL_RC=1 hpc running down h200 > "$work/out" 2>&1
-check "down survives scancel failure" 0 $?
+check "down signals scancel failure (exit 1)" 1 $?
 contains "state kept on scancel failure" "keeping it in state" "$work/out"
 check "alloc preserved after failed scancel" 1 "$(allocs_left)"
 echo '{"netid":"ab1234","clusters":{"bouchet":{"host":"bouchet.ycrc.yale.edu"}},"allocs":{}}' \
@@ -209,6 +209,27 @@ mkstate '"r806u23n04"'
 hpc gone logs 9123 -f > "$work/out" 2>&1
 check "logs -f is a watcher: exit 0 even for non-COMPLETED job" 0 $?
 contains "outcome still reported informationally" "TIMEOUT" "$work/out"
+
+echo "== stage-5: P3 batch =="
+mkstate '"oldnode"'
+hpc running status > "$work/out" 2>&1; check "requeue detected" 0 $?
+contains "node move reported" "moved: oldnode -> r806u23n04" "$work/out"
+contains "alias points at new node" "r806u23n04" "$work/out"
+mkstate null
+hpc suspended why h200 > "$work/out" 2>&1; check "why on suspended job" 0 $?
+contains "no false running claim" "SUSPENDED — not running" "$work/out"
+out="$(hpc running run --dry-run -- echo hi 2>/dev/null)"
+case "$out" in *'$HOME'*) echo "  FAIL: dry-run not pastable"; fails=$((fails + 1));;
+  *".hpc-alloc/run-%j.log"*) echo "  ok: run dry-run pastable (relative log path)";;
+  *) echo "  FAIL: log path missing"; fails=$((fails + 1));; esac
+rm -rf "$work/home/.ssh" && mkdir -p "$work/home/.ssh"
+printf '# Include ~/.config/hpc-alloc/ssh_config\n' > "$work/home/.ssh/config"
+HOME="$work/home" python3 -c "
+m = {}
+exec(open('$cli').read().split('if __name__')[0], m)
+m['ensure_include']()"
+n=$(grep -c '^Include ~/.config/hpc-alloc/ssh_config' "$work/home/.ssh/config")
+check "commented Include no longer satisfies the guard" 1 "$n"
 
 echo "== stage-4: config input hardening =="
 mkstate null

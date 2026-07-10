@@ -286,6 +286,8 @@ def save_state(state):
         tmp.write_text(data)
         tmp.chmod(0o600)
         tmp.replace(STATE_FILE)
+    else:
+        STATE_FILE.chmod(0o600)  # self-heal loose permissions even when unchanged
     rebuild_ssh_config(state)
 
 
@@ -365,6 +367,7 @@ def rebuild_ssh_config(state):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     text = "\n".join(lines)
     if SSH_CONFIG.exists() and SSH_CONFIG.read_text() == text:
+        SSH_CONFIG.chmod(0o600)  # self-heal permissions; skip the rewrite
         return  # avoid needless truncate-rewrite windows for concurrent ssh readers
     tmp = SSH_CONFIG.with_suffix(".tmp")
     tmp.write_text(text)
@@ -376,7 +379,9 @@ def ensure_include():
     """Make ~/.ssh/config Include our managed file (prepended, once)."""
     SSH_DIR.mkdir(mode=0o700, exist_ok=True)
     existing = USER_SSH_CONFIG.read_text() if USER_SSH_CONFIG.exists() else ""
-    if INCLUDE_LINE in existing:
+    # match an UNCOMMENTED Include line — '# Include ...' must not satisfy this
+    if re.search(r"^[ \t]*Include[ \t]+~/\.config/hpc-alloc/ssh_config[ \t]*$",
+                 existing, re.MULTILINE):
         return
     header = f"# hpc-alloc managed hosts\n{INCLUDE_LINE}\n\n"
     USER_SSH_CONFIG.write_text(header + existing)
@@ -676,20 +681,24 @@ def remote_home(cluster, state):
     return cfg["home"]
 
 
-def gpu_util(alias, timeout=15):
-    """Max GPU utilization % on a node, or None if unqueryable."""
-    try:
-        r = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", alias,
-             "nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        return None
-    if r.returncode != 0:
-        return None
-    vals = [int(x) for x in r.stdout.split() if x.strip().isdigit()]
-    return max(vals) if vals else None
+def gpu_util(alias, timeout=12):
+    """Max GPU utilization % on a node, or None if unqueryable. A failed first
+    attempt heals a possibly-stale node master and retries once — otherwise a
+    dead mux makes every `status` show '-' forever."""
+    for attempt in range(2):
+        try:
+            r = subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", alias,
+                 "nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            r = None
+        if r is not None and r.returncode == 0:
+            vals = [int(x) for x in r.stdout.split() if x.strip().isdigit()]
+            return max(vals) if vals else None
+        close_master(alias)  # heal, then one retry
+    return None
 
 
 def timeleft_minutes(s):
@@ -778,8 +787,11 @@ def cmd_setup(args):
         info(f"wrote {CONFIG_TOML} (defaults + pinned SSH key; edit to taste)")
 
     with locked_state() as state:
+        prior_netid = state.get("netid")
         state["netid"] = netid
         existing = state.setdefault("clusters", {}).get(cluster, {})
+        if (prior_netid and prior_netid != netid) or existing.get("host") not in (None, host):
+            existing.pop("home", None)  # cached remote home may belong to the old identity
         state["clusters"][cluster] = {**existing, "host": host}
     ensure_include()
     info(f"configured cluster '{cluster}' ({host}) for NetID '{netid}'")
@@ -845,6 +857,18 @@ def pick_partition(args):
         info(f"--gpus given without --partition; using '{part}'")
         return part
     return resolve_option("partition", args.cluster, DEFAULT_PARTITION)[0]
+
+
+def locate_job(state, jobid, preferred):
+    """Which configured cluster hosts this job right now? Searches the preferred
+    cluster first (numeric job ids are per-cluster counters and can collide).
+    Returns (cluster, row_or_None)."""
+    order = [preferred] + [c for c in state.get("clusters", {}) if c != preferred]
+    for c in order:
+        q = squeue_all(c).get(jobid)
+        if q is not None:
+            return c, q
+    return preferred, None
 
 
 def submit_job(cluster, remote_cmd):
@@ -936,6 +960,7 @@ def wait_for_running(alloc, timeout):
     name, cluster, jobid = alloc["name"], alloc["cluster"], alloc["jobid"]
     start = time.monotonic()
     printed_estimate = False
+    misses = 0
     try:
         while True:
             try:
@@ -953,6 +978,10 @@ def wait_for_running(alloc, timeout):
             if q and q[0] in ENDED_STATES:
                 q = None
             if q is None:
+                misses += 1
+                if misses < 2:  # one absent poll is inconclusive (controller lag/failover)
+                    time.sleep(3)
+                    continue
                 try:
                     r = login_run(cluster, f"sacct -j {jobid} -X -n -o State%20,ExitCode", check=False)
                     final = r.stdout.strip() or "unknown (left the queue)"
@@ -965,6 +994,7 @@ def wait_for_running(alloc, timeout):
                 die(f"job {jobid} ended before starting: {final}\n"
                     f"log (on the cluster): ~/{REMOTE_LOG_DIR}/{jobid}.log\n"
                     f"diagnose with: hpc-alloc why {jobid}")
+            misses = 0
             st_, node, reason, time_left, _part = q
             if st_ == "RUNNING":
                 forget_hostkey(node)
@@ -1045,7 +1075,9 @@ def refresh_status(state):
         for name, alloc in sorted(list(st["allocs"].items())):
             q = queues.get(alloc["cluster"], {}).get(alloc["jobid"])
             if q is None or q[0] in ENDED_STATES:
-                if (name, alloc.get("jobid")) not in pre:
+                # only an ABSENT row is inconclusive for a post-snapshot alloc; a row
+                # in an ENDED state is post-submission evidence — report the death
+                if q is None and (name, alloc.get("jobid")) not in pre:
                     rows.append((alloc, "SUBMITTING", ""))  # created after our snapshot
                     continue
                 if alloc.get("node"):
@@ -1125,14 +1157,16 @@ def cmd_status(args):
         print()
         fmt = "{:<9} {:<12} {:<12} {:<14} {:<11} {}"
         print(fmt.format("RUN JOB", "STATE", "PARTITION", "NODE", "LEFT", "ACTION"))
+        default_cluster = cfg("defaults", "cluster") or DEFAULT_CLUSTER
         for rj in runs:
+            sfx = "" if rj["cluster"] == default_cluster else f" --cluster {rj['cluster']}"
             if rj["kind"] == "run":
-                hint = f"hpc-alloc logs {rj['jobid']} -f"
+                hint = f"hpc-alloc logs {rj['jobid']} -f{sfx}"
             elif rj["kind"] == "recent":
                 hint = f"just submitted ('{rj['jobname']}') — likely another window; re-check status"
             else:  # a sleeper we no longer track — surface it, don't hide it
                 hint = (f"UNTRACKED allocation ('{rj['jobname']}') — verify it isn't another "
-                        f"machine's, then: hpc-alloc cancel {rj['jobid']}")
+                        f"machine's, then: hpc-alloc cancel {rj['jobid']}{sfx}")
             print(fmt.format(rj["jobid"], rj["state"], rj["partition"], rj["node"] or "-",
                              rj["time_left"] or "-", hint))
 
@@ -1247,7 +1281,11 @@ def cmd_run(args):
     cluster = args.cluster
 
     if args.dry_run:
-        logfile = "$HOME/.hpc-alloc/run-%j.log"
+        # keep the printed command pastable: without --chdir, sbatch runs from
+        # $HOME so a relative --output is exact; with --chdir the remote home
+        # can't be resolved offline
+        logfile = ("$HOME/.hpc-alloc/run-%j.log" if args.chdir
+                   else f"{REMOTE_LOG_DIR}/run-%j.log")
     else:
         state = load_state()
         require_setup(state)
@@ -1269,6 +1307,8 @@ def cmd_run(args):
     remote_cmd = submit_prefix() + " ".join(shlex.quote(a) for a in sbatch)
     if args.dry_run:
         print(remote_cmd)
+        if args.chdir:
+            info("dry-run note: the real submission resolves --output under your remote $HOME")
         return
 
     jobid = submit_job(cluster, remote_cmd)
@@ -1296,9 +1336,14 @@ def stream_job(cluster, jobid, logpath, cancel_on_interrupt=False, verdict=False
             try:
                 live = squeue_query(cluster, [jobid])
                 q = live.get(jobid)
-                if q and q[0] == "PENDING":
+                if q and q[0] != "RUNNING" and q[0] not in ENDED_STATES:
+                    # PENDING/SUSPENDED/CONFIGURING/REQUEUED: nothing to tail yet —
+                    # say so instead of silently polling a frozen log
                     if time.monotonic() - last_note > 30:
-                        info(f"job {jobid}: PENDING (reason: {q[2]})")
+                        note = f"job {jobid}: {q[0]}"
+                        if q[0] == "PENDING" and q[2]:
+                            note += f" (reason: {q[2]})"
+                        info(note)
                         last_note = time.monotonic()
                     time.sleep(5)
                     continue
@@ -1334,8 +1379,10 @@ def stream_job(cluster, jobid, logpath, cancel_on_interrupt=False, verdict=False
             r = login_run(cluster, f"scancel {jobid}", check=False)
             if r.returncode != 0:
                 info(f"scancel failed ({r.stderr.strip()}) — run `hpc-alloc cancel {jobid}`")
-        except (ConnectionLost, SystemExit):  # ensure_login exits via die(SystemExit)
+        except ConnectionLost:
             info(f"could not cancel (connection lost) — run `hpc-alloc cancel {jobid}` later")
+        except SystemExit:  # ensure_login die()d: its own diagnosis is already on stderr
+            info(f"could not cancel — see the error above; run `hpc-alloc cancel {jobid}` later")
         sys.exit(130)
 
     # One last read: epilog output lands after the loop's final poll.
@@ -1391,10 +1438,20 @@ def cmd_logs(args):
         logpath = f"{REMOTE_LOG_DIR}/{jobid}.log"
     elif target.isdigit():
         jobid = target
-        r = login_run(cluster,
-                      f'for f in {REMOTE_LOG_DIR}/run-{jobid}.log {REMOTE_LOG_DIR}/{jobid}.log; '
-                      'do [ -f "$f" ] && echo "$f" && break; done', check=False)
-        logpath = r.stdout.strip() or f"{REMOTE_LOG_DIR}/run-{jobid}.log"
+        cluster, q0 = locate_job(state, jobid, cluster)
+        probe_cmd = (f'for f in {REMOTE_LOG_DIR}/run-{jobid}.log {REMOTE_LOG_DIR}/{jobid}.log; '
+                     'do [ -f "$f" ] && echo "$f" && break; done')
+        r = login_run(cluster, probe_cmd, check=False)
+        logpath = r.stdout.strip()
+        if not logpath and q0 is None:  # ended job: its log may live on another cluster
+            for c in state.get("clusters", {}):
+                if c == cluster:
+                    continue
+                r = login_run(c, probe_cmd, check=False)
+                if r.stdout.strip():
+                    cluster, logpath = c, r.stdout.strip()
+                    break
+        logpath = logpath or f"{REMOTE_LOG_DIR}/run-{jobid}.log"
     else:
         die(f"'{target}' is neither an allocation name nor a job id")
     if args.follow:
@@ -1414,7 +1471,7 @@ def cmd_cancel(args):
     jobid = args.jobid
     if not jobid.isdigit():
         die(f"'{jobid}' is not a job id (for named allocations use `hpc-alloc down NAME`)")
-    q = squeue_all(cluster).get(jobid)
+    cluster, q = locate_job(state, jobid, cluster)
     if q is None:
         r = login_run(cluster, f"sacct -j {jobid} -X -n -P -o JobName", check=False)
         jname = (r.stdout.strip().splitlines() or [""])[0]
@@ -1443,6 +1500,7 @@ def cmd_down(args):
     if not names:
         info("no active allocations")
         return
+    failed = 0
     for name in names:
         alloc = state["allocs"].get(name)
         if not alloc:
@@ -1452,6 +1510,7 @@ def cmd_down(args):
         if r.returncode != 0:
             info(f"scancel FAILED for job {alloc['jobid']} ('{name}'): "
                  f"{r.stderr.strip() or 'unknown error'} — keeping it in state, retry later")
+            failed += 1
             continue
         if alloc.get("node"):
             close_master(alloc_alias(alloc))
@@ -1460,6 +1519,8 @@ def cmd_down(args):
             if cur and cur.get("jobid") == alloc["jobid"]:  # don't pop a concurrent replacement
                 del st["allocs"][name]
         info(f"cancelled job {alloc['jobid']} ('{name}')")
+    if failed:
+        sys.exit(1)  # scripts must not read a failed release as success
 
 
 def cmd_connect(args):
@@ -1619,6 +1680,7 @@ def cmd_why(args):
         name, jobid, cluster = target, alloc["jobid"], alloc["cluster"]
     elif target and target.isdigit():
         jobid = target
+        cluster, _ = locate_job(state, jobid, cluster)  # ids are per-cluster
     elif not target:
         alloc = pick_alloc(state, None)
         name, jobid, cluster = alloc["name"], alloc["jobid"], alloc["cluster"]
@@ -1654,11 +1716,14 @@ def cmd_why(args):
                     detail.append(f"scheduler's estimated start: {est}")
                 r = login_run(cluster, f"sprio -l -j {jobid}", check=False)
                 detail += r.stdout.strip().splitlines()[:3]
-        else:
+        elif st_ == "RUNNING":
             note = f"running on {node}, {left} left"
             if expiring(st_, left):
                 note += " — EXPIRING SOON, sync results out"
             result["diagnosis"] = note
+        else:  # SUSPENDED/CONFIGURING/REQUEUED/... — do not claim it is running
+            result["diagnosis"] = (f"{st_} — not running right now "
+                                   f"(node: {node or 'none assigned'}, {left} on the clock)")
     else:
         result["status"] = "ended"
         r = login_run(cluster, f"sacct -j {jobid} -X -n -P -o State,ExitCode,Elapsed,Timelimit",
