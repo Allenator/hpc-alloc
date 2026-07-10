@@ -111,12 +111,56 @@ Defaults (cluster, partition, time, cpus, mem, idle-timeout) and the pinned SSH
 key live in ~/.config/hpc-alloc/config.toml (see config.example.toml in the
 repo; `hpc-alloc setup` creates it). CLI flags always win.
 
-Exit codes: 0 ok; 1 error; 3 connection lost — reconnect the VPN if needed,
+Exit codes: 0 ok; 1 error (including Slurm/scheduler failures, which
+reconnecting cannot fix); 3 connection lost — reconnect the VPN if needed,
 run `hpc-alloc connect` in a terminal (Duo), then retry."""
 
 
-class ConnectionLost(Exception):
-    """SSH transport to the cluster failed or stalled (VPN drop, sleep/wake...)."""
+class ClusterError(Exception):
+    """Base: the cluster could not answer. Subclasses say WHY, because the
+    remedies are disjoint — healing SSH masters fixes transport problems and
+    does nothing for scheduler ones (conflating them caused infinite reconnect
+    loops and needless master teardowns)."""
+
+
+class ConnectionLost(ClusterError):
+    """SSH transport to the cluster failed or stalled (VPN drop, sleep/wake...).
+    Remedy: heal masters, re-auth (exit 3 tells the user to run `connect`)."""
+
+
+class SlurmError(ClusterError):
+    """Transport is fine but Slurm itself failed to answer (slurmctld down,
+    squeue erroring, cluster-side hang). Re-auth CANNOT help; retry later."""
+
+
+# Patience for scheduler errors in polling loops (seconds). Overridable so the
+# test suite can exercise the give-up path without a 2-minute wait.
+SLURM_RETRY_BUDGET = int(os.environ.get("HPC_ALLOC_SLURM_RETRY_BUDGET", "120"))
+
+
+class SlurmRetry:
+    """Bounded patience for SlurmError inside polling loops. The deadline is set
+    at the FIRST error and never extended by further errors — only a successful
+    query clears it. (A loop that re-enters its retry path must not live forever;
+    that exact bug kept `up` spinning while slurmctld was down.)"""
+
+    def __init__(self, budget=None):
+        self.budget = budget or SLURM_RETRY_BUDGET
+        self.deadline = None
+
+    def ok(self):
+        self.deadline = None
+
+    def wait_or_die(self, cluster, err):
+        now = time.monotonic()
+        if self.deadline is None:
+            self.deadline = now + self.budget
+        if now >= self.deadline:
+            die(f"Slurm on {cluster} kept erroring for {self.budget}s ({err}).\n"
+                "  This is a scheduler problem, not a connection problem — `hpc-alloc connect`\n"
+                "  won't help. Submitted jobs are safe; retry once the cluster recovers.")
+        info(f"Slurm error on {cluster} ({err}) — retrying...")
+        time.sleep(min(10, max(1, self.budget // 12)))
 
 
 def info(msg):
@@ -508,6 +552,16 @@ def probe(alias, timeout=15):
     return "net"
 
 
+def probe_node(alias):
+    """Probe a compute-node alias end-to-end, healing a stale node master once.
+    Returns the final probe status ('ok'|'auth'|'hostkey'|'net')."""
+    st = probe(alias)
+    if st != "ok":
+        close_master(alias)
+        st = probe(alias)
+    return st
+
+
 def try_login(cluster, interactive=None):
     """Establish/verify the login master. Returns bool; never exits."""
     global _last_probe
@@ -629,13 +683,24 @@ def login_run(cluster, remote_cmd, check=True, timeout=60, _retry=True, binary=F
         r.stderr = r.stderr.decode(errors="replace")
     if r is None or r.returncode == 255:  # 255 = ssh transport error
         _verified.discard(cluster)
-        if _retry:
-            # a stale master must not be re-trusted by try_login's fast path
-            heal_connections(load_state(), cluster)
-            if try_login(cluster):
-                return login_run(cluster, remote_cmd, check=check, timeout=timeout,
-                                 _retry=False, binary=binary)
         detail = "command stalled" if r is None else (r.stderr.strip() or "ssh failed")
+        if _retry:
+            # Evidence before healing: if the login link probes healthy, the
+            # failure was the command (slow squeue, cluster-side hang, a mux
+            # hiccup) — tearing down every master would kill the user's live
+            # editor/shell sessions for nothing.
+            if probe(login_alias(cluster)) == "ok":
+                _verified.add(cluster)
+            else:
+                # a stale master must not be re-trusted by try_login's fast path
+                heal_connections(load_state(), cluster)
+                if not try_login(cluster):
+                    raise ConnectionLost(detail)
+            return login_run(cluster, remote_cmd, check=check, timeout=timeout,
+                             _retry=False, binary=binary)
+        if probe(login_alias(cluster)) == "ok":
+            raise SlurmError(f"remote command keeps failing while the connection "
+                             f"probes healthy ({detail})")
         raise ConnectionLost(detail)
     if check and r.returncode != 0:
         die(f"remote command failed on {login_alias(cluster)}: {remote_cmd}\n{r.stderr.strip()}")
@@ -688,11 +753,11 @@ def parse_squeue(text):
 
 def squeue_all(cluster):
     """All of the user's queued/running jobs as {jobid: Job}.
-    Raises ConnectionLost if the queue could not actually be queried — absence
+    Raises ClusterError if the queue could not actually be queried — absence
     of a job is only meaningful when this returns normally."""
     r = login_run(cluster, f"squeue --me -h -o '{SQUEUE_FORMAT}'", check=False)
     if r.returncode != 0:
-        raise ConnectionLost(f"squeue failed: {r.stderr.strip() or 'unknown error'}")
+        raise SlurmError(f"squeue failed: {r.stderr.strip() or 'unknown error'}")
     return parse_squeue(r.stdout)
 
 
@@ -773,7 +838,11 @@ def gpu_utils(aliases, timeout=12):
             vals = [int(x) for x in stdout.split() if x.strip().isdigit()]
             out[alias] = max(vals) if vals else None
         else:
-            close_master(alias)  # heal a possibly-stale node master for next time
+            # Heal only on transport evidence: nvidia-smi can fail (driver
+            # hiccup, job just ended) over a perfectly healthy master, and the
+            # user's live shell/editor sessions ride on that master.
+            if probe(alias, timeout=5) != "ok":
+                close_master(alias)
             out[alias] = None
     return out
 
@@ -941,8 +1010,8 @@ def cancel_job(cluster, jobid):
     """scancel with its outcome actually checked. Returns (ok, detail)."""
     try:
         r = login_run(cluster, f"scancel {jobid}", check=False)
-    except ConnectionLost as e:
-        return False, f"connection lost ({e})"
+    except ClusterError as e:
+        return False, str(e)
     if r.returncode != 0:
         return False, r.stderr.strip() or "unknown error"
     return True, ""
@@ -1049,10 +1118,15 @@ def wait_for_running(alloc, timeout):
     start = time.monotonic()
     printed_estimate = False
     misses = 0
+    slurm = SlurmRetry()
     try:
         while True:
             try:
                 live = squeue_query(cluster, [jobid])
+            except SlurmError as e:
+                # transport is fine — reconnecting can't help; retry briefly
+                slurm.wait_or_die(cluster, e)
+                continue
             except ConnectionLost as e:
                 info(f"connection lost while waiting ({e}) — job {jobid} stays queued regardless")
                 if not can_prompt():
@@ -1062,6 +1136,7 @@ def wait_for_running(alloc, timeout):
                     die(f"could not reconnect. Job {jobid} remains queued; run `hpc-alloc status` "
                         "once back online.", code=EXIT_CONNLOST)
                 continue
+            slurm.ok()
             q = live.get(jobid)
             if q and q.state in ENDED_STATES:
                 q = None
@@ -1074,7 +1149,7 @@ def wait_for_running(alloc, timeout):
                     fin = final_job_state(cluster, jobid, patience=False)
                     final = (f"{fin[0]} (exit {fin[1]})" if fin
                              else "unknown (no accounting record yet)")
-                except ConnectionLost:
+                except ClusterError:
                     final = "unknown"
                 with locked_state() as st:
                     cur = st["allocs"].get(name)
@@ -1102,7 +1177,7 @@ def wait_for_running(alloc, timeout):
                     est = r.stdout.strip()
                     if est and est != "N/A":
                         info(f"scheduler's estimated start time: {est}")
-                except ConnectionLost:
+                except ClusterError:
                     pass
                 printed_estimate = True
             if elapsed > timeout:
@@ -1157,6 +1232,16 @@ def refresh_status(state):
     inserted by a concurrent `up` must not be judged by a pre-submission snapshot."""
     pre = {(n, a.get("jobid")) for n, a in state.get("allocs", {}).items()}
     queues = {c: squeue_all(c) for c in state.get("clusters", {})}
+    # A single absent poll is not death evidence (controller failovers blip rows
+    # out of squeue): confirm absence with a second look before reaping anything.
+    missing = {a["cluster"] for a in state.get("allocs", {}).values()
+               if a["cluster"] in queues and a.get("jobid") not in queues[a["cluster"]]}
+    if missing:
+        info("a tracked job is missing from the queue — confirming before cleanup")
+        time.sleep(3)
+        for c in missing:
+            # union: presence in EITHER poll counts as alive; latest state wins
+            queues[c] = {**queues[c], **squeue_all(c)}
     rows = []
     with locked_state() as st:
         for name, alloc in sorted(list(st["allocs"].items())):
@@ -1290,10 +1375,7 @@ def check_node_reachable(state, alloc):
     """Probe the compute node, healing a stale node master once. Dies with a
     useful message (expired allocation vs connection trouble) if unreachable."""
     alias = alloc_alias(alloc)
-    st = probe(alias)
-    if st != "ok":
-        close_master(alias)
-        st = probe(alias)
+    st = probe_node(alias)
     if st == "ok":
         return
     if st == "hostkey":
@@ -1309,7 +1391,7 @@ def check_node_reachable(state, alloc):
             die(f"allocation '{alloc['name']}' has ended (walltime expiry, scancel, or the "
                 "idle-GPU policy — `hpc-alloc why " + alloc["jobid"] + "` to find out). "
                 "Run `hpc-alloc status` to clean up, then `hpc-alloc up` again.")
-    except ConnectionLost:
+    except ClusterError:
         pass
     die(f"cannot reach node {alloc['node']} — run `hpc-alloc status` first (the job may have "
         "been requeued onto a different node), then `hpc-alloc connect` if the network dropped.",
@@ -1428,6 +1510,8 @@ def stream_job(cluster, jobid, logpath, cancel_on_interrupt=False, verdict=False
     stream — watching succeeded regardless of how the watched job ended."""
     offset = 0
     last_note = 0.0
+    misses = 0
+    slurm = SlurmRetry()
     # NEVER stat the log before the job has started: on NFS (Roberts), probing
     # the not-yet-created file caches the negative lookup on the login node,
     # and the stream then reads empty long after the job wrote output.
@@ -1445,7 +1529,7 @@ def stream_job(cluster, jobid, logpath, cancel_on_interrupt=False, verdict=False
                 r = login_run(cluster, combined, check=False, binary=True)
                 head, _, chunk = r.stdout.partition(b"\x1e")
                 if not head.endswith(b"OK"):
-                    raise ConnectionLost("squeue failed mid-stream")
+                    raise SlurmError("squeue failed mid-stream")
                 q = parse_squeue(head[:-2].decode(errors="replace")).get(jobid)
                 if q and q.state != "RUNNING" and q.state not in ENDED_STATES:
                     # PENDING/SUSPENDED/CONFIGURING/REQUEUED: nothing to tail yet —
@@ -1465,6 +1549,11 @@ def stream_job(cluster, jobid, logpath, cancel_on_interrupt=False, verdict=False
                     sys.stdout.buffer.write(chunk)
                     sys.stdout.buffer.flush()
                     offset += len(chunk)
+                slurm.ok()
+            except SlurmError as e:
+                # transport is fine — reconnecting can't help; retry briefly
+                slurm.wait_or_die(cluster, e)
+                continue
             except ConnectionLost as e:
                 info(f"connection lost ({e}) — job {jobid} keeps running; log: ~/{logpath}")
                 if not can_prompt():
@@ -1474,8 +1563,16 @@ def stream_job(cluster, jobid, logpath, cancel_on_interrupt=False, verdict=False
                     die(f"could not reconnect; job {jobid} continues — reattach with "
                         f"`hpc-alloc logs {jobid} -f`", code=EXIT_CONNLOST)
                 continue
-            if q is None or q.state in ENDED_STATES:
-                break
+            if q and q.state in ENDED_STATES:
+                break  # positive evidence: the queue itself says it ended
+            if q is None:
+                misses += 1
+                if misses >= 2:  # absent twice in a row: it really left the queue
+                    break
+                # one absent poll is inconclusive (controller lag/failover) —
+                # ending the stream on it would strand a still-running job
+            else:
+                misses = 0
             time.sleep(3)
     except KeyboardInterrupt:
         print()
@@ -1499,7 +1596,7 @@ def stream_job(cluster, jobid, logpath, cancel_on_interrupt=False, verdict=False
         if r.stdout:
             sys.stdout.buffer.write(r.stdout)
             sys.stdout.buffer.flush()
-    except ConnectionLost:
+    except ClusterError:
         pass
 
     if not verdict:
@@ -1509,17 +1606,17 @@ def stream_job(cluster, jobid, logpath, cancel_on_interrupt=False, verdict=False
             fin = final_job_state(cluster, jobid, patience=False)
             if fin:
                 info(f"job {jobid} ended: {fin[0]}")
-        except ConnectionLost:
+        except ClusterError:
             pass
         return
 
     # run's contract: never report success without a FINAL accounting record.
-    lost = False
+    lost = None
     fin = None
     try:
         fin = final_job_state(cluster, jobid)
-    except ConnectionLost:
-        lost = True
+    except ClusterError as e:
+        lost = e
     if fin:
         jstate, exitcode = fin
         code = int(exitcode.split(":")[0]) if ":" in exitcode else 0
@@ -1527,9 +1624,10 @@ def stream_job(cluster, jobid, logpath, cancel_on_interrupt=False, verdict=False
             code = 1  # OOM/TIMEOUT/CANCELLED/NODE_FAIL/... must not read as success
         info(f"job {jobid} finished: {jstate} (exit {code})")
         sys.exit(code)
-    if lost:
-        die(f"job {jobid} ended but the connection dropped before its final state was "
-            f"fetched — check `hpc-alloc why {jobid}`", code=EXIT_CONNLOST)
+    if lost is not None:
+        die(f"job {jobid} ended but its final state could not be fetched ({lost}) — "
+            f"check `hpc-alloc why {jobid}`",
+            code=EXIT_CONNLOST if isinstance(lost, ConnectionLost) else 1)
     die(f"job {jobid} left the queue but accounting shows no FINAL state after ~30s — "
         f"check `hpc-alloc why {jobid}` (not reporting success without evidence)")
 
@@ -1637,8 +1735,18 @@ def cmd_connect(args):
     if args.reset:
         heal_connections(state, cluster)
         info("closed login and compute-node master connections; swept dead sockets")
-    if args.push and not try_login(cluster, interactive=False):
-        if _last_probe == "auth":
+    if args.push:
+        # End-to-end evidence, not the master fast path: --push exists for
+        # re-auth after sleep/VPN drop — exactly when a master looks alive but
+        # its TCP is dead, and the fast path would silently swallow the push.
+        alias = login_alias(cluster)
+        st = probe(alias)
+        if st != "ok" and master_alive(cluster):
+            heal_connections(state, cluster)  # dead master shadowing the alias
+            st = probe(alias)
+        if st == "ok":
+            _verified.add(cluster)
+        elif st == "auth":
             push_login(cluster)
         # 'net'/'hostkey': a push cannot help — fall through to ensure_login,
         # whose diagnosis (VPN down / host key changed) is the accurate one.
@@ -1648,11 +1756,7 @@ def cmd_connect(args):
     for name, alloc in sorted(state["allocs"].items()):
         if alloc["cluster"] != cluster or not alloc.get("node"):
             continue
-        alias = alloc_alias(alloc)
-        st = probe(alias)
-        if st != "ok":
-            close_master(alias)
-            st = probe(alias)
+        st = probe_node(alloc_alias(alloc))
         if st == "ok":
             info(f"node {alloc['node']} ('{name}'): OK")
         elif st == "hostkey":
@@ -2004,6 +2108,11 @@ def main():
         # downstream reader (| head) closed the pipe: not an error, not a traceback
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         sys.exit(141)  # 128+SIGPIPE, distinct from job-failure exit codes
+    except SlurmError as e:
+        die(f"cluster-side failure ({e}).\n"
+            "  The SSH connection is healthy — this is a Slurm/scheduler problem on the\n"
+            "  cluster, so `hpc-alloc connect` will not help. Submitted jobs and\n"
+            "  allocations are unaffected; retry in a few minutes.")
     except ConnectionLost as e:
         die(f"lost connection to the cluster ({e}).\n"
             "  Reconnect the VPN if needed, run `hpc-alloc connect` in a terminal, then retry.",

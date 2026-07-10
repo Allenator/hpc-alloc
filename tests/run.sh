@@ -138,10 +138,12 @@ mkstate '"r806u23n04"'
 hpc down status > "$work/out" 2>&1; check "exit code" 3 $?
 check "alloc preserved" 1 "$(allocs_left)"
 
-echo "== scenario: slurmctld error (state must survive) =="
+echo "== scenario: slurmctld error (state must survive; NOT exit 3) =="
 mkstate '"r806u23n04"'
-hpc squeue-err status > "$work/out" 2>&1; check "exit code" 3 $?
+hpc squeue-err status > "$work/out" 2>&1
+check "exit code (scheduler error is 1: connect cannot help)" 1 $?
 check "alloc preserved" 1 "$(allocs_left)"
+contains "connect explicitly ruled out" 'connect` will not help' "$work/out"
 
 echo "== scenario: job gone (reap + why forensics) =="
 mkstate '"r806u23n04"'
@@ -359,6 +361,68 @@ diff = [f"  T:{a!r}\n  E:{b!r}" for a, b in zip(tpl, ex) if a != b]
 assert tpl == ex, "CONFIG_TEMPLATE and config.example.toml drifted:\n" + "\n".join(diff)
 print("  ok: config.example.toml matches CONFIG_TEMPLATE")
 PY
+
+echo "== stage-A: bounded scheduler-error retries (no infinite loop) =="
+mkstate null
+HOME="$work/home" HPCTEST_MODE=squeue-err HPC_ALLOC_SLURM_RETRY_BUDGET=2 PATH="$here/shim:$PATH" \
+  "$cli" up --name t2 -p day > "$work/out" 2>&1 </dev/null &
+BPID=$!
+n=0; while kill -0 $BPID 2>/dev/null && [ $n -lt 45 ]; do sleep 1; n=$((n+1)); done
+if kill -0 $BPID 2>/dev/null; then
+  kill -9 $BPID 2>/dev/null; wait $BPID 2>/dev/null
+  echo "  FAIL: up loops forever on scheduler errors"; fails=$((fails + 1))
+else
+  wait $BPID; check "up gives up with exit 1" 1 $?
+  contains "diagnosis names the scheduler" "scheduler problem" "$work/out"
+fi
+
+echo "== stage-A: stale master healed on evidence =="
+mkstate '"r806u23n04"'
+: > "$HPCTEST_LOG"; rm -f "$work/stale.mark"
+HPCTEST_MARK="$work/stale.mark" hpc stale status > "$work/out" 2>&1
+check "status survives a stale master" 0 $?
+contains "queue read after heal" "r806u23n04" "$work/out"
+contains "master was healed (evidence: probe failed)" "MUXEXIT" "$HPCTEST_LOG"
+
+echo "== stage-A: healthy connection is never healed =="
+mkstate '"r806u23n04"'
+: > "$HPCTEST_LOG"; rm -f "$work/flaky.mark"
+HPCTEST_MARK="$work/flaky.mark" hpc flaky status > "$work/out" 2>&1
+check "one-off ssh failure retried" 0 $?
+if grep -q "MUXEXIT" "$HPCTEST_LOG"; then
+  echo "  FAIL: healthy masters torn down on a command failure"; fails=$((fails + 1))
+else echo "  ok: no heal when the connection probes healthy"; fi
+
+echo "== stage-A: push reaches Duo despite a stale-looking master =="
+mkstate null
+rm -f "$work/sd.mark" "$work/sd.mark.heal"
+HPCTEST_MARK="$work/sd.mark" hpc stale-duo connect --push > "$work/out" 2>&1
+check "push sent despite stale master" 0 $?
+contains "push approved after heal" "Duo approved" "$work/out"
+if [ -f "$work/sd.mark.heal" ]; then echo "  ok: stale master healed before the push"
+else echo "  FAIL: no heal before push"; fails=$((fails + 1)); fi
+
+echo "== stage-A: one absent poll never reaps or ends a stream =="
+mkstate '"r806u23n04"'
+rm -f "$work/blip.n"
+HPCTEST_COUNT="$work/blip.n" hpc blip status > "$work/out" 2>&1
+check "blip status exit" 0 $?
+check "alloc NOT reaped on a single absent poll" 1 "$(allocs_left)"
+contains "second look confirmed it alive" "RUNNING" "$work/out"
+mkstate null
+rm -f "$work/flap.n"
+HPCTEST_COUNT="$work/flap.n" hpc flap run -- echo hi > "$work/out" 2>&1
+check "run survives a one-poll queue blip (exit 0)" 0 $?
+contains "stream continued after the blip" "after-blip" "$work/out"
+
+echo "== stage-A: nvidia-smi failure must not kill a healthy node master =="
+mkstate '"r806u23n04"'
+: > "$HPCTEST_LOG"
+hpc gpu-fail status > "$work/out" 2>&1
+check "gpu probe failure tolerated" 0 $?
+if grep -q "MUXEXIT.*h200" "$HPCTEST_LOG"; then
+  echo "  FAIL: healthy node master closed on nvidia-smi failure"; fails=$((fails + 1))
+else echo "  ok: node master kept when transport is healthy"; fi
 
 echo "== scenario: avail digest =="
 mkstate null

@@ -6,12 +6,25 @@
 #   running     alloc 9123 + run job 9200 + foreign job 9300 all RUNNING
 #   pending-qos 9123 PENDING on a QOS cap
 #   expiring    9123 RUNNING with 12 minutes left
-# scancel invocations are appended to $HPCTEST_LOG.
+#   stale       master looks alive (-O check ok) but commands fail until a heal
+#               (-O exit touches $HPCTEST_MARK); then behaves like `running`
+#   stale-duo   stale master, and after healing auth needs Duo (askpass marker)
+#   flaky       first squeue dies 255, probes fine — must retry WITHOUT healing
+#   blip        squeue poll 1 omits job 9123, later polls show it RUNNING
+#   flap        job 7777: RUNNING, absent, RUNNING, then gone (via $HPCTEST_COUNT)
+#   gpu-fail    like running but nvidia-smi fails (transport stays healthy)
+# scancel and -O exit invocations are appended to $HPCTEST_LOG.
 mode="${HPCTEST_MODE:?set HPCTEST_MODE}"
 all="$*"
 
 case "$all" in
-  *"-O exit"*) exit 0 ;;
+  *"-O exit"*)
+    echo "MUXEXIT: $all" >> "${HPCTEST_LOG:-/dev/null}"
+    case "$mode" in
+      stale) touch "${HPCTEST_MARK:?}" ;;
+      stale-duo) touch "${HPCTEST_MARK:?}.heal" ;;
+    esac
+    exit 0 ;;
   *"-O check"*)
     case "$mode" in
       down|hostkey) echo "no master" >&2; exit 255 ;;
@@ -38,11 +51,44 @@ if [ "$mode" = duo ] && [ ! -f "${HPCTEST_MARK:?}" ]; then
   exit 255
 fi
 
+# stale: every command through the "master" fails until it has been healed
+if [ "$mode" = stale ] && [ ! -f "${HPCTEST_MARK:?}" ]; then
+  echo "mux_client_request_session: session request failed: Session open refused" >&2
+  exit 255
+fi
+
+# stale-duo: same, and the fresh connection after healing needs Duo
+if [ "$mode" = stale-duo ]; then
+  if [ ! -f "${HPCTEST_MARK:?}.heal" ]; then
+    echo "mux_client_request_session: session request failed: Session open refused" >&2
+    exit 255
+  fi
+  if [ ! -f "$HPCTEST_MARK" ]; then
+    if [ -n "${SSH_ASKPASS:-}" ]; then touch "$HPCTEST_MARK"; exit 0; fi
+    echo "ab1234@bouchet.ycrc.yale.edu: Permission denied (keyboard-interactive)." >&2
+    exit 255
+  fi
+fi
+
+# flaky: the first squeue dies mid-flight; probes and retries succeed
+if [ "$mode" = flaky ] && [ ! -f "${HPCTEST_MARK:?}" ]; then
+  case "$all" in *squeue*)
+    touch "$HPCTEST_MARK"
+    echo "packet_write_wait: Connection to bouchet port 22: Broken pipe" >&2
+    exit 255 ;;
+  esac
+fi
+
+bump_count() {  # per-squeue-poll counter for the stateful modes
+  n=$(cat "${HPCTEST_COUNT:?}" 2>/dev/null || echo 0)
+  echo $((n + 1)) > "$HPCTEST_COUNT"
+}
+
 squeue_rows() {
   case "$mode" in
     squeue-err) echo "slurm_load_jobs error: Unable to contact slurm controller" >&2; return 1 ;;
     gone) ;;
-    running)
+    running|stale|flaky|gpu-fail)
       h="$(hostname -s)"
       printf '9123|RUNNING|r806u23n04|None|3:59:00|gpu_h200|hpcalloc-h200|2020-01-01T00:00:00|hpc-alloc:%s\n' "$h"
       printf '9200|RUNNING|r801u01n01|None|1:00:00|gpu|hpcalloc-run|2020-01-01T00:00:00|hpc-alloc:%s\n' "$h"
@@ -53,6 +99,16 @@ squeue_rows() {
     pending-qos) echo '9123|PENDING||QOSMaxGRESPerUser|8:00:00|gpu_h200|hpcalloc-h200|2020-01-01T00:00:00|' ;;
     expiring) echo '9123|RUNNING|r806u23n04|None|0:12:00|gpu_h200|hpcalloc-h200|2020-01-01T00:00:00|' ;;
     suspended) echo '9123|SUSPENDED|r806u23n04|None|3:59:00|gpu_h200|hpcalloc-h200|2020-01-01T00:00:00|' ;;
+    blip)  # first poll: job missing; confirm-poll and later: RUNNING
+      bump_count
+      if [ "$n" -ge 1 ]; then
+        echo '9123|RUNNING|r806u23n04|None|3:59:00|gpu_h200|hpcalloc-h200|2020-01-01T00:00:00|'
+      fi ;;
+    flap)  # job 7777: RUNNING, one-poll blip, RUNNING again, then really gone
+      bump_count
+      case "$n" in
+        0|2) echo '7777|RUNNING|r801u01n01|None|1:00:00|gpu|hpcalloc-run|2020-01-01T00:00:00|' ;;
+      esac ;;
   esac
   return 0
 }
@@ -65,7 +121,11 @@ case "$all" in
   *"squeue --me"*"printf OK"*)  # stream_job's combined queue+log poll
     squeue_rows || exit 1
     printf 'OK\036'
-    echo "epoch 1: loss 0.42" ;;
+    if [ "$mode" = flap ] && [ "$(cat "$HPCTEST_COUNT" 2>/dev/null || echo 0)" -ge 3 ]; then
+      echo "after-blip"  # content only reachable if the stream survives the blip
+    else
+      echo "epoch 1: loss 0.42"
+    fi ;;
   *"squeue --me"*)
     squeue_rows || exit 1 ;;
   *"--start"*) echo "2026-07-09T18:00:00" ;;
@@ -95,7 +155,9 @@ SINFO
     printf 'PARTITION|AVAIL|TIMELIMIT|NODES|CPUS|MEMORY|GRES|AVAIL_FEATURES\n'
     printf 'day*|up|1-00:00:00|76|64|990000|(null)|era,nogpu\n'
     printf 'gpu_h200|up|2-00:00:00|7|64|990000|gpu:h200:8|h200\n' ;;
-  *nvidia-smi*) printf '42\n17\n' ;;
+  *nvidia-smi*)
+    if [ "$mode" = gpu-fail ]; then exit 1; fi
+    printf '42\n17\n' ;;
   *'printf "%s" "$HOME"'*) printf '/home/ab1234' ;;
   *"for f in"*) echo ".hpc-alloc/run-9200.log" ;;
   *tail*) echo "epoch 1: loss 0.42" ;;
