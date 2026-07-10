@@ -160,14 +160,18 @@ contains "gpu util shown" "42%" "$work/out"
 contains "run job listed" "9200" "$work/out"
 contains "orphan sleeper surfaced" "UNTRACKED" "$work/out"
 contains "fresh sleeper not cancel-hinted" "just submitted" "$work/out"
+contains "other machine's alloc labelled, no cancel hint" "created on 'othermachine'" "$work/out"
 hpc running status --json 2>/dev/null > "$work/out"
 python3 -c "
 import json; d = json.load(open('$work/out'))    # stdout must be pure JSON
 kinds = {r['jobid']: r['kind'] for r in d['runs']}
-assert kinds == {'9200': 'run', '9400': 'orphan', '9500': 'recent'}, kinds
+assert kinds == {'9200': 'run', '9400': 'orphan', '9500': 'recent',
+                 '9600': 'other-machine'}, kinds
 assert [r['orphan'] for r in d['runs']] == [r['kind'] == 'orphan' for r in d['runs']]
+owners = {r['jobid']: r['owner'] for r in d['runs']}
+assert owners['9600'] == 'othermachine' and owners['9300'] is None if '9300' in owners else True
 assert d['allocs'][0]['gpu_util'] == 42
-print('  ok: json kinds (run/orphan/recent), stdout pure, gpu_util=42')" || fails=$((fails + 1))
+print('  ok: json kinds incl. other-machine ownership, stdout pure, gpu_util=42')" || fails=$((fails + 1))
 hpc running up --dry-run --name run > "$work/out" 2>&1
 check "name 'run' reserved" 1 $?
 

@@ -48,14 +48,16 @@ case "$all" in
       squeue-err) echo "slurm_load_jobs error: Unable to contact slurm controller" >&2; exit 1 ;;
       gone) ;;
       running)
-        printf '9123|RUNNING|r806u23n04|None|3:59:00|gpu_h200|hpcalloc-h200|2020-01-01T00:00:00\n'
-        printf '9200|RUNNING|r801u01n01|None|1:00:00|gpu|hpcalloc-run|2020-01-01T00:00:00\n'
-        printf '9300|RUNNING|r802u02n02|None|2:00:00|day|myjob|2020-01-01T00:00:00\n'
-        printf '9400|RUNNING|r803u03n03|None|5:00:00|day|hpcalloc-stale|2020-01-01T00:00:00\n'
-        printf '9500|RUNNING|r804u04n04|None|5:59:00|day|hpcalloc-fresh|%s\n' "$(date +%Y-%m-%dT%H:%M:%S)" ;;
-      pending-qos) echo '9123|PENDING||QOSMaxGRESPerUser|8:00:00|gpu_h200|hpcalloc-h200|2020-01-01T00:00:00' ;;
-      expiring) echo '9123|RUNNING|r806u23n04|None|0:12:00|gpu_h200|hpcalloc-h200|2020-01-01T00:00:00' ;;
-      suspended) echo '9123|SUSPENDED|r806u23n04|None|3:59:00|gpu_h200|hpcalloc-h200|2020-01-01T00:00:00' ;;
+        h="$(hostname -s)"
+        printf '9123|RUNNING|r806u23n04|None|3:59:00|gpu_h200|hpcalloc-h200|2020-01-01T00:00:00|hpc-alloc:%s\n' "$h"
+        printf '9200|RUNNING|r801u01n01|None|1:00:00|gpu|hpcalloc-run|2020-01-01T00:00:00|hpc-alloc:%s\n' "$h"
+        printf '9300|RUNNING|r802u02n02|None|2:00:00|day|myjob|2020-01-01T00:00:00|\n'
+        printf '9400|RUNNING|r803u03n03|None|5:00:00|day|hpcalloc-stale|2020-01-01T00:00:00|hpc-alloc:%s\n' "$h"
+        printf '9500|RUNNING|r804u04n04|None|5:59:00|day|hpcalloc-fresh|%s|hpc-alloc:%s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$h"
+        printf '9600|RUNNING|r805u05n05|None|4:00:00|day|hpcalloc-dev|2020-01-01T00:00:00|hpc-alloc:othermachine\n' ;;
+      pending-qos) echo '9123|PENDING||QOSMaxGRESPerUser|8:00:00|gpu_h200|hpcalloc-h200|2020-01-01T00:00:00|' ;;
+      expiring) echo '9123|RUNNING|r806u23n04|None|0:12:00|gpu_h200|hpcalloc-h200|2020-01-01T00:00:00|' ;;
+      suspended) echo '9123|SUSPENDED|r806u23n04|None|3:59:00|gpu_h200|hpcalloc-h200|2020-01-01T00:00:00|' ;;
     esac ;;
   *"--start"*) echo "2026-07-09T18:00:00" ;;
   *sprio*) printf 'JOBID PRIORITY AGE FAIRSHARE\n9123 1200 300 900\n' ;;

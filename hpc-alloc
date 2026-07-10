@@ -25,6 +25,7 @@ import argparse
 import fcntl
 import json
 import os
+import platform
 import re
 import shlex
 import signal
@@ -45,6 +46,10 @@ USER_SSH_CONFIG = SSH_DIR / "config"
 INCLUDE_LINE = "Include ~/.config/hpc-alloc/ssh_config"
 JOB_PREFIX = "hpcalloc-"
 REMOTE_LOG_DIR = ".hpc-alloc"  # relative to $HOME on the cluster
+# Stamped into every job's --comment so ownership is explicit cluster-side:
+# state.json is per-machine, and a job created on the laptop must never look
+# like an orphan (with a cancel hint!) when viewed from the desktop.
+MACHINE_ID = re.sub(r"[^A-Za-z0-9_-]", "-", platform.node().split(".")[0]) or "unknown"
 KEY_UPLOADER = "https://sshkeys.ycrc.yale.edu/"
 
 EXIT_CONNLOST = 3
@@ -626,18 +631,23 @@ def wait_reconnect(cluster, budget=600):
 
 def squeue_all(cluster):
     """All of the user's queued/running jobs:
-    {jobid: (state, node, reason, time_left, partition, jobname, submit_time)}.
+    {jobid: (state, node, reason, time_left, partition, jobname, submit_time, comment)}.
     Raises ConnectionLost if the queue could not actually be queried — absence
     of a job is only meaningful when this returns normally."""
-    r = login_run(cluster, "squeue --me -h -o '%i|%T|%N|%r|%L|%P|%j|%V'", check=False)
+    r = login_run(cluster, "squeue --me -h -o '%i|%T|%N|%r|%L|%P|%j|%V|%k'", check=False)
     if r.returncode != 0:
         raise ConnectionLost(f"squeue failed: {r.stderr.strip() or 'unknown error'}")
     out = {}
     for line in r.stdout.strip().splitlines():
         parts = line.strip().split("|")
-        if len(parts) == 8:
+        if len(parts) == 9:
             out[parts[0]] = tuple(parts[1:])
     return out
+
+
+def job_owner(comment):
+    """The machine that created a job, from its --comment tag, or None."""
+    return comment.split(":", 1)[1] if comment.startswith("hpc-alloc:") else None
 
 
 def submit_age(submit):
@@ -829,6 +839,7 @@ def resource_args(args, jobname, logfile):
     out = [
         "sbatch", "--parsable",
         f"--job-name={jobname}",
+        f"--comment=hpc-alloc:{MACHINE_ID}",
         f"--time={args.time}",
         "--nodes=1", "--ntasks=1",
         f"--cpus-per-task={args.cpus}",
@@ -1086,7 +1097,7 @@ def refresh_status(state):
                 rows.append((alloc, "ENDED", ""))
                 del st["allocs"][name]
                 continue
-            st_, node, reason, time_left, _part, _name, _submit = q
+            st_, node, reason, time_left, _part, _name, _submit, _comment = q
             if st_ == "RUNNING" and node and alloc.get("node") != node:
                 if alloc.get("node"):  # Slurm requeued the job onto a different node
                     close_master(alloc_alias(alloc))
@@ -1097,14 +1108,18 @@ def refresh_status(state):
         tracked = {(a.get("cluster"), a.get("jobid")) for a in st["allocs"].values()}
     runs = []
     for cluster, q in queues.items():
-        for jid, (st_, node, _reason, left, part, jname, submit) in sorted(q.items()):
+        for jid, (st_, node, _reason, left, part, jname, submit, comment) in sorted(q.items()):
             # every live hpcalloc-* job we don't track: run jobs AND orphaned
             # sleepers (e.g. a `down` whose record was lost) must stay visible
             if (not jname.startswith(JOB_PREFIX) or (cluster, jid) in tracked
                     or st_ in ENDED_STATES):
                 continue
-            if jname == JOB_PREFIX + "run":  # exact: 'hpcalloc-run2' is an alloc name
+            owner = job_owner(comment)
+            is_run = jname == JOB_PREFIX + "run"  # exact: 'hpcalloc-run2' is an alloc name
+            if is_run:
                 kind = "run"
+            elif owner and owner != MACHINE_ID:
+                kind = "other-machine"  # explicit ownership: never a cancel candidate
             else:
                 age = submit_age(submit)
                 # a just-submitted sleeper is usually an `up` from another window
@@ -1112,8 +1127,9 @@ def refresh_status(state):
                 kind = "recent" if age is not None and age < 120 else "orphan"
             runs.append({"jobid": jid, "cluster": cluster, "state": st_,
                          "node": node or None, "partition": part, "time_left": left,
-                         "jobname": jname, "kind": kind, "orphan": kind == "orphan",
-                         "log": f"~/{REMOTE_LOG_DIR}/{'run-' if kind == 'run' else ''}{jid}.log"})
+                         "jobname": jname, "owner": owner, "kind": kind,
+                         "orphan": kind == "orphan",
+                         "log": f"~/{REMOTE_LOG_DIR}/{'run-' if is_run else ''}{jid}.log"})
     return rows, runs
 
 
@@ -1164,9 +1180,11 @@ def cmd_status(args):
                 hint = f"hpc-alloc logs {rj['jobid']} -f{sfx}"
             elif rj["kind"] == "recent":
                 hint = f"just submitted ('{rj['jobname']}') — likely another window; re-check status"
+            elif rj["kind"] == "other-machine":
+                hint = f"allocation '{rj['jobname']}' created on '{rj['owner']}' — manage it there"
             else:  # a sleeper we no longer track — surface it, don't hide it
-                hint = (f"UNTRACKED allocation ('{rj['jobname']}') — verify it isn't another "
-                        f"machine's, then: hpc-alloc cancel {rj['jobid']}{sfx}")
+                hint = (f"UNTRACKED allocation ('{rj['jobname']}') — verify, then: "
+                        f"hpc-alloc cancel {rj['jobid']}{sfx}")
             print(fmt.format(rj["jobid"], rj["state"], rj["partition"], rj["node"] or "-",
                              rj["time_left"] or "-", hint))
 
@@ -1692,7 +1710,7 @@ def cmd_why(args):
     result = {"jobid": jobid, "name": name, "cluster": cluster}
     detail = []
     if q and q[0] not in ENDED_STATES:
-        st_, node, reason, left, part, _jname, _submit = q
+        st_, node, reason, left, part, _jname, _submit, _comment = q
         result.update(status=st_, partition=part, node=node or None,
                       time_left=left, reason=reason)
         if st_ == "PENDING":
