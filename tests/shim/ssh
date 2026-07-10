@@ -33,6 +33,29 @@ if [ "$mode" = twocluster ]; then
   mode=running  # the bouchet side is a healthy running cluster
 fi
 
+# twoauth/twokey: like twocluster, but grace needs Duo re-auth / has a
+# changed host key — the soft sweep must name the right remedy, not
+# 'unreachable', and never reduce a possible MITM to a skip-note
+if [ "$mode" = twoauth ]; then
+  case "$all" in
+    *grace-login*)
+      case "$all" in *"-O "*) exit 255 ;; esac
+      echo "ab1234@grace.ycrc.yale.edu: Permission denied (keyboard-interactive)." >&2
+      exit 255 ;;
+  esac
+  mode=running
+fi
+if [ "$mode" = twokey ]; then
+  case "$all" in
+    *grace-login*)
+      case "$all" in *"-O "*) exit 255 ;; esac
+      echo "@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@" >&2
+      echo "Host key verification failed." >&2
+      exit 255 ;;
+  esac
+  mode=running
+fi
+
 case "$all" in
   *"-O exit"*)
     echo "MUXEXIT: $all" >> "${HPCTEST_LOG:-/dev/null}"
@@ -181,6 +204,8 @@ squeue_rows() {
       case "$n" in
         0|1) row 9200 RUNNING r801u01n01 None 1:00:00 gpu hpcalloc-run 2020-01-01T00:00:00 "" ;;
       esac ;;
+    cancelmid)  # the waited-on job shows CANCELLED in squeue itself
+      row 7777 CANCELLED "" None 0:00 day hpcalloc-t3 2020-01-01T00:00:00 "" ;;
   esac
   return 0
 }

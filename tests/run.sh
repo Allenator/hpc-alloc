@@ -322,6 +322,48 @@ contains "bouchet alloc cancelled" "scancel 9123" "$HPCTEST_LOG"
 contains "grace alloc kept for retry" "keeping it in state" "$work/out"
 check "grace alloc preserved" 1 "$(allocs_left)"
 
+echo "== stage-I: secondary failures name their remedy =="
+mkstate2
+hpc twoauth status > "$work/out" 2>&1
+check "auth-needing secondary stays soft" 0 $?
+contains "re-auth hint names the cluster" "connect --cluster grace" "$work/out"
+mkstate2
+hpc twokey status > "$work/out" 2>&1
+check "hostkey secondary stays soft" 0 $?
+contains "MITM warning surfaced, not masked" "HOST KEY VERIFICATION FAILED" "$work/out"
+
+echo "== stage-I: primary semantics and single-target exit codes =="
+rm -rf "$work/home" && mkdir -p "$work/home/.config/hpc-alloc" "$work/home/.ssh"
+cat > "$work/home/.config/hpc-alloc/state.json" <<'EOF'
+{"netid":"ab1234","machine_id":"testid123456",
+ "clusters":{"grace":{"host":"grace.ycrc.yale.edu"}},"allocs":{}}
+EOF
+hpc down status > "$work/out" 2>&1
+check "sole non-default-named cluster keeps exit 3" 3 $?
+mkstate '"r806u23n04"'
+hpc down down h200 > "$work/out" 2>&1
+check "single-target down propagates exit 3" 3 $?
+check "alloc kept on failed single down" 1 "$(allocs_left)"
+rm -rf "$work/home" && mkdir -p "$work/home"
+HOME="$work/home" HPCTEST_MODE=running PATH="$here/shim:$PATH" \
+  "$cli" setup --netid ab1234 --cluster grace </dev/null > "$work/out" 2>&1
+check "setup exit" 0 $?
+contains "setup pins the primary cluster in config.toml" 'cluster = "grace"' \
+  "$work/home/.config/hpc-alloc/config.toml"
+
+echo "== stage-I: up precheck rides out a queue blip; death keeps its state =="
+mkstate '"r806u23n04"'
+rm -f "$work/upblip.n"
+HPCTEST_COUNT="$work/upblip.n" hpc blip up --name h200 > "$work/out" 2>&1
+check "up refuses duplicate despite a one-poll blip" 1 $?
+contains "existing allocation detected on the second look" "already exists" "$work/out"
+mkstate null
+rm -f "$work/ac.n"
+HPCTEST_SACCT_LAG="$work/ac.n" hpc cancelmid up --name t3 > "$work/out" 2>&1
+check "mid-wait death reported (exit 1)" 1 $?
+contains "squeue's observed state not discarded" \
+  "CANCELLED (accounting record still pending)" "$work/out"
+
 echo "== scenario: pending on QOS cap (why) =="
 mkstate null
 hpc pending-qos why h200 > "$work/out" 2>&1; check "why exit" 0 $?
@@ -414,7 +456,8 @@ HOME="$work" python3 - "$cli" "$repo/config.example.toml" <<'PY' || fails=$((fai
 import sys
 m = {}
 exec(open(sys.argv[1]).read().split("if __name__")[0], m)
-tpl = m["CONFIG_TEMPLATE"].format(identity_file="~/.ssh/id_ed25519").strip().splitlines()
+tpl = m["CONFIG_TEMPLATE"].format(identity_file="~/.ssh/id_ed25519",
+                                  cluster="bouchet").strip().splitlines()
 ex = [l for l in open(sys.argv[2]).read().strip().splitlines()
       if not l.startswith("# Copy to")]
 diff = [f"  T:{a!r}\n  E:{b!r}" for a, b in zip(tpl, ex) if a != b]

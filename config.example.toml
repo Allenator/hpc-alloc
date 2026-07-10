@@ -3,7 +3,7 @@
 # Values shown commented out are the built-in defaults.
 
 [defaults]
-# cluster = "bouchet"      # used when --cluster is omitted
+cluster = "bouchet"      # the primary cluster: full errors and Duo prompts here
 # partition = "day"        # partition for CPU work
 # gpu_partition = "gpu"    # partition when --gpus is set without -p
 # time = "4:00:00"         # walltime, Slurm format

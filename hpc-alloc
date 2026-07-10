@@ -189,7 +189,7 @@ CONFIG_TEMPLATE = """\
 # Values shown commented out are the built-in defaults.
 
 [defaults]
-# cluster = "bouchet"      # used when --cluster is omitted
+cluster = "{cluster}"      # the primary cluster: full errors and Duo prompts here
 # partition = "day"        # partition for CPU work
 # gpu_partition = "gpu"    # partition when --gpus is set without -p
 # time = "4:00:00"         # walltime, Slurm format
@@ -1036,9 +1036,10 @@ def cmd_setup(args):
         home = str(Path.home())
         if keypath.startswith(home + "/"):
             keypath = "~" + keypath[len(home):]
-        CONFIG_TOML.write_text(CONFIG_TEMPLATE.format(identity_file=keypath))
+        CONFIG_TOML.write_text(CONFIG_TEMPLATE.format(identity_file=keypath,
+                                                      cluster=cluster))
         CONFIG = load_config()  # so this run's ssh_config already pins the key
-        info(f"wrote {CONFIG_TOML} (defaults + pinned SSH key; edit to taste)")
+        info(f"wrote {CONFIG_TOML} (primary cluster + pinned SSH key; edit to taste)")
 
     with locked_state() as state:
         prior_netid = state.get("netid")
@@ -1140,6 +1141,38 @@ def clusters_in_order(state, preferred):
     return [preferred] + [c for c in state.get("clusters", {}) if c != preferred]
 
 
+def primary_cluster(state):
+    """The cluster that gets FULL failure semantics (exit 3, interactive Duo):
+    the configured default when it is actually among the configured clusters,
+    else the sole/first configured cluster. A user whose only cluster isn't
+    named like the built-in default must never have it silently demoted to
+    soft-secondary treatment (status would exit 0 and never offer re-auth)."""
+    clusters = list(state.get("clusters", {}))
+    default = cfg("defaults", "cluster") or DEFAULT_CLUSTER
+    if default in clusters or not clusters:
+        return default
+    return clusters[0]
+
+
+def poll_cluster(c, primary):
+    """Queue snapshot with the failure semantics of the cluster's role: the
+    primary's errors are the caller's errors; secondaries are soft."""
+    if c == primary:
+        return squeue_all(c)
+    return on_secondary(c, lambda: squeue_all(c, interactive=False))
+
+
+def live_row(cluster, jobid, interactive=None):
+    """The job's queue row, double-checking absence (two polls 3s apart) —
+    the same two-observation rule as snapshot_queues/follow_job: one absent
+    poll is controller-blip noise, never death evidence."""
+    q = squeue_all(cluster, interactive=interactive).get(jobid)
+    if q is not None:
+        return q
+    time.sleep(3)
+    return squeue_all(cluster, interactive=interactive).get(jobid)
+
+
 def on_secondary(cluster, fn):
     """Run fn() against a SECONDARY cluster, softly: never interactive, never
     fatal. An unreachable second cluster must not break operations whose answer
@@ -1148,7 +1181,18 @@ def on_secondary(cluster, fn):
     Multi-cluster caveat: these paths are exercised against the offline test
     shim only — no live second cluster is available for validation."""
     if not try_login(cluster, interactive=False):
-        info(f"note: cluster '{cluster}' is unreachable — skipping it")
+        # CONN.last_probe holds WHY (set by try_login's fresh probe): a mere
+        # re-auth need must name its remedy, and a host-key mismatch is a
+        # security signal that must never be reduced to 'unreachable'
+        if CONN.last_probe == "auth":
+            info(f"note: cluster '{cluster}' needs re-auth — run "
+                 f"`hpc-alloc connect --cluster {cluster}`; skipping it for now")
+        elif CONN.last_probe == "hostkey":
+            info(f"WARNING: cluster '{cluster}': HOST KEY VERIFICATION FAILED — "
+                 "reimage or possible interception. Verify with YCRC before "
+                 "trusting it; skipping it for now")
+        else:
+            info(f"note: cluster '{cluster}' is unreachable — skipping it")
         return None
     try:
         return fn()
@@ -1166,11 +1210,11 @@ def locate_job(state, jobid, preferred):
     the preferred cluster keeps full failure semantics, secondaries are swept
     via on_secondary. Returns (cluster, row_or_None, queue_snapshot) — the
     snapshot is the located cluster's full queue, so callers never poll twice."""
-    q = squeue_all(preferred)
+    q = poll_cluster(preferred, preferred)  # hard semantics: raises, never None
     if jobid in q:
         return preferred, q[jobid], q
     for c in clusters_in_order(state, preferred)[1:]:
-        q2 = on_secondary(c, lambda c=c: squeue_all(c, interactive=False))
+        q2 = poll_cluster(c, preferred)
         if q2 and jobid in q2:
             return c, q2[jobid], q2
     return preferred, None, q
@@ -1221,8 +1265,15 @@ def cmd_up(args):
 
     existing = state["allocs"].get(name)
     if existing:
-        live = squeue_query(existing["cluster"], [existing["jobid"]])
-        q = live.get(existing["jobid"])
+        try:
+            # double-checked absence: a one-poll blip here would submit a
+            # duplicate and silently disown the still-running sleeper
+            q = live_row(existing["cluster"], existing["jobid"])
+        except ClusterError as e:
+            die(f"allocation '{name}' already exists (job {existing['jobid']} on "
+                f"'{existing['cluster']}') and that cluster can't be checked right "
+                f"now ({e}) — use a different --name, or retry once it's reachable",
+                code=EXIT_CONNLOST if isinstance(e, ConnectionLost) else 1)
         if q and q.state not in ENDED_STATES:
             die(f"allocation '{name}' already exists (job {existing['jobid']}, {q.state}). "
                 f"Use --name for a second one, or `hpc-alloc down {name}`.")
@@ -1289,19 +1340,24 @@ def wait_for_running(alloc, timeout):
                 continue
             slurm.ok()
             q = live.get(jobid)
+            seen_ended = None
             if q and q.state in ENDED_STATES:
+                seen_ended = q.state  # positive evidence: keep it for the report
                 q = None
             if q is None:
-                misses += 1
-                if misses < 2:  # one absent poll is inconclusive (controller lag/failover)
+                # an ENDED row is conclusive; bare absence needs a second look
+                # (one absent poll is controller-blip noise)
+                misses += 2 if seen_ended else 1
+                if misses < 2:
                     time.sleep(3)
                     continue
                 try:
                     fin = final_job_state(cluster, jobid, patience=False, interactive=False)
-                    final = (f"{fin[0]} (exit {fin[1]})" if fin
-                             else "unknown (no accounting record yet)")
+                    final = (f"{fin[0]} (exit {fin[1]})" if fin else
+                             (f"{seen_ended} (accounting record still pending)"
+                              if seen_ended else "unknown (no accounting record yet)"))
                 except ClusterError:
-                    final = "unknown"
+                    final = seen_ended or "unknown"
                 with locked_state() as st:
                     cur = st["allocs"].get(name)
                     if cur and cur.get("jobid") == jobid:  # don't pop a replacement
@@ -1383,15 +1439,10 @@ def snapshot_queues(state):
     nothing on it may be judged (shim-tested only: no live second cluster).
     A single absent poll is not death evidence (controller failovers blip rows
     out of squeue), so absence is confirmed with a second look."""
-    primary = cfg("defaults", "cluster") or DEFAULT_CLUSTER
-
-    def poll(c):
-        return squeue_all(c) if c == primary else on_secondary(
-            c, lambda: squeue_all(c, interactive=False))
-
+    primary = primary_cluster(state)
     queues = {}
     for c in state.get("clusters", {}):
-        q = poll(c)
+        q = poll_cluster(c, primary)
         if q is not None:
             queues[c] = q
     missing = {a["cluster"] for a in state.get("allocs", {}).values()
@@ -1401,7 +1452,7 @@ def snapshot_queues(state):
         time.sleep(3)
         for c in sorted(missing):
             # union: presence in EITHER poll counts as alive; latest state wins
-            q2 = poll(c)
+            q2 = poll_cluster(c, primary)
             if q2 is None:
                 del queues[c]  # can't confirm — don't judge this cluster at all
             else:
@@ -2005,8 +2056,9 @@ def cmd_down(args):
         try:
             ok, detail = cancel_job(alloc["cluster"], alloc["jobid"])
         except SystemExit:
-            # ensure_login die()d (cluster unreachable) — its diagnosis is
-            # printed; with --all the OTHER clusters' allocations must still go
+            if not args.all:
+                raise  # single target: the diagnosis AND its exit code stand
+            # with --all the OTHER clusters' allocations must still be released
             ok, detail = False, "see the error above"
         if not ok:
             info(f"scancel FAILED for job {alloc['jobid']} ('{name}'): {detail} "
