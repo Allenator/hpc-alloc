@@ -15,6 +15,8 @@
 #   gpu-fail    like running but nvidia-smi fails (transport stays healthy)
 #   tz          UTC submit stamps aged against the UTC cluster clock
 #   requeue     streamed job is requeued mid-run; its log truncates and restarts
+#   flappy      every squeue 255s (transport) while short probes succeed
+#   dropoff     link dies for everything after the streamed job leaves the queue
 #   twocluster  bouchet behaves like `running`; cluster `grace` is unreachable
 #               (the offline stand-in for multi-cluster validation — no live
 #               second cluster is available)
@@ -43,9 +45,27 @@ case "$all" in
     case "$mode" in
       down|hostkey) echo "no master" >&2; exit 255 ;;
       duo) [ -f "${HPCTEST_MARK:?}" ] && exit 0 || exit 1 ;;
+      dropoff) if [ "$(cat "${HPCTEST_COUNT:?}" 2>/dev/null || echo 0)" -ge 4 ]; then
+                 echo "no master" >&2; exit 255
+               fi ;;
     esac
     exit 0 ;;
 esac
+
+# flappy: every squeue dies with a transport error while 1s probes pass —
+# transport-first classification must route this to exit 3, never 'scheduler'
+if [ "$mode" = flappy ]; then
+  case "$all" in *squeue*)
+    echo "packet_write_wait: Connection to bouchet port 22: Broken pipe" >&2
+    exit 255 ;;
+  esac
+fi
+
+# dropoff: the connection dies for EVERYTHING after the stream's last poll
+if [ "$mode" = dropoff ] && [ "$(cat "${HPCTEST_COUNT:?}" 2>/dev/null || echo 0)" -ge 4 ]; then
+  echo "packet_write_wait: Connection to bouchet port 22: Broken pipe" >&2
+  exit 255
+fi
 
 if [ "$mode" = down ]; then
   echo "ssh: Could not resolve hostname bouchet.ycrc.yale.edu" >&2
@@ -155,6 +175,11 @@ squeue_rows() {
       case "$n" in
         0|1|3|4) row 7777 RUNNING r801u01n01 None 1:00:00 day hpcalloc-run 2020-01-01T00:00:00 "" ;;
         2) row 7777 PENDING "" Requeued 1:00:00 day hpcalloc-run 2020-01-01T00:00:00 "" ;;
+      esac ;;
+    dropoff)  # 9200 visible twice, then gone; afterwards the link dies entirely
+      bump_count
+      case "$n" in
+        0|1) row 9200 RUNNING r801u01n01 None 1:00:00 gpu hpcalloc-run 2020-01-01T00:00:00 "" ;;
       esac ;;
   esac
   return 0

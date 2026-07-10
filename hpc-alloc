@@ -757,9 +757,18 @@ def login_run(cluster, remote_cmd, check=True, timeout=60, _retry=True, binary=F
                     raise ConnectionLost(detail)
             return login_run(cluster, remote_cmd, check=check, timeout=timeout,
                              _retry=False, binary=binary, interactive=interactive)
-        if probe(login_alias(cluster)) == "ok":
-            raise SlurmError(f"remote command keeps failing while the connection "
+        if r is None and probe(login_alias(cluster)) == "ok":
+            # the remote shell is reachable but the command keeps hanging — a
+            # cluster-side problem (scheduler/filesystem); reconnecting can't help
+            raise SlurmError(f"remote command keeps stalling while the connection "
                              f"probes healthy ({detail})")
+        # rc 255 is ssh's OWN transport-error code: classify transport-first,
+        # however lucky the probes were (a flapping link fails long commands
+        # while passing 1s probes — that needs the reconnect path, not a
+        # 'scheduler problem, connect won't help' misdiagnosis). Heal first so
+        # wait_reconnect starts from clean masters and can't be fooled into a
+        # false 'reconnected' by a locally-alive mux with dead TCP.
+        heal_connections(load_state(), cluster)
         raise ConnectionLost(detail)
     if check and r.returncode != 0:
         die(f"remote command failed on {login_alias(cluster)}: {remote_cmd}\n{r.stderr.strip()}")
@@ -868,9 +877,9 @@ def submit_age(submit, cluster):
     return max(0.0, now + (time.monotonic() - anchor) - sub)
 
 
-def squeue_query(cluster, jobids):
+def squeue_query(cluster, jobids, interactive=None):
     """Subset of squeue_all for specific ids (full Job rows)."""
-    q = squeue_all(cluster)
+    q = squeue_all(cluster, interactive=interactive)
     return {j: q[j] for j in jobids if j in q}
 
 
@@ -892,10 +901,10 @@ def sacct_final(cluster, jobid, fields=("State", "ExitCode"), attempts=(0,), int
     return None
 
 
-def final_job_state(cluster, jobid, patience=True):
+def final_job_state(cluster, jobid, patience=True, interactive=None):
     """(state, exitcode) once accounting is FINAL, else None. patience=False
     does a single quick attempt (for watchers that don't owe anyone a verdict)."""
-    rec = sacct_final(cluster, jobid,
+    rec = sacct_final(cluster, jobid, interactive=interactive,
                       attempts=[0, 2, 2, 3, 4, 5, 7, 7] if patience else [0])
     return (rec[0], rec[1]) if rec else None
 
@@ -935,10 +944,12 @@ def gpu_utils(aliases, timeout=12):
             vals = [int(x) for x in stdout.split() if x.strip().isdigit()]
             out[alias] = max(vals) if vals else None
         else:
-            # Heal only on transport evidence: nvidia-smi can fail (driver
-            # hiccup, job just ended) over a perfectly healthy master, and the
-            # user's live shell/editor sessions ride on that master.
-            if probe(alias, timeout=5) != "ok":
+            # Heal only on transport evidence, read from ssh's OWN exit code —
+            # no extra probes (serial 5s probes re-created the sum-of-latencies
+            # stall this function exists to avoid). 255/stall = transport;
+            # 1-254 = nvidia-smi failed over a healthy master (driver hiccup,
+            # job just ended) and the user's sessions ride on that master.
+            if stdout is None or p.returncode == 255:
                 close_master(alias)
             out[alias] = None
     return out
@@ -1259,7 +1270,9 @@ def wait_for_running(alloc, timeout):
     try:
         while True:
             try:
-                live = squeue_query(cluster, [jobid])
+                # interactive=False: the ONLY sanctioned prompt site inside
+                # this loop is wait_reconnect's single attempt below
+                live = squeue_query(cluster, [jobid], interactive=False)
             except SlurmError as e:
                 # transport is fine — reconnecting can't help; retry briefly
                 slurm.wait_or_die(cluster, e)
@@ -1272,6 +1285,7 @@ def wait_for_running(alloc, timeout):
                 if not wait_reconnect(cluster):
                     die(f"could not reconnect. Job {jobid} remains queued; run `hpc-alloc status` "
                         "once back online.", code=EXIT_CONNLOST)
+                slurm.ok()  # time offline must not count against the Slurm budget
                 continue
             slurm.ok()
             q = live.get(jobid)
@@ -1283,7 +1297,7 @@ def wait_for_running(alloc, timeout):
                     time.sleep(3)
                     continue
                 try:
-                    fin = final_job_state(cluster, jobid, patience=False)
+                    fin = final_job_state(cluster, jobid, patience=False, interactive=False)
                     final = (f"{fin[0]} (exit {fin[1]})" if fin
                              else "unknown (no accounting record yet)")
                 except ClusterError:
@@ -1310,7 +1324,8 @@ def wait_for_running(alloc, timeout):
             info(f"job {jobid}: {st_} (reason: {reason}, waited {elapsed}s)")
             if elapsed > 30 and not printed_estimate:
                 try:  # best-effort: a drop here must not bypass the reconnect loop
-                    r = login_run(cluster, f"squeue -j {jobid} --start -h -o '%S'", check=False)
+                    r = login_run(cluster, f"squeue -j {jobid} --start -h -o '%S'",
+                                  check=False, interactive=False)
                     est = r.stdout.strip()
                     if est and est != "N/A":
                         info(f"scheduler's estimated start time: {est}")
@@ -1710,7 +1725,9 @@ class Stream:
             tail_part = "echo 0; printf '\\036'; true"
         combined = (f"squeue --me -h -o '{SQUEUE_FORMAT}' && printf OK; "
                     f"printf '\\036'; {tail_part}")
-        r = login_run(self.cluster, combined, check=False, binary=True)
+        # interactive=False: prompts inside the polling loop belong exclusively
+        # to wait_reconnect's single sanctioned attempt
+        r = login_run(self.cluster, combined, check=False, binary=True, interactive=False)
         # anchor on the marker SEQUENCE, not the first RS byte: job names and
         # comments are free text, and an embedded \x1e must not break framing
         head, marker, rest = r.stdout.partition(b"OK\x1e")
@@ -1763,11 +1780,11 @@ class Stream:
         try:
             r = login_run(self.cluster, f"tail -c +{self.offset + 1} "
                           f"{shlex.quote(self.logpath)} 2>/dev/null || true",
-                          check=False, binary=True)
+                          check=False, binary=True, interactive=False)
             if r.stdout:
                 sys.stdout.buffer.write(r.stdout)
                 sys.stdout.buffer.flush()
-        except ClusterError:
+        except (ClusterError, SystemExit):  # best-effort: the job is over either way
             pass
 
 
@@ -1795,6 +1812,7 @@ def follow_job(s, cancel_on_interrupt):
                     else "Ctrl-C detaches, the job keeps running")):
                 die(f"could not reconnect; job {s.jobid} continues — reattach with "
                     f"`hpc-alloc logs {s.jobid} -f`", code=EXIT_CONNLOST)
+            slurm.ok()  # time offline must not count against the Slurm budget
             continue
         if q and q.state in ENDED_STATES:
             return  # positive evidence: the queue itself says it ended
@@ -1811,13 +1829,18 @@ def follow_job(s, cancel_on_interrupt):
 
 def watcher_outro(cluster, jobid):
     """Pure watcher: report the outcome if cheaply available, but the stream
-    itself succeeded — exit 0 (a purged accounting record is not a failure)."""
+    itself succeeded — exit 0 (a purged accounting record is not a failure).
+    SystemExit is contained too: a connection that dies right AFTER a clean
+    stream must not turn the watcher's documented exit 0 into an exit 3."""
     try:
-        fin = final_job_state(cluster, jobid, patience=False)
+        fin = final_job_state(cluster, jobid, patience=False, interactive=False)
         if fin:
             info(f"job {jobid} ended: {fin[0]}")
     except ClusterError:
         pass
+    except SystemExit:
+        info(f"job {jobid} ended; the connection dropped before its final state "
+             f"could be fetched — `hpc-alloc why {jobid}` has it")
 
 
 def verdict_outro(cluster, jobid):
@@ -1826,9 +1849,12 @@ def verdict_outro(cluster, jobid):
     lost = None
     fin = None
     try:
-        fin = final_job_state(cluster, jobid)
+        fin = final_job_state(cluster, jobid, interactive=False)
     except ClusterError as e:
         lost = e
+    except SystemExit:
+        # keep the job context in the message; exit 3 via the handler below
+        lost = ConnectionLost("connection lost while fetching the verdict")
     if fin:
         jstate, exitcode = fin
         code = int(exitcode.split(":")[0]) if ":" in exitcode else 0

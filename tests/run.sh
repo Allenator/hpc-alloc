@@ -488,6 +488,23 @@ contains "attempt 2 re-streamed from the top" "second-attempt" "$work/out"
 check "attempt-2 content exactly once" 1 "$(grep -c 'second-attempt' "$work/out")"
 contains "re-stream notice on stderr" "re-streaming" "$work/err"
 
+echo "== stage-H: transport-first 255 classification =="
+mkstate '"r806u23n04"'
+: > "$HPCTEST_LOG"
+hpc flappy status > "$work/out" 2>&1
+check "double-255 with lucky probes is exit 3 (reconnect protocol)" 3 $?
+contains "diagnosed as connection loss" "lost connection" "$work/out"
+contains "masters healed before raising" "MUXEXIT" "$HPCTEST_LOG"
+check "alloc preserved" 1 "$(allocs_left)"
+
+echo "== stage-H: logs -f exits 0 even if the link dies after the stream =="
+mkstate null
+rm -f "$work/do.n"
+HPCTEST_COUNT="$work/do.n" hpc dropoff logs 9200 -f > "$work/out" 2>&1
+check "watcher contract survives a post-stream drop (exit 0)" 0 $?
+contains "content was streamed" "epoch 1" "$work/out"
+contains "outro note instead of exit 3" "before its final state" "$work/out"
+
 echo "== stage-B: ownership by persisted id, not hostname =="
 mkstate null
 hpc running status --json > "$work/out" 2>/dev/null
