@@ -307,6 +307,31 @@ check "with --push: exit" 0 $?
 contains "push approved" "Duo approved" "$work/out"
 contains "master established" "login OK" "$work/out"
 
+echo "== askpass self-reentry + passphrase precheck =="
+out=$(HOME="$work" HPC_ALLOC_ASKPASS=1 "$cli" status 2>/dev/null)
+check "askpass re-entry answers 1" "1" "$out"
+mkdir -p "$work/.config/hpc-alloc"
+printf 'garbage = = =\n' > "$work/.config/hpc-alloc/config.toml"
+out=$(HOME="$work" HPC_ALLOC_ASKPASS=1 "$cli" status 2>/dev/null)
+check "re-entry stdout clean even with broken config" "1" "$out"
+rm -rf "$work/.config"
+mkstate null
+ssh-keygen -q -t ed25519 -N "secretpass" -f "$work/pkey" </dev/null
+printf '[ssh]\nidentity_file = "%s"\n' "$work/pkey" > "$work/home/.config/hpc-alloc/config.toml"
+rm -f "$work/duo.mark"
+HPCTEST_MARK="$work/duo.mark" hpc duo connect --push > "$work/out" 2>&1
+check "push refused for passphrase-protected key" 3 $?
+contains "actionable guidance" "passphrase-protected" "$work/out"
+ssh-keygen -q -t ed25519 -N "" -f "$work/freekey" </dev/null
+printf '[ssh]\nidentity_file = "%s"\n' "$work/freekey" > "$work/home/.config/hpc-alloc/config.toml"
+touch "$work/home/.config/hpc-alloc/askpass-push.sh"
+rm -f "$work/duo.mark"
+HPCTEST_MARK="$work/duo.mark" hpc duo connect --push > "$work/out" 2>&1
+check "push proceeds with passphrase-free key" 0 $?
+if [ -e "$work/home/.config/hpc-alloc/askpass-push.sh" ]; then
+  echo "  FAIL: legacy helper file not cleaned up"; fails=$((fails + 1))
+else echo "  ok: legacy askpass-push.sh removed"; fi
+
 echo "== stage-8: detach safety + template sync =="
 mkstate null
 : > "$HPCTEST_LOG"
