@@ -63,6 +63,14 @@ ENDED_STATES = {
     "NODE_FAIL", "OUT_OF_MEMORY", "BOOT_FAIL", "DEADLINE", "SPECIAL_EXIT",
 }
 
+# sacct states that are FINAL. Anything else (RUNNING from a lagging slurmdbd,
+# PENDING, REQUEUED) is a stale record that must be retried, never trusted as
+# a verdict — trusting it reported successful jobs as failed.
+FINAL_SACCT_STATES = {
+    "COMPLETED", "CANCELLED", "FAILED", "TIMEOUT", "PREEMPTED", "NODE_FAIL",
+    "OUT_OF_MEMORY", "BOOT_FAIL", "DEADLINE", "REVOKED", "SPECIAL_EXIT",
+}
+
 PARTITION_CHEATSHEET = """\
 Bouchet partition cheatsheet (public partitions; salloc only works on devel ones,
 hpc-alloc's sbatch-sleeper mechanism works on all of them):
@@ -610,6 +618,21 @@ def squeue_query(cluster, jobids):
     """Subset of squeue_all for specific ids, without the jobname field."""
     q = squeue_all(cluster)
     return {j: q[j][:5] for j in jobids if j in q}
+
+
+def final_job_state(cluster, jobid, patience=True):
+    """Poll sacct until it reports a FINAL state; returns (state, exitcode) or
+    None. slurmdbd commit lag routinely spans seconds (longer under load), during
+    which sacct returns the stale start record (RUNNING). patience=False does a
+    single quick attempt (for watchers that don't owe anyone a verdict)."""
+    for delay in [0] + ([2, 2, 3, 4, 5, 7, 7] if patience else []):
+        if delay:
+            time.sleep(delay)
+        r = login_run(cluster, f"sacct -j {jobid} -X -n -P -o State,ExitCode", check=False)
+        rec = (r.stdout.strip().splitlines() or [""])[0].split("|")
+        if len(rec) >= 2 and rec[0].split()[0].rstrip("+") in FINAL_SACCT_STATES:
+            return rec[0], rec[1]
+    return None
 
 
 def remote_home(cluster, state):
@@ -1191,13 +1214,16 @@ def cmd_run(args):
         return
     info(f"submitted run job {jobid} on {partition} ({args.time} limit, log: ~/{logpath}); "
          "Ctrl-C cancels it")
-    stream_job(cluster, jobid, logpath, cancel_on_interrupt=True)
+    stream_job(cluster, jobid, logpath, cancel_on_interrupt=True, verdict=True)
 
 
-def stream_job(cluster, jobid, logpath, cancel_on_interrupt=False):
-    """Follow a batch job: show queue progress, stream its log, mirror its exit
-    code. Ctrl-C/SIGTERM detaches; it cancels the job ONLY for `run` (which
-    documents that) — `logs -f` must never kill what it is merely watching."""
+def stream_job(cluster, jobid, logpath, cancel_on_interrupt=False, verdict=False):
+    """Follow a batch job: show queue progress and stream its log. Ctrl-C/SIGTERM
+    detaches; it cancels the job ONLY for `run` (which documents that) — `logs -f`
+    must never kill what it is merely watching. verdict=True (run) additionally
+    mirrors the job's final exit code and refuses to claim success without a
+    FINAL accounting record; watchers (logs -f) always exit 0 after a clean
+    stream — watching succeeded regardless of how the watched job ended."""
     offset = 0
     last_note = 0.0
     try:
@@ -1247,30 +1273,46 @@ def stream_job(cluster, jobid, logpath, cancel_on_interrupt=False):
             info(f"could not cancel (connection lost) — run `hpc-alloc cancel {jobid}` later")
         sys.exit(130)
 
-    # Final state: never report success without accounting evidence of COMPLETED.
-    lost = False
-    rec = []
+    # One last read: epilog output lands after the loop's final poll.
     try:
-        for _ in range(3):  # sacct can lag briefly after the job leaves the queue
-            r = login_run(cluster, f"sacct -j {jobid} -X -n -P -o State,ExitCode", check=False)
-            rec = (r.stdout.strip().splitlines() or [""])[0].split("|")
-            if len(rec) >= 2 and rec[0]:
-                break
-            time.sleep(2)
+        r = login_run(cluster, f"tail -c +{offset + 1} {shlex.quote(logpath)} 2>/dev/null || true",
+                      check=False, binary=True)
+        if r.stdout:
+            sys.stdout.buffer.write(r.stdout)
+            sys.stdout.buffer.flush()
+    except ConnectionLost:
+        pass
+
+    if not verdict:
+        # Pure watcher: report the outcome if cheaply available, but the stream
+        # itself succeeded — exit 0 (a purged accounting record is not a failure).
+        try:
+            fin = final_job_state(cluster, jobid, patience=False)
+            if fin:
+                info(f"job {jobid} ended: {fin[0]}")
+        except ConnectionLost:
+            pass
+        return
+
+    # run's contract: never report success without a FINAL accounting record.
+    lost = False
+    fin = None
+    try:
+        fin = final_job_state(cluster, jobid)
     except ConnectionLost:
         lost = True
-    if len(rec) >= 2 and rec[0]:
-        jstate, exitcode = rec[0], rec[1]
+    if fin:
+        jstate, exitcode = fin
         code = int(exitcode.split(":")[0]) if ":" in exitcode else 0
-        if jstate != "COMPLETED" and code == 0:
+        if jstate.split()[0].rstrip("+") != "COMPLETED" and code == 0:
             code = 1  # OOM/TIMEOUT/CANCELLED/NODE_FAIL/... must not read as success
         info(f"job {jobid} finished: {jstate} (exit {code})")
         sys.exit(code)
     if lost:
         die(f"job {jobid} ended but the connection dropped before its final state was "
             f"fetched — check `hpc-alloc why {jobid}`", code=EXIT_CONNLOST)
-    die(f"job {jobid} left the queue but accounting has no record yet — check "
-        f"`hpc-alloc why {jobid}` (not reporting success without evidence)")
+    die(f"job {jobid} left the queue but accounting shows no FINAL state after ~30s — "
+        f"check `hpc-alloc why {jobid}` (not reporting success without evidence)")
 
 
 def cmd_logs(args):

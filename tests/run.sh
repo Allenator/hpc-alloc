@@ -193,6 +193,20 @@ mkstate null
 hpc gone run -- echo hi > "$work/out" 2>&1; check "run mirrors TIMEOUT as exit 1" 1 $?
 contains "final state reported" "TIMEOUT" "$work/out"
 
+echo "== stage-1: final-state verdict discipline =="
+mkstate null
+rm -f "$work/sacct.n"
+HPCTEST_SACCT_LAG="$work/sacct.n" hpc running run -- echo hi > "$work/out" 2>&1
+check "successful run exits 0 despite stale RUNNING records (dbd lag)" 0 $?
+contains "verdict waits for final state" "COMPLETED" "$work/out"
+rm -f "$work/sacct.n"
+HPCTEST_SACCT_LAG="$work/sacct.n" hpc gone run -- echo hi > "$work/out" 2>&1
+check "failed run still exits 1 after lag" 1 $?
+mkstate '"r806u23n04"'
+hpc gone logs 9123 -f > "$work/out" 2>&1
+check "logs -f is a watcher: exit 0 even for non-COMPLETED job" 0 $?
+contains "outcome still reported informationally" "TIMEOUT" "$work/out"
+
 echo "== scenario: cancel safety =="
 mkstate '"r806u23n04"'; : > "$HPCTEST_LOG"
 hpc running cancel 9200 > "$work/out" 2>&1; check "cancel own run job" 0 $?
