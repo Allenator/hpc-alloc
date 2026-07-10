@@ -22,6 +22,7 @@ Requires only a VPN connection and a NetID with an uploaded SSH key
 """
 
 import argparse
+import collections
 import fcntl
 import json
 import os
@@ -283,16 +284,22 @@ def load_state():
     return {"netid": None, "clusters": {}, "allocs": {}}
 
 
+def atomic_write_600(path, text):
+    """Write-if-changed via tmp+rename (a signal mid-write can't truncate the
+    live file); self-heals 0600 permissions either way. Returns True if written."""
+    if path.exists() and path.read_text() == text:
+        path.chmod(0o600)
+        return False
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(text)
+    tmp.chmod(0o600)
+    tmp.replace(path)
+    return True
+
+
 def save_state(state):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    data = json.dumps(state, indent=2)
-    if not STATE_FILE.exists() or STATE_FILE.read_text() != data:
-        tmp = STATE_FILE.with_suffix(".tmp")
-        tmp.write_text(data)
-        tmp.chmod(0o600)
-        tmp.replace(STATE_FILE)
-    else:
-        STATE_FILE.chmod(0o600)  # self-heal loose permissions even when unchanged
+    atomic_write_600(STATE_FILE, json.dumps(state, indent=2))
     rebuild_ssh_config(state)
 
 
@@ -370,14 +377,7 @@ def rebuild_ssh_config(state):
             "",
         ]
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    text = "\n".join(lines)
-    if SSH_CONFIG.exists() and SSH_CONFIG.read_text() == text:
-        SSH_CONFIG.chmod(0o600)  # self-heal permissions; skip the rewrite
-        return  # avoid needless truncate-rewrite windows for concurrent ssh readers
-    tmp = SSH_CONFIG.with_suffix(".tmp")
-    tmp.write_text(text)
-    tmp.chmod(0o600)
-    tmp.replace(SSH_CONFIG)  # atomic: a SIGTERM mid-write can't leave a truncated file
+    atomic_write_600(SSH_CONFIG, "\n".join(lines))
 
 
 def ensure_include():
@@ -397,6 +397,18 @@ def ensure_include():
 # ------------------------------------------------------------- ssh plumbing
 
 _verified = set()  # clusters whose login connection was probed OK this run
+
+
+def ssh_argv(alias, remote_cmd=None, batch=True, connect_timeout=10):
+    """The one place ssh invocations are assembled — transport-wide options
+    must not be maintained in five hand-built copies."""
+    argv = ["ssh"]
+    if batch:
+        argv += ["-o", "BatchMode=yes"]
+    argv += ["-o", f"ConnectTimeout={connect_timeout}", "--", alias]
+    if remote_cmd is not None:
+        argv.append(remote_cmd)
+    return argv
 _last_probe = None  # result of the most recent fresh probe ('ok'|'auth'|'net')
 
 
@@ -471,10 +483,8 @@ def probe(alias, timeout=15):
     or 'net' (unresolvable/unreachable/stalled)."""
     global _probe_detail
     try:
-        r = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", alias, "true"],
-            capture_output=True, text=True, errors="replace", timeout=timeout,
-        )
+        r = subprocess.run(ssh_argv(alias, "true"),
+                           capture_output=True, text=True, errors="replace", timeout=timeout)
     except subprocess.TimeoutExpired:
         _probe_detail = "connection stalled"
         return "net"
@@ -511,7 +521,7 @@ def try_login(cluster, interactive=None):
         return True
     if st == "auth" and interactive:
         info(f"connecting to {alias} (answer the Duo prompt in your terminal)...")
-        r = subprocess.run(["ssh", "-o", "ConnectTimeout=30", "--", alias, "true"])
+        r = subprocess.run(ssh_argv(alias, "true", batch=False, connect_timeout=30))
         if r.returncode == 0:
             _verified.add(cluster)
             return True
@@ -533,7 +543,7 @@ def push_login(cluster, timeout=90):
            "DISPLAY": os.environ.get("DISPLAY", ":0")}
     info(f"requesting Duo push for {alias} — approve it on your phone...")
     try:
-        r = subprocess.run(["ssh", "-o", "ConnectTimeout=30", "--", alias, "true"],
+        r = subprocess.run(ssh_argv(alias, "true", batch=False, connect_timeout=30),
                            env=env, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         die("Duo push not approved in time — try again with `hpc-alloc connect --push`",
@@ -576,30 +586,26 @@ def login_run(cluster, remote_cmd, check=True, timeout=60, _retry=True, binary=F
     Raises ConnectionLost on transport failure/stall (after one heal+retry).
     binary=True returns raw bytes in r.stdout — required when streaming log
     content, where strict text decoding would crash on non-UTF-8 bytes and
-    newline translation would corrupt byte-offset accounting."""
+    newline translation would corrupt byte-offset accounting. r.stderr is
+    ALWAYS text, so every caller can .strip() it into a message safely."""
     ensure_login(cluster)
     text_kwargs = {} if binary else {"text": True, "errors": "replace"}
     try:
-        r = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", "--",
-             login_alias(cluster), remote_cmd],
-            capture_output=True, timeout=timeout, **text_kwargs,
-        )
+        r = subprocess.run(ssh_argv(login_alias(cluster), remote_cmd, connect_timeout=20),
+                           capture_output=True, timeout=timeout, **text_kwargs)
     except subprocess.TimeoutExpired:
         r = None
-
-    def err_text(res):
-        return (res.stderr.decode(errors="replace") if binary else res.stderr).strip()
-
+    if r is not None and binary:
+        r.stderr = r.stderr.decode(errors="replace")
     if r is None or r.returncode == 255:  # 255 = ssh transport error
         _verified.discard(cluster)
         if _retry and try_login(cluster):
             return login_run(cluster, remote_cmd, check=check, timeout=timeout,
                              _retry=False, binary=binary)
-        detail = "command stalled" if r is None else (err_text(r) or "ssh failed")
+        detail = "command stalled" if r is None else (r.stderr.strip() or "ssh failed")
         raise ConnectionLost(detail)
     if check and r.returncode != 0:
-        die(f"remote command failed on {login_alias(cluster)}: {remote_cmd}\n{err_text(r)}")
+        die(f"remote command failed on {login_alias(cluster)}: {remote_cmd}\n{r.stderr.strip()}")
     return r
 
 
@@ -629,9 +635,14 @@ def wait_reconnect(cluster, budget=600):
 
 # ------------------------------------------------------------- slurm helpers
 
+# One named shape for queue rows everywhere — positional unpacks broke twice
+# when the squeue format grew a field.
+Job = collections.namedtuple(
+    "Job", "state node reason time_left partition name submit comment")
+
+
 def squeue_all(cluster):
-    """All of the user's queued/running jobs:
-    {jobid: (state, node, reason, time_left, partition, jobname, submit_time, comment)}.
+    """All of the user's queued/running jobs as {jobid: Job}.
     Raises ConnectionLost if the queue could not actually be queried — absence
     of a job is only meaningful when this returns normally."""
     r = login_run(cluster, "squeue --me -h -o '%i|%T|%N|%r|%L|%P|%j|%V|%k'", check=False)
@@ -640,8 +651,8 @@ def squeue_all(cluster):
     out = {}
     for line in r.stdout.strip().splitlines():
         parts = line.strip().split("|")
-        if len(parts) == 9:
-            out[parts[0]] = tuple(parts[1:])
+        if len(parts) == len(Job._fields) + 1:
+            out[parts[0]] = Job(*parts[1:])
     return out
 
 
@@ -659,24 +670,32 @@ def submit_age(submit):
 
 
 def squeue_query(cluster, jobids):
-    """Subset of squeue_all for specific ids, without the jobname field."""
+    """Subset of squeue_all for specific ids (full Job rows)."""
     q = squeue_all(cluster)
-    return {j: q[j][:5] for j in jobids if j in q}
+    return {j: q[j] for j in jobids if j in q}
+
+
+def sacct_final(cluster, jobid, fields=("State", "ExitCode"), attempts=(0,)):
+    """Fetch a job's FINAL accounting record (-P parse). Returns the field list
+    or None. slurmdbd commit lag routinely spans seconds (longer under load),
+    during which sacct returns the stale start record (RUNNING) — non-final
+    states are retried per `attempts` (delays in seconds), never trusted."""
+    for delay in attempts:
+        if delay:
+            time.sleep(delay)
+        r = login_run(cluster, f"sacct -j {jobid} -X -n -P -o {','.join(fields)}", check=False)
+        rec = (r.stdout.strip().splitlines() or [""])[0].split("|")
+        if len(rec) >= len(fields) and rec[0].split()[0].rstrip("+") in FINAL_SACCT_STATES:
+            return rec
+    return None
 
 
 def final_job_state(cluster, jobid, patience=True):
-    """Poll sacct until it reports a FINAL state; returns (state, exitcode) or
-    None. slurmdbd commit lag routinely spans seconds (longer under load), during
-    which sacct returns the stale start record (RUNNING). patience=False does a
-    single quick attempt (for watchers that don't owe anyone a verdict)."""
-    for delay in [0] + ([2, 2, 3, 4, 5, 7, 7] if patience else []):
-        if delay:
-            time.sleep(delay)
-        r = login_run(cluster, f"sacct -j {jobid} -X -n -P -o State,ExitCode", check=False)
-        rec = (r.stdout.strip().splitlines() or [""])[0].split("|")
-        if len(rec) >= 2 and rec[0].split()[0].rstrip("+") in FINAL_SACCT_STATES:
-            return rec[0], rec[1]
-    return None
+    """(state, exitcode) once accounting is FINAL, else None. patience=False
+    does a single quick attempt (for watchers that don't owe anyone a verdict)."""
+    rec = sacct_final(cluster, jobid,
+                      attempts=[0, 2, 2, 3, 4, 5, 7, 7] if patience else [0])
+    return (rec[0], rec[1]) if rec else None
 
 
 def remote_home(cluster, state):
@@ -698,8 +717,8 @@ def gpu_util(alias, timeout=12):
     for attempt in range(2):
         try:
             r = subprocess.run(
-                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", alias,
-                 "nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits"],
+                ssh_argv(alias, "nvidia-smi --query-gpu=utilization.gpu "
+                                "--format=csv,noheader,nounits", connect_timeout=8),
                 capture_output=True, text=True, timeout=timeout,
             )
         except subprocess.TimeoutExpired:
@@ -870,6 +889,17 @@ def pick_partition(args):
     return resolve_option("partition", args.cluster, DEFAULT_PARTITION)[0]
 
 
+def cancel_job(cluster, jobid):
+    """scancel with its outcome actually checked. Returns (ok, detail)."""
+    try:
+        r = login_run(cluster, f"scancel {jobid}", check=False)
+    except ConnectionLost as e:
+        return False, f"connection lost ({e})"
+    if r.returncode != 0:
+        return False, r.stderr.strip() or "unknown error"
+    return True, ""
+
+
 def locate_job(state, jobid, preferred):
     """Which configured cluster hosts this job right now? Searches the preferred
     cluster first (numeric job ids are per-cluster counters and can collide).
@@ -930,8 +960,8 @@ def cmd_up(args):
     if existing:
         live = squeue_query(existing["cluster"], [existing["jobid"]])
         q = live.get(existing["jobid"])
-        if q and q[0] not in ENDED_STATES:
-            die(f"allocation '{name}' already exists (job {existing['jobid']}, {q[0]}). "
+        if q and q.state not in ENDED_STATES:
+            die(f"allocation '{name}' already exists (job {existing['jobid']}, {q.state}). "
                 f"Use --name for a second one, or `hpc-alloc down {name}`.")
 
     jobid = submit_job(cluster, remote_cmd)
@@ -951,9 +981,8 @@ def cmd_up(args):
             st["allocs"][name] = alloc
     if lost_to:
         try:
-            r = login_run(cluster, f"scancel {jobid}", check=False)
-            cancelled = r.returncode == 0
-        except ConnectionLost:
+            cancelled, _ = cancel_job(cluster, jobid)
+        except SystemExit:  # ensure_login die()d; its diagnosis is already printed
             cancelled = False
         outcome = (f"cancelled this duplicate submission (job {jobid})" if cancelled else
                    f"could NOT cancel duplicate job {jobid} — run `hpc-alloc cancel {jobid}`")
@@ -986,7 +1015,7 @@ def wait_for_running(alloc, timeout):
                         "once back online.", code=EXIT_CONNLOST)
                 continue
             q = live.get(jobid)
-            if q and q[0] in ENDED_STATES:
+            if q and q.state in ENDED_STATES:
                 q = None
             if q is None:
                 misses += 1
@@ -994,8 +1023,9 @@ def wait_for_running(alloc, timeout):
                     time.sleep(3)
                     continue
                 try:
-                    r = login_run(cluster, f"sacct -j {jobid} -X -n -o State%20,ExitCode", check=False)
-                    final = r.stdout.strip() or "unknown (left the queue)"
+                    fin = final_job_state(cluster, jobid, patience=False)
+                    final = (f"{fin[0]} (exit {fin[1]})" if fin
+                             else "unknown (no accounting record yet)")
                 except ConnectionLost:
                     final = "unknown"
                 with locked_state() as st:
@@ -1006,7 +1036,7 @@ def wait_for_running(alloc, timeout):
                     f"log (on the cluster): ~/{REMOTE_LOG_DIR}/{jobid}.log\n"
                     f"diagnose with: hpc-alloc why {jobid}")
             misses = 0
-            st_, node, reason, time_left, _part = q
+            st_, node, reason, time_left = q.state, q.node, q.reason, q.time_left
             if st_ == "RUNNING":
                 forget_hostkey(node)
                 with locked_state() as st:
@@ -1045,10 +1075,8 @@ def finish_alloc(alloc, time_left=None):
     name = alloc["name"]
     alias = alloc_alias(alloc)
     for attempt in range(5):
-        r = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "--", alias, "true"],
-            capture_output=True, text=True,
-        )
+        r = subprocess.run(ssh_argv(alias, "true", connect_timeout=15),
+                           capture_output=True, text=True)
         if r.returncode == 0:
             break
         time.sleep(3)
@@ -1085,7 +1113,7 @@ def refresh_status(state):
     with locked_state() as st:
         for name, alloc in sorted(list(st["allocs"].items())):
             q = queues.get(alloc["cluster"], {}).get(alloc["jobid"])
-            if q is None or q[0] in ENDED_STATES:
+            if q is None or q.state in ENDED_STATES:
                 # only an ABSENT row is inconclusive for a post-snapshot alloc; a row
                 # in an ENDED state is post-submission evidence — report the death
                 if q is None and (name, alloc.get("jobid")) not in pre:
@@ -1097,7 +1125,7 @@ def refresh_status(state):
                 rows.append((alloc, "ENDED", ""))
                 del st["allocs"][name]
                 continue
-            st_, node, reason, time_left, _part, _name, _submit, _comment = q
+            st_, node, reason, time_left = q.state, q.node, q.reason, q.time_left
             if st_ == "RUNNING" and node and alloc.get("node") != node:
                 if alloc.get("node"):  # Slurm requeued the job onto a different node
                     close_master(alloc_alias(alloc))
@@ -1108,27 +1136,27 @@ def refresh_status(state):
         tracked = {(a.get("cluster"), a.get("jobid")) for a in st["allocs"].values()}
     runs = []
     for cluster, q in queues.items():
-        for jid, (st_, node, _reason, left, part, jname, submit, comment) in sorted(q.items()):
+        for jid, row in sorted(q.items()):
             # every live hpcalloc-* job we don't track: run jobs AND orphaned
             # sleepers (e.g. a `down` whose record was lost) must stay visible
-            if (not jname.startswith(JOB_PREFIX) or (cluster, jid) in tracked
-                    or st_ in ENDED_STATES):
+            if (not row.name.startswith(JOB_PREFIX) or (cluster, jid) in tracked
+                    or row.state in ENDED_STATES):
                 continue
-            owner = job_owner(comment)
-            is_run = jname == JOB_PREFIX + "run"  # exact: 'hpcalloc-run2' is an alloc name
+            owner = job_owner(row.comment)
+            is_run = row.name == JOB_PREFIX + "run"  # exact: 'hpcalloc-run2' is an alloc name
             if is_run:
                 kind = "run"
             elif owner and owner != MACHINE_ID:
                 kind = "other-machine"  # explicit ownership: never a cancel candidate
             else:
-                age = submit_age(submit)
+                age = submit_age(row.submit)
                 # a just-submitted sleeper is usually an `up` from another window
                 # whose record isn't written yet — never offer to cancel those
                 kind = "recent" if age is not None and age < 120 else "orphan"
-            runs.append({"jobid": jid, "cluster": cluster, "state": st_,
-                         "node": node or None, "partition": part, "time_left": left,
-                         "jobname": jname, "owner": owner, "kind": kind,
-                         "orphan": kind == "orphan",
+            runs.append({"jobid": jid, "cluster": cluster, "state": row.state,
+                         "node": row.node or None, "partition": row.partition,
+                         "time_left": row.time_left, "jobname": row.name,
+                         "owner": owner, "kind": kind, "orphan": kind == "orphan",
                          "log": f"~/{REMOTE_LOG_DIR}/{'run-' if is_run else ''}{jid}.log"})
     return rows, runs
 
@@ -1204,6 +1232,12 @@ def pick_alloc(state, name):
     die("multiple allocations exist — specify a name (see `hpc-alloc status`)")
 
 
+def require_node(alloc):
+    if not alloc.get("node"):
+        die(f"allocation '{alloc['name']}' has no node yet (job {alloc['jobid']} still "
+            "pending?) — run `hpc-alloc status`")
+
+
 def check_node_reachable(state, alloc):
     """Probe the compute node, healing a stale node master once. Dies with a
     useful message (expired allocation vs connection trouble) if unreachable."""
@@ -1223,7 +1257,7 @@ def check_node_reachable(state, alloc):
     try:
         live = squeue_query(alloc["cluster"], [alloc["jobid"]])
         q = live.get(alloc["jobid"])
-        if q is None or q[0] in ENDED_STATES:
+        if q is None or q.state in ENDED_STATES:
             die(f"allocation '{alloc['name']}' has ended (walltime expiry, scancel, or the "
                 "idle-GPU policy — `hpc-alloc why " + alloc["jobid"] + "` to find out). "
                 "Run `hpc-alloc status` to clean up, then `hpc-alloc up` again.")
@@ -1252,9 +1286,7 @@ def cmd_ssh(args):
     require_setup(state)
     name, command = split_ssh_args(state, args.args)
     alloc = pick_alloc(state, name)
-    if not alloc.get("node"):
-        die(f"allocation '{alloc['name']}' has no node yet (job {alloc['jobid']} still pending?) "
-            "— run `hpc-alloc status`")
+    require_node(alloc)
     ensure_login(alloc["cluster"])
     check_node_reachable(state, alloc)
     alias = alloc_alias(alloc)
@@ -1269,8 +1301,7 @@ def cmd_sync(args):
     state = load_state()
     require_setup(state)
     alloc = pick_alloc(state, args.name)
-    if not alloc.get("node"):
-        die(f"allocation '{alloc['name']}' has no node yet — run `hpc-alloc status`")
+    require_node(alloc)
     ensure_login(alloc["cluster"])
     check_node_reachable(state, alloc)
     alias = alloc_alias(alloc)
@@ -1354,13 +1385,13 @@ def stream_job(cluster, jobid, logpath, cancel_on_interrupt=False, verdict=False
             try:
                 live = squeue_query(cluster, [jobid])
                 q = live.get(jobid)
-                if q and q[0] != "RUNNING" and q[0] not in ENDED_STATES:
+                if q and q.state != "RUNNING" and q.state not in ENDED_STATES:
                     # PENDING/SUSPENDED/CONFIGURING/REQUEUED: nothing to tail yet —
                     # say so instead of silently polling a frozen log
                     if time.monotonic() - last_note > 30:
-                        note = f"job {jobid}: {q[0]}"
-                        if q[0] == "PENDING" and q[2]:
-                            note += f" (reason: {q[2]})"
+                        note = f"job {jobid}: {q.state}"
+                        if q.state == "PENDING" and q.reason:
+                            note += f" (reason: {q.reason})"
                         info(note)
                         last_note = time.monotonic()
                     time.sleep(5)
@@ -1383,7 +1414,7 @@ def stream_job(cluster, jobid, logpath, cancel_on_interrupt=False, verdict=False
                     die(f"could not reconnect; job {jobid} continues — reattach with "
                         f"`hpc-alloc logs {jobid} -f`", code=EXIT_CONNLOST)
                 continue
-            if q is None or q[0] in ENDED_STATES:
+            if q is None or q.state in ENDED_STATES:
                 break
             time.sleep(3)
     except KeyboardInterrupt:
@@ -1394,13 +1425,11 @@ def stream_job(cluster, jobid, logpath, cancel_on_interrupt=False, verdict=False
             sys.exit(130)
         info(f"cancelling job {jobid}")
         try:
-            r = login_run(cluster, f"scancel {jobid}", check=False)
-            if r.returncode != 0:
-                info(f"scancel failed ({r.stderr.strip()}) — run `hpc-alloc cancel {jobid}`")
-        except ConnectionLost:
-            info(f"could not cancel (connection lost) — run `hpc-alloc cancel {jobid}` later")
+            ok, detail = cancel_job(cluster, jobid)
         except SystemExit:  # ensure_login die()d: its own diagnosis is already on stderr
-            info(f"could not cancel — see the error above; run `hpc-alloc cancel {jobid}` later")
+            ok, detail = False, "see the error above"
+        if not ok:
+            info(f"could not cancel ({detail}) — run `hpc-alloc cancel {jobid}` later")
         sys.exit(130)
 
     # One last read: epilog output lands after the loop's final poll.
@@ -1477,7 +1506,7 @@ def cmd_logs(args):
         return
     r = login_run(cluster, f"tail -n {args.lines} {shlex.quote(logpath)}", check=False, binary=True)
     if r.returncode != 0:
-        die(f"no log at ~/{logpath} on {cluster}: {r.stderr.decode(errors='replace').strip()}")
+        die(f"no log at ~/{logpath} on {cluster}: {r.stderr.strip()}")
     sys.stdout.buffer.write(r.stdout)
     sys.stdout.buffer.flush()
 
@@ -1497,11 +1526,11 @@ def cmd_cancel(args):
             info(f"job {jobid} has already finished")
             return
         die(f"job {jobid} not found among your jobs")
-    if not q[5].startswith(JOB_PREFIX):
-        die(f"refusing: job {jobid} ('{q[5]}') was not created by hpc-alloc")
-    r = login_run(cluster, f"scancel {jobid}", check=False)
-    if r.returncode != 0:
-        die(f"scancel failed for job {jobid}: {r.stderr.strip() or 'unknown error'} — retry")
+    if not q.name.startswith(JOB_PREFIX):
+        die(f"refusing: job {jobid} ('{q.name}') was not created by hpc-alloc")
+    ok, detail = cancel_job(cluster, jobid)
+    if not ok:
+        die(f"scancel failed for job {jobid}: {detail} — retry")
     with locked_state() as st:
         for n, a in list(st["allocs"].items()):
             if a["jobid"] == jobid and a["cluster"] == cluster:
@@ -1524,10 +1553,10 @@ def cmd_down(args):
         if not alloc:
             info(f"no allocation named '{name}'")
             continue
-        r = login_run(alloc["cluster"], f"scancel {alloc['jobid']}", check=False)
-        if r.returncode != 0:
-            info(f"scancel FAILED for job {alloc['jobid']} ('{name}'): "
-                 f"{r.stderr.strip() or 'unknown error'} — keeping it in state, retry later")
+        ok, detail = cancel_job(alloc["cluster"], alloc["jobid"])
+        if not ok:
+            info(f"scancel FAILED for job {alloc['jobid']} ('{name}'): {detail} "
+                 "— keeping it in state, retry later")
             failed += 1
             continue
         if alloc.get("node"):
@@ -1709,16 +1738,16 @@ def cmd_why(args):
     q = queue.get(jobid)
     result = {"jobid": jobid, "name": name, "cluster": cluster}
     detail = []
-    if q and q[0] not in ENDED_STATES:
-        st_, node, reason, left, part, _jname, _submit, _comment = q
+    if q and q.state not in ENDED_STATES:
+        st_, node, reason, left, part = q.state, q.node, q.reason, q.time_left, q.partition
         result.update(status=st_, partition=part, node=node or None,
                       time_left=left, reason=reason)
         if st_ == "PENDING":
             if reason.startswith(("QOSMax", "QOSGrp", "AssocGrp", "MaxTRESPer", "QOSUsage")):
                 result["diagnosis"] = (f"a per-user/group resource cap ({reason}) — this will not "
                                        "start until your other jobs release resources")
-                mine = [f"{j} ({t[4]}, {t[0]}, '{t[5]}')" for j, t in sorted(queue.items())
-                        if t[0] == "RUNNING"]
+                mine = [f"{j} ({t.partition}, {t.state}, '{t.name}')" for j, t in sorted(queue.items())
+                        if t.state == "RUNNING"]
                 detail.append("your running jobs: " + (", ".join(mine) or "none visible"))
             elif "ReqNodeNotAvail" in reason or "Reserv" in reason:
                 result["diagnosis"] = ("required nodes are reserved (usually an upcoming "
@@ -1744,10 +1773,10 @@ def cmd_why(args):
                                    f"(node: {node or 'none assigned'}, {left} on the clock)")
     else:
         result["status"] = "ended"
-        r = login_run(cluster, f"sacct -j {jobid} -X -n -P -o State,ExitCode,Elapsed,Timelimit",
-                      check=False)
-        rec = (r.stdout.strip().splitlines() or [""])[0].split("|")
-        if len(rec) >= 4 and rec[0]:
+        rec = sacct_final(cluster, jobid,
+                          fields=("State", "ExitCode", "Elapsed", "Timelimit"),
+                          attempts=(0, 2, 2))
+        if rec:
             jstate, exitcode, elapsed, limit = rec[0], rec[1], rec[2], rec[3]
             result.update(final_state=jstate, exit_code=exitcode, elapsed=elapsed)
             if jstate == "TIMEOUT":
@@ -1770,7 +1799,8 @@ def cmd_why(args):
             if tail:
                 detail += ["--- log tail ---"] + tail[-15:]
         else:
-            result["diagnosis"] = "no accounting record found for this job id"
+            result["diagnosis"] = ("no FINAL accounting record — a just-ended job can lag a "
+                                   "few seconds (retry), or the id is unknown/purged")
     result["detail"] = detail
     if args.json:
         print(json.dumps(result, indent=2))
