@@ -258,12 +258,46 @@ mkstate '"r806u23n04"'; : > "$HPCTEST_LOG"
 hpc running cancel 9200 > "$work/out" 2>&1; check "cancel own run job" 0 $?
 contains "scancel invoked" "scancel 9200" "$HPCTEST_LOG"
 hpc running cancel 9300 > "$work/out" 2>&1; check "refuses foreign job" 1 $?
+contains "pipe-in-job-name parsed intact (US-delimited squeue)" "my|job" "$work/out"
 hpc running cancel 8888 > "$work/out" 2>&1; check "unknown job" 1 $?
 
 echo "== scenario: logs =="
 mkstate '"r806u23n04"'
 hpc running logs 9200 > "$work/out" 2>&1; check "logs exit" 0 $?
 contains "log content" "epoch 1: loss 0.42" "$work/out"
+hpc pending-qos logs 9123 > "$work/out" 2>&1
+check "logs refuses to touch a pending job's file (NFS cache)" 1 $?
+contains "explains and points at -f" "no log to show yet" "$work/out"
+
+echo "== stage-D: multi-cluster degradation (offline stand-in; no live 2nd cluster) =="
+mkstate2() {  # two clusters; one alloc on each; grace is unreachable in twocluster mode
+  rm -rf "$work/home" && mkdir -p "$work/home/.config/hpc-alloc" "$work/home/.ssh"
+  cat > "$work/home/.config/hpc-alloc/state.json" <<EOF
+{"netid":"ab1234","machine_id":"testid123456",
+ "clusters":{"bouchet":{"host":"bouchet.ycrc.yale.edu"},"grace":{"host":"grace.ycrc.yale.edu"}},
+ "allocs":{"h200":{"name":"h200","cluster":"bouchet","jobid":"9123","node":"r806u23n04",
+ "partition":"gpu_h200","time":"8:00:00","gpus":"h200:1","idle_timeout":30,"created":"x"},
+ "gdev":{"name":"gdev","cluster":"grace","jobid":"8123","node":"gr01",
+ "partition":"day","time":"4:00:00","gpus":null,"idle_timeout":null,"created":"x"}}}
+EOF
+}
+mkstate2
+hpc twocluster status > "$work/out" 2>&1
+check "status survives an unreachable second cluster" 0 $?
+contains "bouchet allocs still shown" "r806u23n04" "$work/out"
+contains "grace alloc marked unknown, not reaped" "UNKNOWN" "$work/out"
+contains "skip note printed" "unreachable — skipping" "$work/out"
+check "both allocs preserved" 2 "$(allocs_left)"
+mkstate2
+hpc twocluster why 4242 > "$work/out" 2>&1
+check "why sweeps softly past the dead cluster" 0 $?
+contains "sweep note" "skipping" "$work/out"
+mkstate2; : > "$HPCTEST_LOG"
+hpc twocluster down --all > "$work/out" 2>&1
+check "down --all continues past the dead cluster (exit 1)" 1 $?
+contains "bouchet alloc cancelled" "scancel 9123" "$HPCTEST_LOG"
+contains "grace alloc kept for retry" "keeping it in state" "$work/out"
+check "grace alloc preserved" 1 "$(allocs_left)"
 
 echo "== scenario: pending on QOS cap (why) =="
 mkstate null

@@ -83,6 +83,8 @@ Optional TOML config at `~/.config/hpc-alloc/config.toml` — `hpc-alloc setup` 
 - `[ssh] identity_file` — pins the key with `IdentityFile` + `IdentitiesOnly` in the generated SSH config. Without this, ssh offers every key it knows and the server can hit "Too many authentication failures" before trying the right one.
 - `[cluster.<name>]` — per-cluster `host` and partition overrides, for clusters whose partition layout differs from Bouchet's.
 
+> **Multi-cluster status.** Every command takes `--cluster`, state and config are fully plural, and job lookups sweep all configured clusters (ids are per-cluster counters). The failure semantics are deliberate: the target/default cluster fails loudly, while *secondary* clusters degrade softly — an unreachable second cluster prints `note: cluster '<x>' is unreachable — skipping it` and never blocks `status`, `why`, `cancel`, `logs`, or `down --all` (allocations on the unreachable cluster show as `UNKNOWN` and are never reaped). **Limitation:** only Bouchet has been validated live. The multi-cluster paths are exercised against the offline test shim (including an unreachable-second-cluster scenario) because no second cluster is available to us — treat first real multi-cluster use as beta.
+
 The division of labor: config.toml = who you are and what you usually want (yours to edit); `state.json` = what currently exists (tool-owned); flags = this invocation's exceptions. `hpc-alloc config` prints the effective merged defaults with provenance (`--json` for agents), and every submission echoes the actual partition/walltime/idle-timeout it used. Parsing uses `tomllib` on Python ≥ 3.11 and falls back to a built-in subset parser (strings/ints/bools, dotted sections) on older interpreters.
 
 ## Bouchet quick reference
@@ -145,4 +147,4 @@ Everything on the cluster side is a normal batch job named `hpcalloc-<name>` plu
 
 ## Tests
 
-`tests/run.sh` runs the whole suite offline — unit tests for the parsers plus end-to-end scenarios (connection loss, slurmctld errors, job death, GPU status, cancel safety, capacity digests) against a fake `ssh` shim in `tests/shim/`. No cluster, network, or credentials needed.
+`tests/run.sh` runs the whole suite offline — unit tests for the parsers plus end-to-end scenarios (connection loss, slurmctld errors, stale-master healing, job death, GPU status, cancel safety, capacity digests, Duo push, and a two-cluster scenario with an unreachable secondary — the documented stand-in for live multi-cluster access) against a fake `ssh` shim in `tests/shim/`. No cluster, network, or credentials needed.

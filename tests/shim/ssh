@@ -14,9 +14,21 @@
 #   flap        job 7777: RUNNING, absent, RUNNING, then gone (via $HPCTEST_COUNT)
 #   gpu-fail    like running but nvidia-smi fails (transport stays healthy)
 #   tz          cluster clock runs in UTC: submit stamps are cluster-local
+#   twocluster  bouchet behaves like `running`; cluster `grace` is unreachable
+#               (the offline stand-in for multi-cluster validation — no live
+#               second cluster is available)
 # scancel and -O exit invocations are appended to $HPCTEST_LOG.
 mode="${HPCTEST_MODE:?set HPCTEST_MODE}"
 all="$*"
+
+if [ "$mode" = twocluster ]; then
+  case "$all" in
+    *grace-login*)
+      echo "ssh: Could not resolve hostname grace.ycrc.yale.edu" >&2
+      exit 255 ;;
+  esac
+  mode=running  # the bouchet side is a healthy running cluster
+fi
 
 case "$all" in
   *"-O exit"*)
@@ -101,36 +113,41 @@ remote_now() {  # the cluster clock appended to every squeue_all round trip
   fi
 }
 
+row() {  # emit one squeue row, fields joined by the US byte (\037)
+  local IFS=$'\037'
+  printf '%s\n' "$*"
+}
+
 squeue_rows() {
   case "$mode" in
     squeue-err) echo "slurm_load_jobs error: Unable to contact slurm controller" >&2; return 1 ;;
     gone) ;;
     running|stale|flaky|gpu-fail)
       h="$(hostname -s)"
-      printf '9123|RUNNING|r806u23n04|None|3:59:00|gpu_h200|hpcalloc-h200|2020-01-01T00:00:00|hpc-alloc:testid123456:%s\n' "$h"
-      printf '9200|RUNNING|r801u01n01|None|1:00:00|gpu|hpcalloc-run|2020-01-01T00:00:00|hpc-alloc:testid123456:%s\n' "$h"
-      printf '9300|RUNNING|r802u02n02|None|2:00:00|day|myjob|2020-01-01T00:00:00|\n'
-      printf '9400|RUNNING|r803u03n03|None|5:00:00|day|hpcalloc-stale|2020-01-01T00:00:00|hpc-alloc:testid123456:%s\n' "$h"
-      printf '9500|RUNNING|r804u04n04|None|5:59:00|day|hpcalloc-fresh|%s|hpc-alloc:testid123456:%s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$h"
-      printf '9600|RUNNING|r805u05n05|None|4:00:00|day|hpcalloc-dev|2020-01-01T00:00:00|hpc-alloc:otherid999999:othermachine\n'
-      printf '9650|RUNNING|r805u05n06|None|4:00:00|day|hpcalloc-twin|2020-01-01T00:00:00|hpc-alloc:otherid999999:%s\n' "$h" ;;
+      row 9123 RUNNING r806u23n04 None 3:59:00 gpu_h200 hpcalloc-h200 2020-01-01T00:00:00 "hpc-alloc:testid123456:$h"
+      row 9200 RUNNING r801u01n01 None 1:00:00 gpu hpcalloc-run 2020-01-01T00:00:00 "hpc-alloc:testid123456:$h"
+      row 9300 RUNNING r802u02n02 None 2:00:00 day 'my|job' 2020-01-01T00:00:00 ""
+      row 9400 RUNNING r803u03n03 None 5:00:00 day hpcalloc-stale 2020-01-01T00:00:00 "hpc-alloc:testid123456:$h"
+      row 9500 RUNNING r804u04n04 None 5:59:00 day hpcalloc-fresh "$(date +%Y-%m-%dT%H:%M:%S)" "hpc-alloc:testid123456:$h"
+      row 9600 RUNNING r805u05n05 None 4:00:00 day hpcalloc-dev 2020-01-01T00:00:00 "hpc-alloc:otherid999999:othermachine"
+      row 9650 RUNNING r805u05n06 None 4:00:00 day hpcalloc-twin 2020-01-01T00:00:00 "hpc-alloc:otherid999999:$h" ;;
     tz)  # cluster-local (UTC) stamps: 1h-old sleeper + 5s-fresh sleeper
       old=$(python3 -c 'import time; print(time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - 3600)))')
       new=$(python3 -c 'import time; print(time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - 5)))')
-      printf '9700|RUNNING|r801u01n01|None|1:00:00|day|hpcalloc-old|%s|hpc-alloc:testid123456:testhost\n' "$old"
-      printf '9800|RUNNING|r802u02n02|None|1:00:00|day|hpcalloc-new|%s|hpc-alloc:testid123456:testhost\n' "$new" ;;
-    pending-qos) echo '9123|PENDING||QOSMaxGRESPerUser|8:00:00|gpu_h200|hpcalloc-h200|2020-01-01T00:00:00|' ;;
-    expiring) echo '9123|RUNNING|r806u23n04|None|0:12:00|gpu_h200|hpcalloc-h200|2020-01-01T00:00:00|' ;;
-    suspended) echo '9123|SUSPENDED|r806u23n04|None|3:59:00|gpu_h200|hpcalloc-h200|2020-01-01T00:00:00|' ;;
+      row 9700 RUNNING r801u01n01 None 1:00:00 day hpcalloc-old "$old" "hpc-alloc:testid123456:testhost"
+      row 9800 RUNNING r802u02n02 None 1:00:00 day hpcalloc-new "$new" "hpc-alloc:testid123456:testhost" ;;
+    pending-qos) row 9123 PENDING "" QOSMaxGRESPerUser 8:00:00 gpu_h200 hpcalloc-h200 2020-01-01T00:00:00 "" ;;
+    expiring) row 9123 RUNNING r806u23n04 None 0:12:00 gpu_h200 hpcalloc-h200 2020-01-01T00:00:00 "" ;;
+    suspended) row 9123 SUSPENDED r806u23n04 None 3:59:00 gpu_h200 hpcalloc-h200 2020-01-01T00:00:00 "" ;;
     blip)  # first poll: job missing; confirm-poll and later: RUNNING
       bump_count
       if [ "$n" -ge 1 ]; then
-        echo '9123|RUNNING|r806u23n04|None|3:59:00|gpu_h200|hpcalloc-h200|2020-01-01T00:00:00|'
+        row 9123 RUNNING r806u23n04 None 3:59:00 gpu_h200 hpcalloc-h200 2020-01-01T00:00:00 ""
       fi ;;
     flap)  # job 7777: RUNNING, one-poll blip, RUNNING again, then really gone
       bump_count
       case "$n" in
-        0|2) echo '7777|RUNNING|r801u01n01|None|1:00:00|gpu|hpcalloc-run|2020-01-01T00:00:00|' ;;
+        0|2) row 7777 RUNNING r801u01n01 None 1:00:00 gpu hpcalloc-run 2020-01-01T00:00:00 "" ;;
       esac ;;
   esac
   return 0

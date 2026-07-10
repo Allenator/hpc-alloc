@@ -670,8 +670,8 @@ def push_login(cluster, timeout=90):
     info("Duo approved — connection established")
 
 
-def ensure_login(cluster):
-    if try_login(cluster):
+def ensure_login(cluster, interactive=None):
+    if try_login(cluster, interactive=interactive):
         return
     if _last_probe == "hostkey":
         first = _probe_detail.splitlines()[0] if _probe_detail else "host key mismatch"
@@ -696,15 +696,18 @@ def ensure_login(cluster):
         code=EXIT_CONNLOST)
 
 
-def login_run(cluster, remote_cmd, check=True, timeout=60, _retry=True, binary=False):
+def login_run(cluster, remote_cmd, check=True, timeout=60, _retry=True, binary=False,
+              interactive=None):
     """Run a command on the login node over the multiplexed connection.
 
     Raises ConnectionLost on transport failure/stall (after one heal+retry).
     binary=True returns raw bytes in r.stdout — required when streaming log
     content, where strict text decoding would crash on non-UTF-8 bytes and
     newline translation would corrupt byte-offset accounting. r.stderr is
-    ALWAYS text, so every caller can .strip() it into a message safely."""
-    ensure_login(cluster)
+    ALWAYS text, so every caller can .strip() it into a message safely.
+    interactive=False guarantees no Duo prompt anywhere in the call (required
+    when sweeping secondary clusters in the background of another operation)."""
+    ensure_login(cluster, interactive=interactive)
     text_kwargs = {} if binary else {"text": True, "errors": "replace"}
     try:
         r = subprocess.run(ssh_argv(login_alias(cluster), remote_cmd, connect_timeout=20),
@@ -726,10 +729,10 @@ def login_run(cluster, remote_cmd, check=True, timeout=60, _retry=True, binary=F
             else:
                 # a stale master must not be re-trusted by try_login's fast path
                 heal_connections(load_state(), cluster)
-                if not try_login(cluster):
+                if not try_login(cluster, interactive=interactive):
                     raise ConnectionLost(detail)
             return login_run(cluster, remote_cmd, check=check, timeout=timeout,
-                             _retry=False, binary=binary)
+                             _retry=False, binary=binary, interactive=interactive)
         if probe(login_alias(cluster)) == "ok":
             raise SlurmError(f"remote command keeps failing while the connection "
                              f"probes healthy ({detail})")
@@ -774,13 +777,18 @@ Job = collections.namedtuple(
     "Job", "state node reason time_left partition name submit comment")
 
 
-SQUEUE_FORMAT = "%i|%T|%N|%r|%L|%P|%j|%V|%k"
+# Unit-separator delimited: %j (job name) and %k (comment) are free text that
+# users can legally put '|' into — one pipe in a job name shifted every field.
+SQUEUE_SEP = "\x1f"
+SQUEUE_FORMAT = SQUEUE_SEP.join(["%i", "%T", "%N", "%r", "%L", "%P", "%j", "%V", "%k"])
 
 
 def parse_squeue(text):
     out = {}
-    for line in text.strip().splitlines():
-        parts = line.strip().split("|")
+    for line in text.splitlines():
+        # no strip(): Python counts \x1f as whitespace, and stripping it would
+        # drop the trailing separator of every row whose comment is empty
+        parts = line.rstrip("\r").split(SQUEUE_SEP)
         if len(parts) == len(Job._fields) + 1:
             out[parts[0]] = Job(*parts[1:])
     return out
@@ -789,7 +797,7 @@ def parse_squeue(text):
 _remote_now = {}  # cluster -> (cluster-local 'date' string, monotonic anchor)
 
 
-def squeue_all(cluster):
+def squeue_all(cluster, interactive=None):
     """All of the user's queued/running jobs as {jobid: Job}.
     Raises ClusterError if the queue could not actually be queried — absence
     of a job is only meaningful when this returns normally.
@@ -798,7 +806,8 @@ def squeue_all(cluster):
     squeue %V stamps are cluster-local time, and any comparison against the
     client clock inherits the timezone offset (live-proven PT-vs-ET skew)."""
     r = login_run(cluster, f"squeue --me -h -o '{SQUEUE_FORMAT}' && "
-                           "printf '\\036' && date +%Y-%m-%dT%H:%M:%S", check=False)
+                           "printf '\\036' && date +%Y-%m-%dT%H:%M:%S", check=False,
+                  interactive=interactive)
     if r.returncode != 0 or "\x1e" not in r.stdout:
         raise SlurmError(f"squeue failed: {r.stderr.strip() or 'unknown error'}")
     text, _, now_str = r.stdout.partition("\x1e")
@@ -837,7 +846,7 @@ def squeue_query(cluster, jobids):
     return {j: q[j] for j in jobids if j in q}
 
 
-def sacct_final(cluster, jobid, fields=("State", "ExitCode"), attempts=(0,)):
+def sacct_final(cluster, jobid, fields=("State", "ExitCode"), attempts=(0,), interactive=None):
     """Fetch a job's FINAL accounting record (-P parse). Returns the field list
     or None. slurmdbd commit lag routinely spans seconds (longer under load),
     during which sacct returns the stale start record (RUNNING) — non-final
@@ -845,7 +854,8 @@ def sacct_final(cluster, jobid, fields=("State", "ExitCode"), attempts=(0,)):
     for delay in attempts:
         if delay:
             time.sleep(delay)
-        r = login_run(cluster, f"sacct -j {jobid} -X -n -P -o {','.join(fields)}", check=False)
+        r = login_run(cluster, f"sacct -j {jobid} -X -n -P -o {','.join(fields)}", check=False,
+                      interactive=interactive)
         rec = (r.stdout.strip().splitlines() or [""])[0].split("|")
         if len(rec) >= len(fields) and rec[0].split()[0].rstrip("+") in FINAL_SACCT_STATES:
             return rec
@@ -1074,16 +1084,45 @@ def cancel_job(cluster, jobid):
     return True, ""
 
 
+def clusters_in_order(state, preferred):
+    """All configured clusters, preferred first."""
+    return [preferred] + [c for c in state.get("clusters", {}) if c != preferred]
+
+
+def on_secondary(cluster, fn):
+    """Run fn() against a SECONDARY cluster, softly: never interactive, never
+    fatal. An unreachable second cluster must not break operations whose answer
+    lives on the first. Returns fn's result, or None with a skip note.
+
+    Multi-cluster caveat: these paths are exercised against the offline test
+    shim only — no live second cluster is available for validation."""
+    if not try_login(cluster, interactive=False):
+        info(f"note: cluster '{cluster}' is unreachable — skipping it")
+        return None
+    try:
+        return fn()
+    except ClusterError as e:
+        info(f"note: cluster '{cluster}' could not be queried ({e}) — skipping it")
+        return None
+    except SystemExit:  # a die() from deep plumbing must stay contained here
+        info(f"note: cluster '{cluster}' could not be queried — skipping it")
+        return None
+
+
 def locate_job(state, jobid, preferred):
     """Which configured cluster hosts this job right now? Searches the preferred
-    cluster first (numeric job ids are per-cluster counters and can collide).
-    Returns (cluster, row_or_None)."""
-    order = [preferred] + [c for c in state.get("clusters", {}) if c != preferred]
-    for c in order:
-        q = squeue_all(c).get(jobid)
-        if q is not None:
-            return c, q
-    return preferred, None
+    cluster first (numeric job ids are per-cluster counters and can collide);
+    the preferred cluster keeps full failure semantics, secondaries are swept
+    via on_secondary. Returns (cluster, row_or_None, queue_snapshot) — the
+    snapshot is the located cluster's full queue, so callers never poll twice."""
+    q = squeue_all(preferred)
+    if jobid in q:
+        return preferred, q[jobid], q
+    for c in clusters_in_order(state, preferred)[1:]:
+        q2 = on_secondary(c, lambda c=c: squeue_all(c, interactive=False))
+        if q2 and jobid in q2:
+            return c, q2[jobid], q2
+    return preferred, None, q
 
 
 def submit_job(cluster, remote_cmd):
@@ -1290,7 +1329,17 @@ def refresh_status(state):
     inserted by a concurrent `up` must not be judged by a pre-submission snapshot."""
     pre = {(n, a.get("jobid")) for n, a in state.get("allocs", {}).items()}
     my_id = machine_id(state)  # before the lock below: it may take the lock itself
-    queues = {c: squeue_all(c) for c in state.get("clusters", {})}
+    # The default cluster keeps full failure semantics; SECONDARY clusters
+    # degrade softly — one unreachable cluster must not abort the whole status.
+    # A cluster whose queue could not be read is left out of `queues` entirely,
+    # and nothing on it may be judged (shim-tested only: no live second cluster).
+    primary = cfg("defaults", "cluster") or DEFAULT_CLUSTER
+    queues = {}
+    for c in state.get("clusters", {}):
+        q = squeue_all(c) if c == primary else on_secondary(
+            c, lambda c=c: squeue_all(c, interactive=False))
+        if q is not None:
+            queues[c] = q
     # A single absent poll is not death evidence (controller failovers blip rows
     # out of squeue): confirm absence with a second look before reaping anything.
     missing = {a["cluster"] for a in state.get("allocs", {}).values()
@@ -1298,13 +1347,21 @@ def refresh_status(state):
     if missing:
         info("a tracked job is missing from the queue — confirming before cleanup")
         time.sleep(3)
-        for c in missing:
+        for c in sorted(missing):
             # union: presence in EITHER poll counts as alive; latest state wins
-            queues[c] = {**queues[c], **squeue_all(c)}
+            q2 = squeue_all(c) if c == primary else on_secondary(
+                c, lambda c=c: squeue_all(c, interactive=False))
+            if q2 is None:
+                del queues[c]  # can't confirm — don't judge this cluster at all
+            else:
+                queues[c] = {**queues[c], **q2}
     rows = []
     with locked_state() as st:
         for name, alloc in sorted(list(st["allocs"].items())):
-            q = queues.get(alloc["cluster"], {}).get(alloc["jobid"])
+            if alloc["cluster"] not in queues:
+                rows.append((alloc, "UNKNOWN (cluster unreachable)", ""))
+                continue
+            q = queues[alloc["cluster"]].get(alloc["jobid"])
             if q is None or q.state in ENDED_STATES:
                 # only an ABSENT row is inconclusive for a post-snapshot alloc; a row
                 # in an ENDED state is post-submission evidence — report the death
@@ -1701,31 +1758,43 @@ def cmd_logs(args):
     require_setup(state)
     cluster = args.cluster
     target = args.target
+    q0 = None
     if target in state["allocs"]:
         alloc = state["allocs"][target]
         cluster, jobid = alloc["cluster"], alloc["jobid"]
         logpath = f"{REMOTE_LOG_DIR}/{jobid}.log"
     elif target.isdigit():
         jobid = target
-        cluster, q0 = locate_job(state, jobid, cluster)
-        probe_cmd = (f'for f in {REMOTE_LOG_DIR}/run-{jobid}.log {REMOTE_LOG_DIR}/{jobid}.log; '
-                     'do [ -f "$f" ] && echo "$f" && break; done')
-        r = login_run(cluster, probe_cmd, check=False)
-        logpath = r.stdout.strip()
-        if not logpath and q0 is None:  # ended job: its log may live on another cluster
-            for c in state.get("clusters", {}):
-                if c == cluster:
-                    continue
-                r = login_run(c, probe_cmd, check=False)
-                if r.stdout.strip():
-                    cluster, logpath = c, r.stdout.strip()
-                    break
-        logpath = logpath or f"{REMOTE_LOG_DIR}/run-{jobid}.log"
+        cluster, q0, _ = locate_job(state, jobid, cluster)
+        if q0 is not None:
+            # live job: derive the path from its queue row. NEVER stat the log
+            # of a not-yet-started job — that poisons the login node's NFS
+            # negative-lookup cache and the later stream reads empty for ages.
+            is_run = q0.name == JOB_PREFIX + "run"
+            logpath = f"{REMOTE_LOG_DIR}/{'run-' if is_run else ''}{jobid}.log"
+        else:
+            # ended job: its log already exists (or never will) — probing is
+            # safe now, and the file may live on another cluster
+            probe_cmd = (f'for f in {REMOTE_LOG_DIR}/run-{jobid}.log {REMOTE_LOG_DIR}/{jobid}.log; '
+                         'do [ -f "$f" ] && echo "$f" && break; done')
+            r = login_run(cluster, probe_cmd, check=False)
+            logpath = r.stdout.strip()
+            if not logpath:
+                for c in clusters_in_order(state, cluster)[1:]:
+                    r = on_secondary(c, lambda c=c: login_run(
+                        c, probe_cmd, check=False, interactive=False))
+                    if r is not None and r.stdout.strip():
+                        cluster, logpath = c, r.stdout.strip()
+                        break
+            logpath = logpath or f"{REMOTE_LOG_DIR}/run-{jobid}.log"
     else:
         die(f"'{target}' is neither an allocation name nor a job id")
     if args.follow:
         stream_job(cluster, jobid, logpath)  # Ctrl-C detaches; never cancels
         return
+    if q0 is not None and q0.state != "RUNNING" and q0.state not in ENDED_STATES:
+        die(f"job {jobid} is {q0.state} — no log to show yet; "
+            f"`hpc-alloc logs {jobid} -f` streams it once the job starts")
     r = login_run(cluster, f"tail -n {args.lines} {shlex.quote(logpath)}", check=False, binary=True)
     if r.returncode != 0:
         die(f"no log at ~/{logpath} on {cluster}: {r.stderr.strip()}")
@@ -1740,10 +1809,20 @@ def cmd_cancel(args):
     jobid = args.jobid
     if not jobid.isdigit():
         die(f"'{jobid}' is not a job id (for named allocations use `hpc-alloc down NAME`)")
-    cluster, q = locate_job(state, jobid, cluster)
+    cluster, q, _ = locate_job(state, jobid, cluster)
     if q is None:
         r = login_run(cluster, f"sacct -j {jobid} -X -n -P -o JobName", check=False)
         jname = (r.stdout.strip().splitlines() or [""])[0]
+        if not jname.startswith(JOB_PREFIX):
+            # ids are per-cluster: the finished job may be another cluster's
+            for c in clusters_in_order(state, cluster)[1:]:
+                r2 = on_secondary(c, lambda c=c: login_run(
+                    c, f"sacct -j {jobid} -X -n -P -o JobName", check=False,
+                    interactive=False))
+                jn = (r2.stdout.strip().splitlines() or [""])[0] if r2 else ""
+                if jn.startswith(JOB_PREFIX):
+                    jname = jn
+                    break
         if jname.startswith(JOB_PREFIX):
             info(f"job {jobid} has already finished")
             return
@@ -1775,7 +1854,12 @@ def cmd_down(args):
         if not alloc:
             info(f"no allocation named '{name}'")
             continue
-        ok, detail = cancel_job(alloc["cluster"], alloc["jobid"])
+        try:
+            ok, detail = cancel_job(alloc["cluster"], alloc["jobid"])
+        except SystemExit:
+            # ensure_login die()d (cluster unreachable) — its diagnosis is
+            # printed; with --all the OTHER clusters' allocations must still go
+            ok, detail = False, "see the error above"
         if not ok:
             info(f"scancel FAILED for job {alloc['jobid']} ('{name}'): {detail} "
                  "— keeping it in state, retry later")
@@ -1950,19 +2034,21 @@ def cmd_why(args):
     cluster = args.cluster
     target = args.target
     name = None
+    queue = None
     if target and target in state["allocs"]:
         alloc = state["allocs"][target]
         name, jobid, cluster = target, alloc["jobid"], alloc["cluster"]
     elif target and target.isdigit():
         jobid = target
-        cluster, _ = locate_job(state, jobid, cluster)  # ids are per-cluster
+        cluster, _, queue = locate_job(state, jobid, cluster)  # ids are per-cluster
     elif not target:
         alloc = pick_alloc(state, None)
         name, jobid, cluster = alloc["name"], alloc["jobid"], alloc["cluster"]
     else:
         die(f"'{target}' is neither an allocation name nor a job id")
 
-    queue = squeue_all(cluster)
+    if queue is None:  # locate_job already polled for digit targets
+        queue = squeue_all(cluster)
     q = queue.get(jobid)
     result = {"jobid": jobid, "name": name, "cluster": cluster}
     detail = []
@@ -2004,6 +2090,16 @@ def cmd_why(args):
         rec = sacct_final(cluster, jobid,
                           fields=("State", "ExitCode", "Elapsed", "Timelimit"),
                           attempts=(0, 2, 2))
+        if rec is None:
+            # ids are per-cluster: the dead job's accounting may live elsewhere
+            for c in clusters_in_order(state, cluster)[1:]:
+                rec = on_secondary(c, lambda c=c: sacct_final(
+                    c, jobid, fields=("State", "ExitCode", "Elapsed", "Timelimit"),
+                    interactive=False))
+                if rec:
+                    cluster = c
+                    result["cluster"] = c
+                    break
         if rec:
             jstate, exitcode, elapsed, limit = rec[0], rec[1], rec[2], rec[3]
             result.update(final_state=jstate, exit_code=exitcode, elapsed=elapsed)
