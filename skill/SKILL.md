@@ -18,7 +18,7 @@ description: Allocate and use Yale YCRC compute nodes (Bouchet) for development 
 
 | Command | Purpose |
 |---|---|
-| `hpc-alloc status --json` | Allocations + run jobs (state, node, alias, `time_left`, `expiring_soon`, live `gpu_util`). **Always run this first.** |
+| `hpc-alloc status --json` | Allocations + a `runs` list of every untracked hpc-alloc job, each with `kind`: `run` (batch job, ends on its own), `recent` (just submitted — probably another window; leave it alone), or `orphan` (a sleeper allocation with no local record — holds resources until cancelled). **Always run this first.** Progress notices go to stderr; stdout is pure JSON. |
 | `hpc-alloc config --json` | Effective defaults: the user's config.toml merged over built-ins, with provenance. No cluster contact. |
 | `hpc-alloc avail [--json] [-p PART]` | Free capacity digest: idle CPUs and free GPUs by type per partition. **Run before requesting GPUs.** |
 | `hpc-alloc up [--name N] [-p PART] [-t TIME] [-c CPUS] [--mem M] [-G GPUS] [--idle-timeout MIN]` | Allocate a dev node; blocks until it starts (`--no-wait` for busy partitions). |
@@ -78,3 +78,5 @@ YCRC monitors GPU jobs and **cancels ones whose GPUs sit idle** (warning email a
 - Walltime is a hard deadline and cannot be extended — sync results out before it hits (`status` flags `expiring_soon`).
 - Cluster `scratch` storage purges files after 60 days; keep anything important in `project` or home.
 - On exit code 3: stop; either ask the user to run `hpc-alloc connect`, or announce and run `hpc-alloc connect --push` (they approve on their phone), then resume. On a stuck or dead job: `hpc-alloc why` first, then act on its diagnosis.
+- A `runs` entry with `"orphan": true` may be a lost allocation — but it may also belong to the user's OTHER machine (state is per-machine). Report it and run `hpc-alloc cancel <jobid>` only with the user's explicit confirmation; never cancel `kind: recent` entries.
+- `hpc-alloc run` mirrors the job's exit code (any non-COMPLETED end is nonzero); `hpc-alloc logs -f` is a pure watcher and exits 0 after a clean stream regardless of the job's outcome.

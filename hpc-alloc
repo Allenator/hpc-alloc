@@ -614,18 +614,26 @@ def wait_reconnect(cluster, budget=600):
 
 def squeue_all(cluster):
     """All of the user's queued/running jobs:
-    {jobid: (state, node, reason, time_left, partition, jobname)}.
+    {jobid: (state, node, reason, time_left, partition, jobname, submit_time)}.
     Raises ConnectionLost if the queue could not actually be queried — absence
     of a job is only meaningful when this returns normally."""
-    r = login_run(cluster, "squeue --me -h -o '%i|%T|%N|%r|%L|%P|%j'", check=False)
+    r = login_run(cluster, "squeue --me -h -o '%i|%T|%N|%r|%L|%P|%j|%V'", check=False)
     if r.returncode != 0:
         raise ConnectionLost(f"squeue failed: {r.stderr.strip() or 'unknown error'}")
     out = {}
     for line in r.stdout.strip().splitlines():
         parts = line.strip().split("|")
-        if len(parts) == 7:
+        if len(parts) == 8:
             out[parts[0]] = tuple(parts[1:])
     return out
+
+
+def submit_age(submit):
+    """Seconds since a squeue %V submit timestamp, or None if unparseable."""
+    try:
+        return max(0.0, time.time() - time.mktime(time.strptime(submit, "%Y-%m-%dT%H:%M:%S")))
+    except ValueError:
+        return None
 
 
 def squeue_query(cluster, jobids):
@@ -834,8 +842,8 @@ def pick_partition(args):
 
 def cmd_up(args):
     name = args.name
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name) or name == "login":
-        die(f"invalid allocation name '{name}'")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name) or name in ("login", "run"):
+        die(f"invalid allocation name '{name}' ('login' and 'run' are reserved)")
     partition = pick_partition(args)
 
     idle = args.idle_timeout
@@ -881,14 +889,22 @@ def cmd_up(args):
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     stale_jobid = existing["jobid"] if existing else None
-    with locked_state() as st:
+    lost_to = None
+    with locked_state() as st:  # decide under the lock; network stays outside it
         cur = st["allocs"].get(name)
         if cur and cur.get("jobid") not in (stale_jobid, jobid):
-            # lost a race: another invocation created this name after our check
-            login_run(cluster, f"scancel {jobid}", check=False)
-            die(f"allocation '{name}' was created concurrently (job {cur['jobid']}); "
-                f"cancelled this duplicate submission (job {jobid})")
-        st["allocs"][name] = alloc
+            lost_to = cur["jobid"]  # concurrent creation wins; cancel ours below
+        else:
+            st["allocs"][name] = alloc
+    if lost_to:
+        try:
+            r = login_run(cluster, f"scancel {jobid}", check=False)
+            cancelled = r.returncode == 0
+        except ConnectionLost:
+            cancelled = False
+        outcome = (f"cancelled this duplicate submission (job {jobid})" if cancelled else
+                   f"could NOT cancel duplicate job {jobid} — run `hpc-alloc cancel {jobid}`")
+        die(f"allocation '{name}' was created concurrently (job {lost_to}); {outcome}")
     extra = f", self-releases after {idle} idle GPU minutes" if idle else ""
     info(f"submitted job {jobid} on {cluster} (partition {partition}, {args.time}{extra})")
 
@@ -925,7 +941,9 @@ def wait_for_running(alloc, timeout):
                 except ConnectionLost:
                     final = "unknown"
                 with locked_state() as st:
-                    st["allocs"].pop(name, None)
+                    cur = st["allocs"].get(name)
+                    if cur and cur.get("jobid") == jobid:  # don't pop a replacement
+                        del st["allocs"][name]
                 die(f"job {jobid} ended before starting: {final}\n"
                     f"log (on the cluster): ~/{REMOTE_LOG_DIR}/{jobid}.log\n"
                     f"diagnose with: hpc-alloc why {jobid}")
@@ -933,8 +951,9 @@ def wait_for_running(alloc, timeout):
             if st_ == "RUNNING":
                 forget_hostkey(node)
                 with locked_state() as st:
-                    if name in st["allocs"]:
-                        st["allocs"][name]["node"] = node
+                    cur = st["allocs"].get(name)
+                    if cur and cur.get("jobid") == jobid:  # not a concurrent replacement
+                        cur["node"] = node
                 alloc["node"] = node
                 finish_alloc(alloc, time_left)
                 return
@@ -1017,7 +1036,7 @@ def refresh_status(state):
                 rows.append((alloc, "ENDED", ""))
                 del st["allocs"][name]
                 continue
-            st_, node, reason, time_left, _part, _name = q
+            st_, node, reason, time_left, _part, _name, _submit = q
             if st_ == "RUNNING" and node and alloc.get("node") != node:
                 if alloc.get("node"):  # Slurm requeued the job onto a different node
                     close_master(alloc_alias(alloc))
@@ -1025,18 +1044,26 @@ def refresh_status(state):
                 forget_hostkey(node)
                 alloc["node"] = node
             rows.append((alloc, st_ if st_ == "RUNNING" else f"{st_} ({reason})", time_left))
-        tracked = {a.get("jobid") for a in st["allocs"].values()}
+        tracked = {(a.get("cluster"), a.get("jobid")) for a in st["allocs"].values()}
     runs = []
     for cluster, q in queues.items():
-        for jid, (st_, node, _reason, left, part, jname) in sorted(q.items()):
+        for jid, (st_, node, _reason, left, part, jname, submit) in sorted(q.items()):
             # every live hpcalloc-* job we don't track: run jobs AND orphaned
             # sleepers (e.g. a `down` whose record was lost) must stay visible
-            if jname.startswith(JOB_PREFIX) and jid not in tracked and st_ not in ENDED_STATES:
-                is_run = jname.startswith(JOB_PREFIX + "run")
-                runs.append({"jobid": jid, "cluster": cluster, "state": st_,
-                             "node": node or None, "partition": part, "time_left": left,
-                             "jobname": jname,
-                             "log": f"~/{REMOTE_LOG_DIR}/{'run-' if is_run else ''}{jid}.log"})
+            if (not jname.startswith(JOB_PREFIX) or (cluster, jid) in tracked
+                    or st_ in ENDED_STATES):
+                continue
+            if jname == JOB_PREFIX + "run":  # exact: 'hpcalloc-run2' is an alloc name
+                kind = "run"
+            else:
+                age = submit_age(submit)
+                # a just-submitted sleeper is usually an `up` from another window
+                # whose record isn't written yet — never offer to cancel those
+                kind = "recent" if age is not None and age < 120 else "orphan"
+            runs.append({"jobid": jid, "cluster": cluster, "state": st_,
+                         "node": node or None, "partition": part, "time_left": left,
+                         "jobname": jname, "kind": kind, "orphan": kind == "orphan",
+                         "log": f"~/{REMOTE_LOG_DIR}/{'run-' if kind == 'run' else ''}{jid}.log"})
     return rows, runs
 
 
@@ -1081,10 +1108,13 @@ def cmd_status(args):
         fmt = "{:<9} {:<12} {:<12} {:<14} {:<11} {}"
         print(fmt.format("RUN JOB", "STATE", "PARTITION", "NODE", "LEFT", "ACTION"))
         for rj in runs:
-            if rj["jobname"].startswith(JOB_PREFIX + "run"):
+            if rj["kind"] == "run":
                 hint = f"hpc-alloc logs {rj['jobid']} -f"
+            elif rj["kind"] == "recent":
+                hint = f"just submitted ('{rj['jobname']}') — likely another window; re-check status"
             else:  # a sleeper we no longer track — surface it, don't hide it
-                hint = f"ORPHANED allocation ('{rj['jobname']}') — hpc-alloc cancel {rj['jobid']}"
+                hint = (f"UNTRACKED allocation ('{rj['jobname']}') — verify it isn't another "
+                        f"machine's, then: hpc-alloc cancel {rj['jobid']}")
             print(fmt.format(rj["jobid"], rj["state"], rj["partition"], rj["node"] or "-",
                              rj["time_left"] or "-", hint))
 
@@ -1581,7 +1611,7 @@ def cmd_why(args):
     result = {"jobid": jobid, "name": name, "cluster": cluster}
     detail = []
     if q and q[0] not in ENDED_STATES:
-        st_, node, reason, left, part, _jname = q
+        st_, node, reason, left, part, _jname, _submit = q
         result.update(status=st_, partition=part, node=node or None,
                       time_left=left, reason=reason)
         if st_ == "PENDING":

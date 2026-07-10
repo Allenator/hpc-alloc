@@ -158,15 +158,18 @@ hpc running status > "$work/out" 2>&1; check "status exit" 0 $?
 contains "node discovered" "r806u23n04" "$work/out"
 contains "gpu util shown" "42%" "$work/out"
 contains "run job listed" "9200" "$work/out"
-contains "orphan sleeper surfaced" "ORPHANED" "$work/out"
-hpc running status --json > "$work/out" 2>&1
-contains "json run job" '"jobid": "9200"' "$work/out"
+contains "orphan sleeper surfaced" "UNTRACKED" "$work/out"
+contains "fresh sleeper not cancel-hinted" "just submitted" "$work/out"
+hpc running status --json 2>/dev/null > "$work/out"
 python3 -c "
-import json; d = json.load(open('$work/out'))
-ids = {r['jobid'] for r in d['runs']}
-assert ids == {'9200', '9400'}, ids           # run job + orphan; foreign 9300 and tracked 9123 excluded
+import json; d = json.load(open('$work/out'))    # stdout must be pure JSON
+kinds = {r['jobid']: r['kind'] for r in d['runs']}
+assert kinds == {'9200': 'run', '9400': 'orphan', '9500': 'recent'}, kinds
+assert [r['orphan'] for r in d['runs']] == [r['kind'] == 'orphan' for r in d['runs']]
 assert d['allocs'][0]['gpu_util'] == 42
-print('  ok: json runs filtered (run + orphan), gpu_util=42')" || fails=$((fails + 1))
+print('  ok: json kinds (run/orphan/recent), stdout pure, gpu_util=42')" || fails=$((fails + 1))
+hpc running up --dry-run --name run > "$work/out" 2>&1
+check "name 'run' reserved" 1 $?
 
 echo "== review fixes: regression checks =="
 mkstate null
