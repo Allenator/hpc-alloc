@@ -13,7 +13,8 @@
 #   blip        squeue poll 1 omits job 9123, later polls show it RUNNING
 #   flap        job 7777: RUNNING, absent, RUNNING, then gone (via $HPCTEST_COUNT)
 #   gpu-fail    like running but nvidia-smi fails (transport stays healthy)
-#   tz          cluster clock runs in UTC: submit stamps are cluster-local
+#   tz          UTC submit stamps aged against the UTC cluster clock
+#   requeue     streamed job is requeued mid-run; its log truncates and restarts
 #   twocluster  bouchet behaves like `running`; cluster `grace` is unreachable
 #               (the offline stand-in for multi-cluster validation — no live
 #               second cluster is available)
@@ -106,11 +107,8 @@ bump_count() {  # per-squeue-poll counter for the stateful modes
 }
 
 remote_now() {  # the cluster clock appended to every squeue_all round trip
-  if [ "$mode" = tz ]; then  # cluster in UTC, client wherever it happens to be
-    python3 -c 'import time; print(time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()))'
-  else
-    date +%Y-%m-%dT%H:%M:%S
-  fi
+  # always UTC: the CLI now requests TZ=UTC squeue / date -u
+  date -u +%Y-%m-%dT%H:%M:%S
 }
 
 row() {  # emit one squeue row, fields joined by the US byte (\037)
@@ -125,10 +123,13 @@ squeue_rows() {
     running|stale|flaky|gpu-fail)
       h="$(hostname -s)"
       row 9123 RUNNING r806u23n04 None 3:59:00 gpu_h200 hpcalloc-h200 2020-01-01T00:00:00 "hpc-alloc:testid123456:$h"
+      # RS byte in a foreign job's name: must not truncate framing (rows after
+      # this one vanished when squeue_all partitioned on the FIRST \x1e)
+      row 9350 RUNNING r899u99n99 None 1:00:00 day "$(printf 'evil\036name')" 2020-01-01T00:00:00 ""
       row 9200 RUNNING r801u01n01 None 1:00:00 gpu hpcalloc-run 2020-01-01T00:00:00 "hpc-alloc:testid123456:$h"
       row 9300 RUNNING r802u02n02 None 2:00:00 day 'my|job' 2020-01-01T00:00:00 ""
       row 9400 RUNNING r803u03n03 None 5:00:00 day hpcalloc-stale 2020-01-01T00:00:00 "hpc-alloc:testid123456:$h"
-      row 9500 RUNNING r804u04n04 None 5:59:00 day hpcalloc-fresh "$(date +%Y-%m-%dT%H:%M:%S)" "hpc-alloc:testid123456:$h"
+      row 9500 RUNNING r804u04n04 None 5:59:00 day hpcalloc-fresh "$(date -u +%Y-%m-%dT%H:%M:%S)" "hpc-alloc:testid123456:$h"
       row 9600 RUNNING r805u05n05 None 4:00:00 day hpcalloc-dev 2020-01-01T00:00:00 "hpc-alloc:otherid999999:othermachine"
       row 9650 RUNNING r805u05n06 None 4:00:00 day hpcalloc-twin 2020-01-01T00:00:00 "hpc-alloc:otherid999999:$h" ;;
     tz)  # cluster-local (UTC) stamps: 1h-old sleeper + 5s-fresh sleeper
@@ -149,16 +150,32 @@ squeue_rows() {
       case "$n" in
         0|2) row 7777 RUNNING r801u01n01 None 1:00:00 gpu hpcalloc-run 2020-01-01T00:00:00 "" ;;
       esac ;;
+    requeue)  # 7777 runs, gets requeued (log truncates), runs again, ends
+      bump_count
+      case "$n" in
+        0|1|3|4) row 7777 RUNNING r801u01n01 None 1:00:00 day hpcalloc-run 2020-01-01T00:00:00 "" ;;
+        2) row 7777 PENDING "" Requeued 1:00:00 day hpcalloc-run 2020-01-01T00:00:00 "" ;;
+      esac ;;
   esac
   return 0
 }
 
 stream_content() {  # the canonical log file a streamed job "wrote"
-  if [ "$mode" = flap ] && [ "$(cat "$HPCTEST_COUNT" 2>/dev/null || echo 0)" -ge 3 ]; then
-    printf 'epoch 1: loss 0.42\nafter-blip\n'  # grows after the queue blip
-  else
-    printf 'epoch 1: loss 0.42\n'
-  fi
+  case "$mode" in
+    flap)
+      if [ "$(cat "$HPCTEST_COUNT" 2>/dev/null || echo 0)" -ge 3 ]; then
+        printf 'epoch 1: loss 0.42\nafter-blip\n'  # grows after the queue blip
+      else
+        printf 'epoch 1: loss 0.42\n'
+      fi ;;
+    requeue)  # attempt 2's file is SHORTER than attempt 1 (truncate-on-requeue)
+      if [ "$(cat "$HPCTEST_COUNT" 2>/dev/null || echo 0)" -ge 4 ]; then
+        printf 'second-attempt\n'
+      else
+        printf 'first-attempt: 0123456789\n'
+      fi ;;
+    *) printf 'epoch 1: loss 0.42\n' ;;
+  esac
 }
 
 tail_chunk() {  # honor the CLI's `tail -c +N` byte offset (stream correctness)
@@ -175,9 +192,11 @@ case "$all" in
   *scancel*)
     echo "SCANCEL: $all" >> "${HPCTEST_LOG:-/dev/null}"
     exit "${HPCTEST_SCANCEL_RC:-0}" ;;
-  *"squeue --me"*"printf OK"*)  # stream_job's combined queue+log poll
+  *"squeue --me"*"printf OK"*)  # stream_job's combined queue+size+log poll
     squeue_rows || exit 1
     printf 'OK\036'
+    stream_content | wc -c | tr -d ' \n'  # log's current byte size
+    printf '\036'
     stream_content | tail_chunk ;;
   *"squeue --me"*)
     squeue_rows || exit 1

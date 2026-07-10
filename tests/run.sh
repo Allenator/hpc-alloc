@@ -56,6 +56,15 @@ assert m["split_ssh_args"](s, ["h200", "--", "ls", "-la"]) == ("h200", ["ls", "-
 assert m["split_ssh_args"](s, ["--", "ls"]) == (None, ["ls"])
 # a leading -- forces the command interpretation even for alloc-name lookalikes
 assert m["split_ssh_args"](s, ["--", "h200", "-v"]) == (None, ["h200", "-v"])
+US = "\x1f"
+mkrow = lambda jid, name: US.join([jid, "RUNNING", "n1", "None", "1:00", "day",
+                                   name, "2020-01-01T00:00:00", ""])
+q = m["parse_squeue"](mkrow("77", "my\x0cjob") + "\n" + mkrow("78", "evil\x1ename"))
+assert set(q) == {"77", "78"} and q["77"].name == "my\x0cjob", q  # control bytes survive
+m["CONN"].remote_now["c"] = ("2026-01-01T00:01:00", m["time"].monotonic())
+age = m["submit_age"]("2026-01-01T00:00:00", "c")
+assert age is not None and 59 <= age <= 62, age  # UTC/timegm arithmetic
+assert m["submit_age"]("garbage", "c") is None
 mk = lambda name, comment: m["Job"]("RUNNING", "n1", "None", "1:00", "day",
                                     name, "2020-01-01T00:00:00", comment)
 cl = m["classify_untracked"]
@@ -468,6 +477,16 @@ contains "stream continued after the blip" "after-blip" "$work/out"
 check "log content streamed exactly once (byte offsets honored)" \
   1 "$(grep -c 'epoch 1' "$work/out")"
 check "post-blip content not duplicated either" 1 "$(grep -c 'after-blip' "$work/out")"
+
+echo "== stage-G: requeue truncation detected and re-streamed =="
+mkstate null
+rm -f "$work/rq.n"
+HPCTEST_COUNT="$work/rq.n" hpc requeue run -- echo hi > "$work/out" 2>"$work/err"
+check "requeued run exits 0" 0 $?
+contains "attempt 1 streamed" "first-attempt" "$work/out"
+contains "attempt 2 re-streamed from the top" "second-attempt" "$work/out"
+check "attempt-2 content exactly once" 1 "$(grep -c 'second-attempt' "$work/out")"
+contains "re-stream notice on stderr" "re-streaming" "$work/err"
 
 echo "== stage-B: ownership by persisted id, not hostname =="
 mkstate null

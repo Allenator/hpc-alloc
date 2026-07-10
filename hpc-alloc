@@ -22,6 +22,7 @@ Requires only a VPN connection and a NetID with an uploaded SSH key
 """
 
 import argparse
+import calendar
 import collections
 import fcntl
 import json
@@ -808,7 +809,10 @@ SQUEUE_FORMAT = SQUEUE_SEP.join(["%i", "%T", "%N", "%r", "%L", "%P", "%j", "%V",
 
 def parse_squeue(text):
     out = {}
-    for line in text.splitlines():
+    # split("\n"), not splitlines(): job names/comments are free text, and
+    # Python treats \x0b/\x0c/\x1c/\x1d/\x85/U+2028/U+2029 as line breaks —
+    # splitlines() fragmented such rows and the job silently vanished.
+    for line in text.split("\n"):
         # no strip(): Python counts \x1f as whitespace, and stripping it would
         # drop the trailing separator of every row whose comment is empty
         parts = line.rstrip("\r").split(SQUEUE_SEP)
@@ -822,15 +826,19 @@ def squeue_all(cluster, interactive=None):
     Raises ClusterError if the queue could not actually be queried — absence
     of a job is only meaningful when this returns normally.
 
-    The same round trip captures the CLUSTER's wall clock (for submit_age):
-    squeue %V stamps are cluster-local time, and any comparison against the
-    client clock inherits the timezone offset (live-proven PT-vs-ET skew)."""
-    r = login_run(cluster, f"squeue --me -h -o '{SQUEUE_FORMAT}' && "
-                           "printf '\\036' && date +%Y-%m-%dT%H:%M:%S", check=False,
+    The same round trip captures the CLUSTER's wall clock (for submit_age).
+    Both squeue's %V stamps and the clock are rendered in UTC on the cluster,
+    so the client's timezone and DST folds can never skew age arithmetic
+    (live-proven PT-vs-ET skew; mktime's fall-back-hour ambiguity)."""
+    r = login_run(cluster, f"TZ=UTC squeue --me -h -o '{SQUEUE_FORMAT}' && "
+                           "printf '\\036' && date -u +%Y-%m-%dT%H:%M:%S", check=False,
                   interactive=interactive)
     if r.returncode != 0 or "\x1e" not in r.stdout:
         raise SlurmError(f"squeue failed: {r.stderr.strip() or 'unknown error'}")
-    text, _, now_str = r.stdout.partition("\x1e")
+    # LAST separator: %j/%k are user free text, and an embedded RS byte must
+    # not truncate the snapshot (a truncated snapshot once reaped a live
+    # allocation — absence evidence must never come from framing accidents)
+    text, _, now_str = r.stdout.rpartition("\x1e")
     CONN.remote_now[cluster] = (now_str.strip(), time.monotonic())
     return parse_squeue(text)
 
@@ -845,16 +853,16 @@ def parse_owner(comment):
 
 def submit_age(submit, cluster):
     """Seconds between a squeue %V submit stamp and the cluster's own clock
-    (captured by squeue_all in the same round trip). Both stamps are cluster-
-    local wall time parsed with the same local mktime, so the client's timezone
-    cancels out. None if either stamp is missing/unparseable."""
+    (captured by squeue_all in the same round trip). Both stamps are UTC
+    (TZ=UTC squeue / date -u) and parsed with timegm — no local timezone, no
+    DST-fold ambiguity. None if either stamp is missing/unparseable."""
     clock = CONN.remote_now.get(cluster)
     if clock is None:
         return None
     now_str, anchor = clock
     try:
-        now = time.mktime(time.strptime(now_str, "%Y-%m-%dT%H:%M:%S"))
-        sub = time.mktime(time.strptime(submit, "%Y-%m-%dT%H:%M:%S"))
+        now = calendar.timegm(time.strptime(now_str, "%Y-%m-%dT%H:%M:%S"))
+        sub = calendar.timegm(time.strptime(submit, "%Y-%m-%dT%H:%M:%S"))
     except ValueError:
         return None
     return max(0.0, now + (time.monotonic() - anchor) - sub)
@@ -877,7 +885,9 @@ def sacct_final(cluster, jobid, fields=("State", "ExitCode"), attempts=(0,), int
         r = login_run(cluster, f"sacct -j {jobid} -X -n -P -o {','.join(fields)}", check=False,
                       interactive=interactive)
         rec = (r.stdout.strip().splitlines() or [""])[0].split("|")
-        if len(rec) >= len(fields) and rec[0].split()[0].rstrip("+") in FINAL_SACCT_STATES:
+        state_words = rec[0].split()  # guard: an empty State field must retry,
+        if (len(rec) >= len(fields) and state_words  # not IndexError-crash
+                and state_words[0].rstrip("+") in FINAL_SACCT_STATES):
             return rec
     return None
 
@@ -1688,18 +1698,26 @@ class Stream:
         stdout and returns the job's queue row (or None). A job that has not
         started only gets a periodic state note — its log is never touched.
         Raises SlurmError/ConnectionLost like login_run."""
-        # ONE round trip per poll: queue state and log chunk together,
-        # separated by an RS byte; the OK marker distinguishes an empty
-        # queue from a failed squeue (which must not read as job-ended)
-        tail_part = (f"tail -c +{self.offset + 1} {shlex.quote(self.logpath)} 2>/dev/null || true"
-                     if self.seen_active else "true")
+        # ONE round trip per poll, three RS-framed parts: queue rows + OK
+        # marker, the log's current byte size, and the new log chunk. The OK
+        # marker distinguishes an empty queue from a failed squeue (which must
+        # not read as job-ended); the size detects requeue truncation.
+        if self.seen_active:
+            qlog = shlex.quote(self.logpath)
+            tail_part = (f"wc -c < {qlog} 2>/dev/null || echo 0; printf '\\036'; "
+                         f"tail -c +{self.offset + 1} {qlog} 2>/dev/null || true")
+        else:
+            tail_part = "echo 0; printf '\\036'; true"
         combined = (f"squeue --me -h -o '{SQUEUE_FORMAT}' && printf OK; "
                     f"printf '\\036'; {tail_part}")
         r = login_run(self.cluster, combined, check=False, binary=True)
-        head, _, chunk = r.stdout.partition(b"\x1e")
-        if not head.endswith(b"OK"):
+        # anchor on the marker SEQUENCE, not the first RS byte: job names and
+        # comments are free text, and an embedded \x1e must not break framing
+        head, marker, rest = r.stdout.partition(b"OK\x1e")
+        if not marker:
             raise SlurmError("squeue failed mid-stream")
-        q = parse_squeue(head[:-2].decode(errors="replace")).get(self.jobid)
+        size_b, _, chunk = rest.partition(b"\x1e")
+        q = parse_squeue(head.decode(errors="replace")).get(self.jobid)
         if q and q.state != "RUNNING" and q.state not in ENDED_STATES:
             # PENDING/SUSPENDED/CONFIGURING/REQUEUED: nothing to tail yet —
             # say so instead of silently polling a frozen log (any tailed
@@ -1711,7 +1729,26 @@ class Stream:
                 info(note)
                 self.last_note = time.monotonic()
             return q
-        self.seen_active = True  # job has (or had) started: tailing is safe now
+        if q is not None:
+            # only a PRESENT row (RUNNING, or ENDED meaning it ran) proves the
+            # job started; an ABSENT row proves nothing and must not arm the
+            # tail — a one-poll blip while PENDING would otherwise stat the
+            # uncreated log and poison the NFS negative-lookup cache
+            self.seen_active = True
+        if not self.seen_active:
+            return q
+        try:
+            size = int(size_b.strip() or b"0")
+        except ValueError:
+            size = None
+        if size is not None and size < self.offset:
+            # Slurm reopened --output in truncate mode (requeue/preemption):
+            # restart from byte 0 or attempt 2's early output is silently lost.
+            # (If the new log outgrows the old offset within one poll interval,
+            # this check can miss — accepted residual for a 3-5s window.)
+            info(f"job {self.jobid}: log restarted (requeued?) — re-streaming from the top")
+            self.offset = 0
+            return q  # this poll's chunk used the stale offset; re-read next poll
         # binary: raw bytes keep the offset exact (no newline translation)
         # and non-UTF-8 log content cannot crash the stream
         if chunk:
