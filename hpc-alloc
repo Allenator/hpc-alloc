@@ -39,8 +39,12 @@ from pathlib import Path
 # SSH_ASKPASS re-entry: during `connect --push`, ssh execs THIS script to answer
 # its keyboard-interactive prompt (no helper file, no fixed path to race).
 # stdout IS the auth response — answer "1" (Duo's push option) and exit before
-# anything else can touch stdout.
-if os.environ.get("HPC_ALLOC_ASKPASS") == "1":
+# anything else can touch stdout. Only when ssh invoked us as the askpass
+# program push_login configured (marker AND SSH_ASKPASS pointing back here):
+# a stray exported marker in a user's shell must not turn every hpc-alloc
+# command into a "1" printer.
+if (os.environ.get("HPC_ALLOC_ASKPASS") == "1"
+        and os.path.realpath(os.environ.get("SSH_ASKPASS", "")) == os.path.realpath(__file__)):
     print("1")
     sys.exit(0)
 
@@ -474,12 +478,14 @@ def ensure_include():
 _verified = set()  # clusters whose login connection was probed OK this run
 
 
-def ssh_argv(alias, remote_cmd=None, batch=True, connect_timeout=10):
+def ssh_argv(alias, remote_cmd=None, batch=True, connect_timeout=10, extra=()):
     """The one place ssh invocations are assembled — transport-wide options
     must not be maintained in five hand-built copies."""
     argv = ["ssh"]
     if batch:
         argv += ["-o", "BatchMode=yes"]
+    for opt in extra:
+        argv += ["-o", opt]
     argv += ["-o", f"ConnectTimeout={connect_timeout}", "--", alias]
     if remote_cmd is not None:
         argv.append(remote_cmd)
@@ -650,7 +656,10 @@ def push_login(cluster, timeout=90):
            "DISPLAY": os.environ.get("DISPLAY", ":0")}
     info(f"requesting Duo push for {alias} — approve it on your phone...")
     try:
-        r = subprocess.run(ssh_argv(alias, "true", batch=False, connect_timeout=30),
+        # one auth prompt = one push: a denied/expired push must not make ssh
+        # re-prompt (askpass would answer "1" again — push fatigue by design)
+        r = subprocess.run(ssh_argv(alias, "true", batch=False, connect_timeout=30,
+                                    extra=("NumberOfPasswordPrompts=1",)),
                            env=env, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         die("Duo push not approved in time — try again with `hpc-alloc connect --push`",
@@ -730,12 +739,15 @@ def login_run(cluster, remote_cmd, check=True, timeout=60, _retry=True, binary=F
     return r
 
 
-def wait_reconnect(cluster, budget=600):
+def wait_reconnect(cluster, budget=600, interrupt_hint="Ctrl-C is safe, jobs stay queued"):
     """Patiently re-probe after a drop. Probes are NON-interactive; when the
     network returns and re-auth is needed, at most ONE interactive attempt is
     made — a reconnect loop must never strafe the user with repeated Duo
-    prompts (push fatigue). True once reconnected."""
-    info(f"retrying for up to {budget // 60} minutes — Ctrl-C is safe, jobs stay queued")
+    prompts (push fatigue). True once reconnected.
+
+    interrupt_hint must match the CALLER's Ctrl-C behavior: `run` cancels its
+    job on interrupt, so promising 'safe' here would be a lie."""
+    info(f"retrying for up to {budget // 60} minutes — {interrupt_hint}")
     deadline = time.monotonic() + budget
     while time.monotonic() < deadline:
         time.sleep(15)
@@ -1609,7 +1621,9 @@ def stream_job(cluster, jobid, logpath, cancel_on_interrupt=False, verdict=False
                 if not can_prompt():
                     die(f"reconnect, then reattach with `hpc-alloc logs {jobid} -f`",
                         code=EXIT_CONNLOST)
-                if not wait_reconnect(cluster):
+                if not wait_reconnect(cluster, interrupt_hint=(
+                        "Ctrl-C CANCELS the job" if cancel_on_interrupt
+                        else "Ctrl-C detaches, the job keeps running")):
                     die(f"could not reconnect; job {jobid} continues — reattach with "
                         f"`hpc-alloc logs {jobid} -f`", code=EXIT_CONNLOST)
                 continue

@@ -45,9 +45,14 @@ if [ "$mode" = hostkey ]; then
   exit 255
 fi
 
-# duo: auth fails until an SSH_ASKPASS attempt "approves" (creates the marker)
+# duo: auth fails until an SSH_ASKPASS attempt "approves" (creates the marker).
+# Approval also requires the one-prompt cap — a push attempt that would let ssh
+# re-prompt (and re-push) on a denied/expired push must not pass the suite.
 if [ "$mode" = duo ] && [ ! -f "${HPCTEST_MARK:?}" ]; then
-  if [ -n "${SSH_ASKPASS:-}" ]; then touch "$HPCTEST_MARK"; exit 0; fi
+  case "$all" in
+    *"NumberOfPasswordPrompts=1"*)
+      if [ -n "${SSH_ASKPASS:-}" ]; then touch "$HPCTEST_MARK"; exit 0; fi ;;
+  esac
   echo "ab1234@bouchet.ycrc.yale.edu: Permission denied (keyboard-interactive)." >&2
   exit 255
 fi
@@ -65,7 +70,10 @@ if [ "$mode" = stale-duo ]; then
     exit 255
   fi
   if [ ! -f "$HPCTEST_MARK" ]; then
-    if [ -n "${SSH_ASKPASS:-}" ]; then touch "$HPCTEST_MARK"; exit 0; fi
+    case "$all" in
+      *"NumberOfPasswordPrompts=1"*)
+        if [ -n "${SSH_ASKPASS:-}" ]; then touch "$HPCTEST_MARK"; exit 0; fi ;;
+    esac
     echo "ab1234@bouchet.ycrc.yale.edu: Permission denied (keyboard-interactive)." >&2
     exit 255
   fi

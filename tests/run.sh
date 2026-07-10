@@ -311,11 +311,13 @@ contains "push approved" "Duo approved" "$work/out"
 contains "master established" "login OK" "$work/out"
 
 echo "== askpass self-reentry + passphrase precheck =="
-out=$(HOME="$work" HPC_ALLOC_ASKPASS=1 "$cli" status 2>/dev/null)
+out=$(HOME="$work" HPC_ALLOC_ASKPASS=1 SSH_ASKPASS="$cli" "$cli" status 2>/dev/null)
 check "askpass re-entry answers 1" "1" "$out"
+out=$(HOME="$work" HPC_ALLOC_ASKPASS=1 "$cli" status 2>/dev/null)
+check "stray marker without SSH_ASKPASS pairing is ignored" "" "$out"
 mkdir -p "$work/.config/hpc-alloc"
 printf 'garbage = = =\n' > "$work/.config/hpc-alloc/config.toml"
-out=$(HOME="$work" HPC_ALLOC_ASKPASS=1 "$cli" status 2>/dev/null)
+out=$(HOME="$work" HPC_ALLOC_ASKPASS=1 SSH_ASKPASS="$cli" "$cli" status 2>/dev/null)
 check "re-entry stdout clean even with broken config" "1" "$out"
 rm -rf "$work/.config"
 mkstate null
