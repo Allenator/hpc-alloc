@@ -56,7 +56,16 @@ assert m["split_ssh_args"](s, ["h200", "--", "ls", "-la"]) == ("h200", ["ls", "-
 assert m["split_ssh_args"](s, ["--", "ls"]) == (None, ["ls"])
 # a leading -- forces the command interpretation even for alloc-name lookalikes
 assert m["split_ssh_args"](s, ["--", "h200", "-v"]) == (None, ["h200", "-v"])
-print("  ok: timeleft/gres/state/ssh-args helpers")
+mk = lambda name, comment: m["Job"]("RUNNING", "n1", "None", "1:00", "day",
+                                    name, "2020-01-01T00:00:00", comment)
+cl = m["classify_untracked"]
+assert cl(mk("hpcalloc-run", ""), "me1", None) == "run"
+assert cl(mk("hpcalloc-run2", "hpc-alloc:me1:host"), "me1", 9999) == "orphan"  # not a run job
+assert cl(mk("hpcalloc-dev", "hpc-alloc:other:host"), "me1", 9999) == "other-machine"
+assert cl(mk("hpcalloc-dev", "hpc-alloc:me1:host"), "me1", 5) == "recent"
+assert cl(mk("hpcalloc-dev", "hpc-alloc:me1:host"), "me1", 9999) == "orphan"
+assert cl(mk("hpcalloc-dev", ""), "me1", None) == "orphan"  # unknown age: assume worst
+print("  ok: timeleft/gres/state/ssh-args/kind-ladder helpers")
 PY
 
 echo "== unit: dry runs (no network) =="

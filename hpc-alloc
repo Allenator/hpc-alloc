@@ -475,7 +475,26 @@ def ensure_include():
 
 # ------------------------------------------------------------- ssh plumbing
 
-_verified = set()  # clusters whose login connection was probed OK this run
+class ConnState:
+    """Connection-layer knowledge accumulated during ONE hpc-alloc run.
+
+    verified: clusters whose login connection was confirmed this run —
+      try_login's fast path trusts these; login_run's failure path revokes.
+    last_probe / probe_detail: outcome ('ok'|'auth'|'hostkey'|'net') and
+      stderr of the most recent fresh probe. Only meaningful immediately
+      after the probe/try_login call that set them (ensure_login and the
+      reconnect loop read them right away; nothing else should).
+    remote_now: cluster -> (cluster-local 'date' string, monotonic anchor),
+      captured by squeue_all's round trip for submit_age."""
+
+    def __init__(self):
+        self.verified = set()
+        self.last_probe = None
+        self.probe_detail = ""
+        self.remote_now = {}
+
+
+CONN = ConnState()
 
 
 def ssh_argv(alias, remote_cmd=None, batch=True, connect_timeout=10, extra=()):
@@ -490,7 +509,6 @@ def ssh_argv(alias, remote_cmd=None, batch=True, connect_timeout=10, extra=()):
     if remote_cmd is not None:
         argv.append(remote_cmd)
     return argv
-_last_probe = None  # result of the most recent fresh probe ('ok'|'auth'|'net')
 
 
 def can_prompt():
@@ -550,10 +568,7 @@ def heal_connections(state, cluster):
             close_master(alloc_alias(alloc))
     close_master(login_alias(cluster))
     sweep_dead_sockets()
-    _verified.discard(cluster)
-
-
-_probe_detail = ""  # stderr of the most recent failed probe, for diagnosis
+    CONN.verified.discard(cluster)
 
 
 def probe(alias, timeout=15):
@@ -562,18 +577,17 @@ def probe(alias, timeout=15):
     Returns 'ok', 'auth' (host reachable but needs interactive auth, i.e. Duo),
     'hostkey' (host key verification failed — must be surfaced, never masked),
     or 'net' (unresolvable/unreachable/stalled)."""
-    global _probe_detail
     try:
         r = subprocess.run(ssh_argv(alias, "true"),
                            capture_output=True, text=True, errors="replace", timeout=timeout)
     except subprocess.TimeoutExpired:
-        _probe_detail = "connection stalled"
+        CONN.probe_detail = "connection stalled"
         return "net"
     if r.returncode == 0:
-        _probe_detail = ""
+        CONN.probe_detail = ""
         return "ok"
-    _probe_detail = (r.stderr or "").strip()
-    s = _probe_detail.lower()
+    CONN.probe_detail = (r.stderr or "").strip()
+    s = CONN.probe_detail.lower()
     if "host key verification failed" in s or "identification has changed" in s:
         return "hostkey"
     if "permission denied" in s or "authentication" in s:
@@ -593,8 +607,7 @@ def probe_node(alias):
 
 def try_login(cluster, interactive=None):
     """Establish/verify the login master. Returns bool; never exits."""
-    global _last_probe
-    if cluster in _verified:
+    if cluster in CONN.verified:
         return True
     if interactive is None:
         interactive = can_prompt()
@@ -602,33 +615,44 @@ def try_login(cluster, interactive=None):
     if master_alive(cluster):
         # Trust the mux (saves an end-to-end probe on EVERY command). If it is
         # actually stale, login_run's failure path heals and retries.
-        _verified.add(cluster)
+        CONN.verified.add(cluster)
         return True
     st = probe(alias)  # fresh attempt; succeeds if no interactive auth needed
-    _last_probe = st
+    CONN.last_probe = st
     if st == "ok":
-        _verified.add(cluster)
+        CONN.verified.add(cluster)
         return True
     if st == "auth" and interactive:
         info(f"connecting to {alias} (answer the Duo prompt in your terminal)...")
         r = subprocess.run(ssh_argv(alias, "true", batch=False, connect_timeout=30))
         if r.returncode == 0:
-            _verified.add(cluster)
+            CONN.verified.add(cluster)
             return True
     return False
 
 
-def key_in_agent(key):
-    """Is this key's fingerprint loaded in the running ssh-agent?"""
+def key_fingerprint(key):
+    """The key's fingerprint (via its .pub when present), or None."""
     pub = Path(str(key) + ".pub")
     fp = subprocess.run(["ssh-keygen", "-lf", str(pub if pub.exists() else key)],
                         capture_output=True, text=True)
     toks = fp.stdout.split()
-    if fp.returncode != 0 or len(toks) < 2:
+    return toks[1] if fp.returncode == 0 and len(toks) >= 2 else None
+
+
+def key_in_agent(key):
+    """Is this key's fingerprint loaded in the running ssh-agent?"""
+    fingerprint = key_fingerprint(key)
+    if not fingerprint:
         return False
-    fingerprint = toks[1]
     agent = subprocess.run(["ssh-add", "-l"], capture_output=True, text=True)
     return agent.returncode == 0 and fingerprint in agent.stdout
+
+
+def key_needs_passphrase(key):
+    """True if the private key cannot be loaded without a passphrase."""
+    return subprocess.run(["ssh-keygen", "-y", "-P", "", "-f", str(key)],
+                          capture_output=True).returncode != 0
 
 
 def push_login(cluster, timeout=90):
@@ -643,9 +667,7 @@ def push_login(cluster, timeout=90):
     ident = cfg("ssh", "identity_file")
     if ident:
         key = Path(ident).expanduser()
-        if key.exists() and subprocess.run(
-                ["ssh-keygen", "-y", "-P", "", "-f", str(key)],
-                capture_output=True).returncode != 0 and not key_in_agent(key):
+        if key.exists() and key_needs_passphrase(key) and not key_in_agent(key):
             die(f"{key} is passphrase-protected and not loaded in an ssh-agent — "
                 "no Duo push can be sent without a usable key.\n"
                 f"  Either `ssh-add {key}` first, or run `hpc-alloc connect` in a terminal.",
@@ -667,22 +689,22 @@ def push_login(cluster, timeout=90):
             code=EXIT_CONNLOST)
     if r.returncode != 0:
         die(f"push authentication failed: {r.stderr.strip() or 'denied'}", code=EXIT_CONNLOST)
-    _verified.add(cluster)
+    CONN.verified.add(cluster)
     info("Duo approved — connection established")
 
 
 def ensure_login(cluster, interactive=None):
     if try_login(cluster, interactive=interactive):
         return
-    if _last_probe == "hostkey":
-        first = _probe_detail.splitlines()[0] if _probe_detail else "host key mismatch"
+    if CONN.last_probe == "hostkey":
+        first = CONN.probe_detail.splitlines()[0] if CONN.probe_detail else "host key mismatch"
         die("SSH HOST KEY VERIFICATION FAILED — the server's key changed.\n"
             f"  ssh said: {first}\n"
             "  If YCRC reimaged its login nodes this is expected: verify with them, then run\n"
             f"  `ssh-keygen -R <hostname>` (for compute nodes, edit {KNOWN_HOSTS}).\n"
             "  If unexpected, treat it as a possible interception and contact hpc@yale.edu.",
             code=EXIT_CONNLOST)
-    if _last_probe == "auth":
+    if CONN.last_probe == "auth":
         if not can_prompt():
             die(f"{login_alias(cluster)} is reachable but needs interactive (Duo) auth.\n"
                 "  Run `hpc-alloc connect` in a terminal, then retry.", code=EXIT_CONNLOST)
@@ -718,7 +740,7 @@ def login_run(cluster, remote_cmd, check=True, timeout=60, _retry=True, binary=F
     if r is not None and binary:
         r.stderr = r.stderr.decode(errors="replace")
     if r is None or r.returncode == 255:  # 255 = ssh transport error
-        _verified.discard(cluster)
+        CONN.verified.discard(cluster)
         detail = "command stalled" if r is None else (r.stderr.strip() or "ssh failed")
         if _retry:
             # Evidence before healing: if the login link probes healthy, the
@@ -726,7 +748,7 @@ def login_run(cluster, remote_cmd, check=True, timeout=60, _retry=True, binary=F
             # hiccup) — tearing down every master would kill the user's live
             # editor/shell sessions for nothing.
             if probe(login_alias(cluster)) == "ok":
-                _verified.add(cluster)
+                CONN.verified.add(cluster)
             else:
                 # a stale master must not be re-trusted by try_login's fast path
                 heal_connections(load_state(), cluster)
@@ -758,9 +780,9 @@ def wait_reconnect(cluster, budget=600, interrupt_hint="Ctrl-C is safe, jobs sta
         if try_login(cluster, interactive=False):
             info("reconnected")
             return True
-        if _last_probe == "hostkey":
+        if CONN.last_probe == "hostkey":
             return False  # surfaced by ensure_login on the next command
-        if _last_probe == "auth":
+        if CONN.last_probe == "auth":
             if can_prompt() and try_login(cluster):  # exactly one Duo attempt
                 info("reconnected")
                 return True
@@ -795,9 +817,6 @@ def parse_squeue(text):
     return out
 
 
-_remote_now = {}  # cluster -> (cluster-local 'date' string, monotonic anchor)
-
-
 def squeue_all(cluster, interactive=None):
     """All of the user's queued/running jobs as {jobid: Job}.
     Raises ClusterError if the queue could not actually be queried — absence
@@ -812,7 +831,7 @@ def squeue_all(cluster, interactive=None):
     if r.returncode != 0 or "\x1e" not in r.stdout:
         raise SlurmError(f"squeue failed: {r.stderr.strip() or 'unknown error'}")
     text, _, now_str = r.stdout.partition("\x1e")
-    _remote_now[cluster] = (now_str.strip(), time.monotonic())
+    CONN.remote_now[cluster] = (now_str.strip(), time.monotonic())
     return parse_squeue(text)
 
 
@@ -829,7 +848,7 @@ def submit_age(submit, cluster):
     (captured by squeue_all in the same round trip). Both stamps are cluster-
     local wall time parsed with the same local mktime, so the client's timezone
     cancels out. None if either stamp is missing/unparseable."""
-    clock = _remote_now.get(cluster)
+    clock = CONN.remote_now.get(cluster)
     if clock is None:
         return None
     now_str, anchor = clock
@@ -1064,6 +1083,16 @@ def submit_prefix():
             f"(find {REMOTE_LOG_DIR} -name '*.log' -mtime +30 -delete 2>/dev/null || true) && ")
 
 
+def build_submit(args, jobname, logfile, partition, wrap, chdir=None):
+    """The complete remote sbatch command line (shared by up and run)."""
+    sbatch = resource_args(args, jobname, logfile, machine_tag(persist=not args.dry_run))
+    sbatch.append(f"--partition={partition}")
+    if chdir:
+        sbatch.append(f"--chdir={chdir}")
+    sbatch += ["--wrap", wrap]
+    return submit_prefix() + " ".join(shlex.quote(a) for a in sbatch)
+
+
 def pick_partition(args):
     if args.partition:
         return args.partition
@@ -1157,10 +1186,8 @@ def cmd_up(args):
         info("--idle-timeout only applies to GPU allocations (it watches nvidia-smi); ignoring")
         idle = None
 
-    sbatch = resource_args(args, f"{JOB_PREFIX}{name}", f"{REMOTE_LOG_DIR}/%j.log",
-                           machine_tag(persist=not args.dry_run))
-    sbatch += [f"--partition={partition}", "--wrap", sleeper_command(idle)]
-    remote_cmd = submit_prefix() + " ".join(shlex.quote(a) for a in sbatch)
+    remote_cmd = build_submit(args, f"{JOB_PREFIX}{name}", f"{REMOTE_LOG_DIR}/%j.log",
+                              partition, sleeper_command(idle))
     if args.dry_run:
         print(remote_cmd)
         return
@@ -1322,29 +1349,26 @@ def finish_alloc(alloc, time_left=None):
   The node goes away when the job hits its time limit or you run `hpc-alloc down {name}`.""")
 
 
-def refresh_status(state):
-    """Reconcile allocations with the queue and discover untracked hpcalloc jobs.
+def snapshot_queues(state):
+    """{cluster: {jobid: Job}} for every readable cluster.
 
-    Returns (rows, runs): rows = [(alloc, state_str, time_left)], runs = [dict].
-    Raises ConnectionLost (without touching state) if a queue can't be queried.
-    The queue snapshot is taken before the lock (network stays outside it), so
-    only records that already existed at snapshot time may be reaped — an alloc
-    inserted by a concurrent `up` must not be judged by a pre-submission snapshot."""
-    pre = {(n, a.get("jobid")) for n, a in state.get("allocs", {}).items()}
-    my_id = machine_id(state)  # before the lock below: it may take the lock itself
-    # The default cluster keeps full failure semantics; SECONDARY clusters
-    # degrade softly — one unreachable cluster must not abort the whole status.
-    # A cluster whose queue could not be read is left out of `queues` entirely,
-    # and nothing on it may be judged (shim-tested only: no live second cluster).
+    The default cluster keeps full failure semantics; SECONDARY clusters
+    degrade softly — one unreachable cluster must not abort the whole status.
+    A cluster whose queue could not be read is absent from the result, and
+    nothing on it may be judged (shim-tested only: no live second cluster).
+    A single absent poll is not death evidence (controller failovers blip rows
+    out of squeue), so absence is confirmed with a second look."""
     primary = cfg("defaults", "cluster") or DEFAULT_CLUSTER
+
+    def poll(c):
+        return squeue_all(c) if c == primary else on_secondary(
+            c, lambda: squeue_all(c, interactive=False))
+
     queues = {}
     for c in state.get("clusters", {}):
-        q = squeue_all(c) if c == primary else on_secondary(
-            c, lambda c=c: squeue_all(c, interactive=False))
+        q = poll(c)
         if q is not None:
             queues[c] = q
-    # A single absent poll is not death evidence (controller failovers blip rows
-    # out of squeue): confirm absence with a second look before reaping anything.
     missing = {a["cluster"] for a in state.get("allocs", {}).values()
                if a["cluster"] in queues and a.get("jobid") not in queues[a["cluster"]]}
     if missing:
@@ -1352,12 +1376,41 @@ def refresh_status(state):
         time.sleep(3)
         for c in sorted(missing):
             # union: presence in EITHER poll counts as alive; latest state wins
-            q2 = squeue_all(c) if c == primary else on_secondary(
-                c, lambda c=c: squeue_all(c, interactive=False))
+            q2 = poll(c)
             if q2 is None:
                 del queues[c]  # can't confirm — don't judge this cluster at all
             else:
                 queues[c] = {**queues[c], **q2}
+    return queues
+
+
+def classify_untracked(row, my_id, age):
+    """The kind ladder for a live hpcalloc-* job this machine doesn't track:
+    'run' jobs end on their own; explicitly foreign-owned allocations are never
+    cancel candidates; a just-submitted sleeper is usually another window's
+    `up` whose record isn't written yet (the race is sub-second, and ages are
+    exact via the cluster clock); everything else is an orphan holding
+    resources until cancelled."""
+    if row.name == JOB_PREFIX + "run":  # exact: 'hpcalloc-run2' is an alloc name
+        return "run"
+    owner_id, _ = parse_owner(row.comment)
+    if owner_id and owner_id != my_id:
+        return "other-machine"
+    return "recent" if age is not None and age < 20 else "orphan"
+
+
+def refresh_status(state):
+    """Reconcile allocations with the queue and discover untracked hpcalloc jobs.
+
+    Returns (rows, runs): rows = [(alloc, state_str, time_left)], runs = [dict].
+    Raises ClusterError (without touching state) if the default cluster's queue
+    can't be queried. The queue snapshot is taken before the lock (network
+    stays outside it), so only records that already existed at snapshot time
+    may be reaped — an alloc inserted by a concurrent `up` must not be judged
+    by a pre-submission snapshot."""
+    pre = {(n, a.get("jobid")) for n, a in state.get("allocs", {}).items()}
+    my_id = machine_id(state)  # before the lock below: it may take the lock itself
+    queues = snapshot_queues(state)
     rows = []
     with locked_state() as st:
         for name, alloc in sorted(list(st["allocs"].items())):
@@ -1394,24 +1447,15 @@ def refresh_status(state):
             if (not row.name.startswith(JOB_PREFIX) or (cluster, jid) in tracked
                     or row.state in ENDED_STATES):
                 continue
+            kind = classify_untracked(row, my_id, submit_age(row.submit, cluster))
             owner_id, owner_host = parse_owner(row.comment)
-            is_run = row.name == JOB_PREFIX + "run"  # exact: 'hpcalloc-run2' is an alloc name
-            if is_run:
-                kind = "run"
-            elif owner_id and owner_id != my_id:
-                kind = "other-machine"  # explicit ownership: never a cancel candidate
-            else:
-                age = submit_age(row.submit, cluster)
-                # a just-submitted sleeper is usually an `up` from another window
-                # whose record isn't written yet — never offer to cancel those
-                # (the race is sub-second; ages are exact via the cluster clock)
-                kind = "recent" if age is not None and age < 20 else "orphan"
             runs.append({"jobid": jid, "cluster": cluster, "state": row.state,
                          "node": row.node or None, "partition": row.partition,
                          "time_left": row.time_left, "jobname": row.name,
                          "owner": owner_host or owner_id, "kind": kind,
                          "orphan": kind == "orphan",
-                         "log": f"~/{REMOTE_LOG_DIR}/{'run-' if is_run else ''}{jid}.log"})
+                         "log": f"~/{REMOTE_LOG_DIR}/"
+                                f"{'run-' if kind == 'run' else ''}{jid}.log"})
     return rows, runs
 
 
@@ -1500,7 +1544,7 @@ def check_node_reachable(state, alloc):
     if st == "ok":
         return
     if st == "hostkey":
-        first = _probe_detail.splitlines()[0] if _probe_detail else "host key mismatch"
+        first = CONN.probe_detail.splitlines()[0] if CONN.probe_detail else "host key mismatch"
         die(f"node {alloc['node']}: HOST KEY VERIFICATION FAILED — {first}\n"
             f"  If the node was reimaged this is expected: remove its entry from\n"
             f"  {KNOWN_HOSTS} and retry. If unexpected, treat it as a possible\n"
@@ -1602,15 +1646,11 @@ def cmd_run(args):
             rest = args.chdir[1:].lstrip("/")
             args.chdir = f"{home}/{rest}" if rest else home
 
-    sbatch = resource_args(args, f"{JOB_PREFIX}run", logfile,
-                           machine_tag(persist=not args.dry_run))
-    sbatch.append(f"--partition={partition}")
-    if args.chdir:
-        sbatch.append(f"--chdir={args.chdir}")
     # one arg = a shell command string (operators work); several args = exact argv,
     # so `run -- python -c 'x = 1'` survives with its quoting intact
-    sbatch += ["--wrap", command[0] if len(command) == 1 else shlex.join(command)]
-    remote_cmd = submit_prefix() + " ".join(shlex.quote(a) for a in sbatch)
+    wrap = command[0] if len(command) == 1 else shlex.join(command)
+    remote_cmd = build_submit(args, f"{JOB_PREFIX}run", logfile, partition, wrap,
+                              chdir=args.chdir)
     if args.dry_run:
         print(remote_cmd)
         if args.chdir:
@@ -1628,118 +1668,124 @@ def cmd_run(args):
     stream_job(cluster, jobid, logpath, cancel_on_interrupt=True, verdict=True)
 
 
-def stream_job(cluster, jobid, logpath, cancel_on_interrupt=False, verdict=False):
-    """Follow a batch job: show queue progress and stream its log. Ctrl-C/SIGTERM
-    detaches; it cancels the job ONLY for `run` (which documents that) — `logs -f`
-    must never kill what it is merely watching. verdict=True (run) additionally
-    mirrors the job's final exit code and refuses to claim success without a
-    FINAL accounting record; watchers (logs -f) always exit 0 after a clean
-    stream — watching succeeded regardless of how the watched job ended."""
-    offset = 0
-    last_note = 0.0
+class Stream:
+    """Byte-exact state of one log-following session (offset accounting)."""
+
+    def __init__(self, cluster, jobid, logpath):
+        self.cluster = cluster
+        self.jobid = jobid
+        self.logpath = logpath
+        self.offset = 0
+        self.last_note = 0.0
+        # NEVER stat the log before the job has started: on NFS (Roberts),
+        # probing the not-yet-created file caches the negative lookup on the
+        # login node, and the stream then reads empty long after the job
+        # wrote output.
+        self.seen_active = False
+
+    def poll(self):
+        """One combined queue+log round trip; streams any new log bytes to
+        stdout and returns the job's queue row (or None). A job that has not
+        started only gets a periodic state note — its log is never touched.
+        Raises SlurmError/ConnectionLost like login_run."""
+        # ONE round trip per poll: queue state and log chunk together,
+        # separated by an RS byte; the OK marker distinguishes an empty
+        # queue from a failed squeue (which must not read as job-ended)
+        tail_part = (f"tail -c +{self.offset + 1} {shlex.quote(self.logpath)} 2>/dev/null || true"
+                     if self.seen_active else "true")
+        combined = (f"squeue --me -h -o '{SQUEUE_FORMAT}' && printf OK; "
+                    f"printf '\\036'; {tail_part}")
+        r = login_run(self.cluster, combined, check=False, binary=True)
+        head, _, chunk = r.stdout.partition(b"\x1e")
+        if not head.endswith(b"OK"):
+            raise SlurmError("squeue failed mid-stream")
+        q = parse_squeue(head[:-2].decode(errors="replace")).get(self.jobid)
+        if q and q.state != "RUNNING" and q.state not in ENDED_STATES:
+            # PENDING/SUSPENDED/CONFIGURING/REQUEUED: nothing to tail yet —
+            # say so instead of silently polling a frozen log (any tailed
+            # bytes are dropped WITHOUT advancing offset: re-read next poll)
+            if time.monotonic() - self.last_note > 30:
+                note = f"job {self.jobid}: {q.state}"
+                if q.state == "PENDING" and q.reason:
+                    note += f" (reason: {q.reason})"
+                info(note)
+                self.last_note = time.monotonic()
+            return q
+        self.seen_active = True  # job has (or had) started: tailing is safe now
+        # binary: raw bytes keep the offset exact (no newline translation)
+        # and non-UTF-8 log content cannot crash the stream
+        if chunk:
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
+            self.offset += len(chunk)
+        return q
+
+    def drain(self):
+        """One last read: epilog output lands after the loop's final poll.
+        Best-effort — the job is over either way."""
+        try:
+            r = login_run(self.cluster, f"tail -c +{self.offset + 1} "
+                          f"{shlex.quote(self.logpath)} 2>/dev/null || true",
+                          check=False, binary=True)
+            if r.stdout:
+                sys.stdout.buffer.write(r.stdout)
+                sys.stdout.buffer.flush()
+        except ClusterError:
+            pass
+
+
+def follow_job(s, cancel_on_interrupt):
+    """Poll a Stream until its job verifiably left the queue (or its row says
+    ENDED), riding out scheduler errors (bounded retry) and connection drops
+    (reconnect, at most one Duo attempt)."""
     misses = 0
     slurm = SlurmRetry()
-    # NEVER stat the log before the job has started: on NFS (Roberts), probing
-    # the not-yet-created file caches the negative lookup on the login node,
-    # and the stream then reads empty long after the job wrote output.
-    seen_active = False
-    try:
-        while True:
-            try:
-                # ONE round trip per poll: queue state and log chunk together,
-                # separated by an RS byte; the OK marker distinguishes an empty
-                # queue from a failed squeue (which must not read as job-ended)
-                tail_part = (f"tail -c +{offset + 1} {shlex.quote(logpath)} 2>/dev/null || true"
-                             if seen_active else "true")
-                combined = (f"squeue --me -h -o '{SQUEUE_FORMAT}' && printf OK; "
-                            f"printf '\\036'; {tail_part}")
-                r = login_run(cluster, combined, check=False, binary=True)
-                head, _, chunk = r.stdout.partition(b"\x1e")
-                if not head.endswith(b"OK"):
-                    raise SlurmError("squeue failed mid-stream")
-                q = parse_squeue(head[:-2].decode(errors="replace")).get(jobid)
-                if q and q.state != "RUNNING" and q.state not in ENDED_STATES:
-                    # PENDING/SUSPENDED/CONFIGURING/REQUEUED: nothing to tail yet —
-                    # say so instead of silently polling a frozen log
-                    if time.monotonic() - last_note > 30:
-                        note = f"job {jobid}: {q.state}"
-                        if q.state == "PENDING" and q.reason:
-                            note += f" (reason: {q.reason})"
-                        info(note)
-                        last_note = time.monotonic()
-                    time.sleep(5)
-                    continue
-                seen_active = True  # job has (or had) started: tailing is safe now
-                # binary: raw bytes keep the offset exact (no newline translation)
-                # and non-UTF-8 log content cannot crash the stream
-                if chunk:
-                    sys.stdout.buffer.write(chunk)
-                    sys.stdout.buffer.flush()
-                    offset += len(chunk)
-                slurm.ok()
-            except SlurmError as e:
-                # transport is fine — reconnecting can't help; retry briefly
-                slurm.wait_or_die(cluster, e)
-                continue
-            except ConnectionLost as e:
-                info(f"connection lost ({e}) — job {jobid} keeps running; log: ~/{logpath}")
-                if not can_prompt():
-                    die(f"reconnect, then reattach with `hpc-alloc logs {jobid} -f`",
-                        code=EXIT_CONNLOST)
-                if not wait_reconnect(cluster, interrupt_hint=(
-                        "Ctrl-C CANCELS the job" if cancel_on_interrupt
-                        else "Ctrl-C detaches, the job keeps running")):
-                    die(f"could not reconnect; job {jobid} continues — reattach with "
-                        f"`hpc-alloc logs {jobid} -f`", code=EXIT_CONNLOST)
-                continue
-            if q and q.state in ENDED_STATES:
-                break  # positive evidence: the queue itself says it ended
-            if q is None:
-                misses += 1
-                if misses >= 2:  # absent twice in a row: it really left the queue
-                    break
-                # one absent poll is inconclusive (controller lag/failover) —
-                # ending the stream on it would strand a still-running job
-            else:
-                misses = 0
-            time.sleep(3)
-    except KeyboardInterrupt:
-        print(file=sys.stderr)  # newline after ^C — stdout is the streamed log
-        if not cancel_on_interrupt:
-            info(f"detached — job {jobid} keeps running (reattach: `hpc-alloc logs {jobid} -f`, "
-                 f"cancel: `hpc-alloc cancel {jobid}`)")
-            sys.exit(130)
-        info(f"cancelling job {jobid}")
+    while True:
         try:
-            ok, detail = cancel_job(cluster, jobid)
-        except SystemExit:  # ensure_login die()d: its own diagnosis is already on stderr
-            ok, detail = False, "see the error above"
-        if not ok:
-            info(f"could not cancel ({detail}) — run `hpc-alloc cancel {jobid}` later")
-        sys.exit(130)
+            q = s.poll()
+            slurm.ok()
+        except SlurmError as e:
+            # transport is fine — reconnecting can't help; retry briefly
+            slurm.wait_or_die(s.cluster, e)
+            continue
+        except ConnectionLost as e:
+            info(f"connection lost ({e}) — job {s.jobid} keeps running; log: ~/{s.logpath}")
+            if not can_prompt():
+                die(f"reconnect, then reattach with `hpc-alloc logs {s.jobid} -f`",
+                    code=EXIT_CONNLOST)
+            if not wait_reconnect(s.cluster, interrupt_hint=(
+                    "Ctrl-C CANCELS the job" if cancel_on_interrupt
+                    else "Ctrl-C detaches, the job keeps running")):
+                die(f"could not reconnect; job {s.jobid} continues — reattach with "
+                    f"`hpc-alloc logs {s.jobid} -f`", code=EXIT_CONNLOST)
+            continue
+        if q and q.state in ENDED_STATES:
+            return  # positive evidence: the queue itself says it ended
+        if q is None:
+            misses += 1
+            if misses >= 2:  # absent twice in a row: it really left the queue
+                return
+            # one absent poll is inconclusive (controller lag/failover) —
+            # ending the stream on it would strand a still-running job
+        else:
+            misses = 0
+        time.sleep(3 if s.seen_active else 5)
 
-    # One last read: epilog output lands after the loop's final poll.
+
+def watcher_outro(cluster, jobid):
+    """Pure watcher: report the outcome if cheaply available, but the stream
+    itself succeeded — exit 0 (a purged accounting record is not a failure)."""
     try:
-        r = login_run(cluster, f"tail -c +{offset + 1} {shlex.quote(logpath)} 2>/dev/null || true",
-                      check=False, binary=True)
-        if r.stdout:
-            sys.stdout.buffer.write(r.stdout)
-            sys.stdout.buffer.flush()
+        fin = final_job_state(cluster, jobid, patience=False)
+        if fin:
+            info(f"job {jobid} ended: {fin[0]}")
     except ClusterError:
         pass
 
-    if not verdict:
-        # Pure watcher: report the outcome if cheaply available, but the stream
-        # itself succeeded — exit 0 (a purged accounting record is not a failure).
-        try:
-            fin = final_job_state(cluster, jobid, patience=False)
-            if fin:
-                info(f"job {jobid} ended: {fin[0]}")
-        except ClusterError:
-            pass
-        return
 
-    # run's contract: never report success without a FINAL accounting record.
+def verdict_outro(cluster, jobid):
+    """run's contract: mirror the job's exit code, and never report success
+    without a FINAL accounting record."""
     lost = None
     fin = None
     try:
@@ -1759,6 +1805,37 @@ def stream_job(cluster, jobid, logpath, cancel_on_interrupt=False, verdict=False
             code=EXIT_CONNLOST if isinstance(lost, ConnectionLost) else 1)
     die(f"job {jobid} left the queue but accounting shows no FINAL state after ~30s — "
         f"check `hpc-alloc why {jobid}` (not reporting success without evidence)")
+
+
+def stream_job(cluster, jobid, logpath, cancel_on_interrupt=False, verdict=False):
+    """Follow a batch job: show queue progress and stream its log. Ctrl-C/SIGTERM
+    detaches; it cancels the job ONLY for `run` (which documents that) — `logs -f`
+    must never kill what it is merely watching. verdict=True (run) additionally
+    mirrors the job's final exit code and refuses to claim success without a
+    FINAL accounting record; watchers (logs -f) always exit 0 after a clean
+    stream — watching succeeded regardless of how the watched job ended."""
+    s = Stream(cluster, jobid, logpath)
+    try:
+        follow_job(s, cancel_on_interrupt)
+    except KeyboardInterrupt:
+        print(file=sys.stderr)  # newline after ^C — stdout is the streamed log
+        if not cancel_on_interrupt:
+            info(f"detached — job {jobid} keeps running (reattach: `hpc-alloc logs {jobid} -f`, "
+                 f"cancel: `hpc-alloc cancel {jobid}`)")
+            sys.exit(130)
+        info(f"cancelling job {jobid}")
+        try:
+            ok, detail = cancel_job(cluster, jobid)
+        except SystemExit:  # ensure_login die()d: its own diagnosis is already on stderr
+            ok, detail = False, "see the error above"
+        if not ok:
+            info(f"could not cancel ({detail}) — run `hpc-alloc cancel {jobid}` later")
+        sys.exit(130)
+    s.drain()
+    if verdict:
+        verdict_outro(cluster, jobid)
+    else:
+        watcher_outro(cluster, jobid)
 
 
 def cmd_logs(args):
@@ -1901,7 +1978,7 @@ def cmd_connect(args):
             heal_connections(state, cluster)  # dead master shadowing the alias
             st = probe(alias)
         if st == "ok":
-            _verified.add(cluster)
+            CONN.verified.add(cluster)
         elif st == "auth":
             push_login(cluster)
         # 'net'/'hostkey': a push cannot help — fall through to ensure_login,
