@@ -509,11 +509,10 @@ def try_login(cluster, interactive=None):
         interactive = can_prompt()
     alias = login_alias(cluster)
     if master_alive(cluster):
-        if probe(alias) == "ok":
-            _verified.add(cluster)
-            return True
-        info(f"connection to {alias} is stale (VPN drop or sleep?) — resetting")
-        heal_connections(load_state(), cluster)
+        # Trust the mux (saves an end-to-end probe on EVERY command). If it is
+        # actually stale, login_run's failure path heals and retries.
+        _verified.add(cluster)
+        return True
     st = probe(alias)  # fresh attempt; succeeds if no interactive auth needed
     _last_probe = st
     if st == "ok":
@@ -599,9 +598,12 @@ def login_run(cluster, remote_cmd, check=True, timeout=60, _retry=True, binary=F
         r.stderr = r.stderr.decode(errors="replace")
     if r is None or r.returncode == 255:  # 255 = ssh transport error
         _verified.discard(cluster)
-        if _retry and try_login(cluster):
-            return login_run(cluster, remote_cmd, check=check, timeout=timeout,
-                             _retry=False, binary=binary)
+        if _retry:
+            # a stale master must not be re-trusted by try_login's fast path
+            heal_connections(load_state(), cluster)
+            if try_login(cluster):
+                return login_run(cluster, remote_cmd, check=check, timeout=timeout,
+                                 _retry=False, binary=binary)
         detail = "command stalled" if r is None else (r.stderr.strip() or "ssh failed")
         raise ConnectionLost(detail)
     if check and r.returncode != 0:
@@ -641,19 +643,26 @@ Job = collections.namedtuple(
     "Job", "state node reason time_left partition name submit comment")
 
 
-def squeue_all(cluster):
-    """All of the user's queued/running jobs as {jobid: Job}.
-    Raises ConnectionLost if the queue could not actually be queried — absence
-    of a job is only meaningful when this returns normally."""
-    r = login_run(cluster, "squeue --me -h -o '%i|%T|%N|%r|%L|%P|%j|%V|%k'", check=False)
-    if r.returncode != 0:
-        raise ConnectionLost(f"squeue failed: {r.stderr.strip() or 'unknown error'}")
+SQUEUE_FORMAT = "%i|%T|%N|%r|%L|%P|%j|%V|%k"
+
+
+def parse_squeue(text):
     out = {}
-    for line in r.stdout.strip().splitlines():
+    for line in text.strip().splitlines():
         parts = line.strip().split("|")
         if len(parts) == len(Job._fields) + 1:
             out[parts[0]] = Job(*parts[1:])
     return out
+
+
+def squeue_all(cluster):
+    """All of the user's queued/running jobs as {jobid: Job}.
+    Raises ConnectionLost if the queue could not actually be queried — absence
+    of a job is only meaningful when this returns normally."""
+    r = login_run(cluster, f"squeue --me -h -o '{SQUEUE_FORMAT}'", check=False)
+    if r.returncode != 0:
+        raise ConnectionLost(f"squeue failed: {r.stderr.strip() or 'unknown error'}")
+    return parse_squeue(r.stdout)
 
 
 def job_owner(comment):
@@ -710,24 +719,32 @@ def remote_home(cluster, state):
     return cfg["home"]
 
 
-def gpu_util(alias, timeout=12):
-    """Max GPU utilization % on a node, or None if unqueryable. A failed first
-    attempt heals a possibly-stale node master and retries once — otherwise a
-    dead mux makes every `status` show '-' forever."""
-    for attempt in range(2):
+def gpu_utils(aliases, timeout=12):
+    """Max GPU utilization % per alias, queried CONCURRENTLY (N sequential
+    ProxyJump execs made every status pay sum-of-latencies; a single wedged
+    node stalled it 15s). Failures heal the node master for the next status
+    instead of retrying now. Returns {alias: percent_or_None}."""
+    cmd = "nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits"
+    procs = {alias: subprocess.Popen(ssh_argv(alias, cmd, connect_timeout=8),
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                     text=True)
+             for alias in aliases}
+    out = {}
+    deadline = time.monotonic() + timeout
+    for alias, p in procs.items():
         try:
-            r = subprocess.run(
-                ssh_argv(alias, "nvidia-smi --query-gpu=utilization.gpu "
-                                "--format=csv,noheader,nounits", connect_timeout=8),
-                capture_output=True, text=True, timeout=timeout,
-            )
+            stdout, _ = p.communicate(timeout=max(0.1, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
-            r = None
-        if r is not None and r.returncode == 0:
-            vals = [int(x) for x in r.stdout.split() if x.strip().isdigit()]
-            return max(vals) if vals else None
-        close_master(alias)  # heal, then one retry
-    return None
+            p.kill()
+            p.communicate()
+            stdout = None
+        if stdout is not None and p.returncode == 0:
+            vals = [int(x) for x in stdout.split() if x.strip().isdigit()]
+            out[alias] = max(vals) if vals else None
+        else:
+            close_master(alias)  # heal a possibly-stale node master for next time
+            out[alias] = None
+    return out
 
 
 def timeleft_minutes(s):
@@ -1170,10 +1187,10 @@ def cmd_status(args):
     state = load_state()
     require_setup(state)
     rows, runs = refresh_status(state)
-    utils = {}
-    for alloc, st_, _tl in rows:
-        if st_ == "RUNNING" and alloc.get("gpus") and alloc.get("node"):
-            utils[alloc["name"]] = gpu_util(alloc_alias(alloc))
+    targets = {alloc["name"]: alloc_alias(alloc) for alloc, st_, _tl in rows
+               if st_ == "RUNNING" and alloc.get("gpus") and alloc.get("node")}
+    by_alias = gpu_utils(list(targets.values())) if targets else {}
+    utils = {name: by_alias.get(alias) for name, alias in targets.items()}
     if args.json:
         payload = [
             {**alloc, "state": st_, "time_left": tl,
@@ -1380,11 +1397,25 @@ def stream_job(cluster, jobid, logpath, cancel_on_interrupt=False, verdict=False
     stream — watching succeeded regardless of how the watched job ended."""
     offset = 0
     last_note = 0.0
+    # NEVER stat the log before the job has started: on NFS (Roberts), probing
+    # the not-yet-created file caches the negative lookup on the login node,
+    # and the stream then reads empty long after the job wrote output.
+    seen_active = False
     try:
         while True:
             try:
-                live = squeue_query(cluster, [jobid])
-                q = live.get(jobid)
+                # ONE round trip per poll: queue state and log chunk together,
+                # separated by an RS byte; the OK marker distinguishes an empty
+                # queue from a failed squeue (which must not read as job-ended)
+                tail_part = (f"tail -c +{offset + 1} {shlex.quote(logpath)} 2>/dev/null || true"
+                             if seen_active else "true")
+                combined = (f"squeue --me -h -o '{SQUEUE_FORMAT}' && printf OK; "
+                            f"printf '\\036'; {tail_part}")
+                r = login_run(cluster, combined, check=False, binary=True)
+                head, _, chunk = r.stdout.partition(b"\x1e")
+                if not head.endswith(b"OK"):
+                    raise ConnectionLost("squeue failed mid-stream")
+                q = parse_squeue(head[:-2].decode(errors="replace")).get(jobid)
                 if q and q.state != "RUNNING" and q.state not in ENDED_STATES:
                     # PENDING/SUSPENDED/CONFIGURING/REQUEUED: nothing to tail yet —
                     # say so instead of silently polling a frozen log
@@ -1396,15 +1427,13 @@ def stream_job(cluster, jobid, logpath, cancel_on_interrupt=False, verdict=False
                         last_note = time.monotonic()
                     time.sleep(5)
                     continue
+                seen_active = True  # job has (or had) started: tailing is safe now
                 # binary: raw bytes keep the offset exact (no newline translation)
                 # and non-UTF-8 log content cannot crash the stream
-                r = login_run(cluster,
-                              f"tail -c +{offset + 1} {shlex.quote(logpath)} 2>/dev/null || true",
-                              check=False, binary=True)
-                if r.stdout:
-                    sys.stdout.buffer.write(r.stdout)
+                if chunk:
+                    sys.stdout.buffer.write(chunk)
                     sys.stdout.buffer.flush()
-                    offset += len(r.stdout)
+                    offset += len(chunk)
             except ConnectionLost as e:
                 info(f"connection lost ({e}) — job {jobid} keeps running; log: ~/{logpath}")
                 if not can_prompt():

@@ -307,6 +307,34 @@ check "with --push: exit" 0 $?
 contains "push approved" "Duo approved" "$work/out"
 contains "master established" "login OK" "$work/out"
 
+echo "== stage-8: detach safety + template sync =="
+mkstate null
+: > "$HPCTEST_LOG"
+pkill -f "hpc-alloc logs 9200" 2>/dev/null || true   # reap strays from failed runs
+# background the CLI directly — backgrounding the hpc() FUNCTION would make
+# $! a subshell pid, and SIGTERM would kill the wrapper instead of the CLI
+HOME="$work/home" HPCTEST_MODE=running PATH="$here/shim:$PATH" \
+  "$cli" logs 9200 -f > "$work/follow.out" 2>&1 </dev/null &
+FPID=$!
+n=0; until grep -q "epoch" "$work/follow.out" 2>/dev/null || [ $n -ge 30 ]; do sleep 1; n=$((n+1)); done
+kill -TERM $FPID 2>/dev/null; wait $FPID; rc=$?
+check "logs -f detaches on SIGTERM (exit 130)" 130 $rc
+contains "detach message" "detached — job 9200 keeps running" "$work/follow.out"
+if grep -q "SCANCEL" "$HPCTEST_LOG" 2>/dev/null; then
+  echo "  FAIL: detach cancelled the watched job"; fails=$((fails + 1))
+else echo "  ok: watched job NOT cancelled on detach"; fi
+HOME="$work" python3 - "$cli" "$repo/config.example.toml" <<'PY' || fails=$((fails + 1))
+import sys
+m = {}
+exec(open(sys.argv[1]).read().split("if __name__")[0], m)
+tpl = m["CONFIG_TEMPLATE"].format(identity_file="~/.ssh/id_ed25519").strip().splitlines()
+ex = [l for l in open(sys.argv[2]).read().strip().splitlines()
+      if not l.startswith("# Copy to")]
+diff = [f"  T:{a!r}\n  E:{b!r}" for a, b in zip(tpl, ex) if a != b]
+assert tpl == ex, "CONFIG_TEMPLATE and config.example.toml drifted:\n" + "\n".join(diff)
+print("  ok: config.example.toml matches CONFIG_TEMPLATE")
+PY
+
 echo "== scenario: avail digest =="
 mkstate null
 hpc running avail > "$work/out" 2>&1; check "avail exit" 0 $?
