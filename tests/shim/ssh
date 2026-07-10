@@ -13,6 +13,7 @@
 #   blip        squeue poll 1 omits job 9123, later polls show it RUNNING
 #   flap        job 7777: RUNNING, absent, RUNNING, then gone (via $HPCTEST_COUNT)
 #   gpu-fail    like running but nvidia-smi fails (transport stays healthy)
+#   tz          cluster clock runs in UTC: submit stamps are cluster-local
 # scancel and -O exit invocations are appended to $HPCTEST_LOG.
 mode="${HPCTEST_MODE:?set HPCTEST_MODE}"
 all="$*"
@@ -84,18 +85,32 @@ bump_count() {  # per-squeue-poll counter for the stateful modes
   echo $((n + 1)) > "$HPCTEST_COUNT"
 }
 
+remote_now() {  # the cluster clock appended to every squeue_all round trip
+  if [ "$mode" = tz ]; then  # cluster in UTC, client wherever it happens to be
+    python3 -c 'import time; print(time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()))'
+  else
+    date +%Y-%m-%dT%H:%M:%S
+  fi
+}
+
 squeue_rows() {
   case "$mode" in
     squeue-err) echo "slurm_load_jobs error: Unable to contact slurm controller" >&2; return 1 ;;
     gone) ;;
     running|stale|flaky|gpu-fail)
       h="$(hostname -s)"
-      printf '9123|RUNNING|r806u23n04|None|3:59:00|gpu_h200|hpcalloc-h200|2020-01-01T00:00:00|hpc-alloc:%s\n' "$h"
-      printf '9200|RUNNING|r801u01n01|None|1:00:00|gpu|hpcalloc-run|2020-01-01T00:00:00|hpc-alloc:%s\n' "$h"
+      printf '9123|RUNNING|r806u23n04|None|3:59:00|gpu_h200|hpcalloc-h200|2020-01-01T00:00:00|hpc-alloc:testid123456:%s\n' "$h"
+      printf '9200|RUNNING|r801u01n01|None|1:00:00|gpu|hpcalloc-run|2020-01-01T00:00:00|hpc-alloc:testid123456:%s\n' "$h"
       printf '9300|RUNNING|r802u02n02|None|2:00:00|day|myjob|2020-01-01T00:00:00|\n'
-      printf '9400|RUNNING|r803u03n03|None|5:00:00|day|hpcalloc-stale|2020-01-01T00:00:00|hpc-alloc:%s\n' "$h"
-      printf '9500|RUNNING|r804u04n04|None|5:59:00|day|hpcalloc-fresh|%s|hpc-alloc:%s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$h"
-      printf '9600|RUNNING|r805u05n05|None|4:00:00|day|hpcalloc-dev|2020-01-01T00:00:00|hpc-alloc:othermachine\n' ;;
+      printf '9400|RUNNING|r803u03n03|None|5:00:00|day|hpcalloc-stale|2020-01-01T00:00:00|hpc-alloc:testid123456:%s\n' "$h"
+      printf '9500|RUNNING|r804u04n04|None|5:59:00|day|hpcalloc-fresh|%s|hpc-alloc:testid123456:%s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$h"
+      printf '9600|RUNNING|r805u05n05|None|4:00:00|day|hpcalloc-dev|2020-01-01T00:00:00|hpc-alloc:otherid999999:othermachine\n'
+      printf '9650|RUNNING|r805u05n06|None|4:00:00|day|hpcalloc-twin|2020-01-01T00:00:00|hpc-alloc:otherid999999:%s\n' "$h" ;;
+    tz)  # cluster-local (UTC) stamps: 1h-old sleeper + 5s-fresh sleeper
+      old=$(python3 -c 'import time; print(time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - 3600)))')
+      new=$(python3 -c 'import time; print(time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - 5)))')
+      printf '9700|RUNNING|r801u01n01|None|1:00:00|day|hpcalloc-old|%s|hpc-alloc:testid123456:testhost\n' "$old"
+      printf '9800|RUNNING|r802u02n02|None|1:00:00|day|hpcalloc-new|%s|hpc-alloc:testid123456:testhost\n' "$new" ;;
     pending-qos) echo '9123|PENDING||QOSMaxGRESPerUser|8:00:00|gpu_h200|hpcalloc-h200|2020-01-01T00:00:00|' ;;
     expiring) echo '9123|RUNNING|r806u23n04|None|0:12:00|gpu_h200|hpcalloc-h200|2020-01-01T00:00:00|' ;;
     suspended) echo '9123|SUSPENDED|r806u23n04|None|3:59:00|gpu_h200|hpcalloc-h200|2020-01-01T00:00:00|' ;;
@@ -127,7 +142,8 @@ case "$all" in
       echo "epoch 1: loss 0.42"
     fi ;;
   *"squeue --me"*)
-    squeue_rows || exit 1 ;;
+    squeue_rows || exit 1
+    printf '\036'; remote_now ;;
   *"--start"*) echo "2026-07-09T18:00:00" ;;
   *sprio*) printf 'JOBID PRIORITY AGE FAIRSHARE\n9123 1200 300 900\n' ;;
   *"show reservation"*)

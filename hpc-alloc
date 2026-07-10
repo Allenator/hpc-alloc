@@ -55,10 +55,12 @@ USER_SSH_CONFIG = SSH_DIR / "config"
 INCLUDE_LINE = "Include ~/.config/hpc-alloc/ssh_config"
 JOB_PREFIX = "hpcalloc-"
 REMOTE_LOG_DIR = ".hpc-alloc"  # relative to $HOME on the cluster
-# Stamped into every job's --comment so ownership is explicit cluster-side:
-# state.json is per-machine, and a job created on the laptop must never look
-# like an orphan (with a cancel hint!) when viewed from the desktop.
-MACHINE_ID = re.sub(r"[^A-Za-z0-9_-]", "-", platform.node().split(".")[0]) or "unknown"
+# Stamped into every job's --comment (hpc-alloc:<id>:<hostname>) so ownership
+# is explicit cluster-side: state.json is per-machine, and a job created on the
+# laptop must never look like an orphan (with a cancel hint!) when viewed from
+# the desktop. Matching uses a random id persisted in state.json — hostnames
+# are volatile (DHCP, renames) and only ride along for human display.
+MACHINE_HOST = re.sub(r"[^A-Za-z0-9_-]", "-", platform.node().split(".")[0]) or "unknown"
 KEY_UPLOADER = "https://sshkeys.ycrc.yale.edu/"
 
 EXIT_CONNLOST = 3
@@ -375,6 +377,27 @@ def locked_state():
 def require_setup(state):
     if not state.get("netid") or not state.get("clusters"):
         die("not configured yet — run `hpc-alloc setup --netid YOUR_NETID` first")
+
+
+def machine_id(state=None, persist=True):
+    """This machine's ownership id: 12 random hex chars generated once and kept
+    in state.json. Must not be called while holding locked_state (it takes the
+    lock itself when it needs to persist a fresh id)."""
+    state = state if state is not None else load_state()
+    mid = state.get("machine_id")
+    if mid:
+        return mid
+    mid = os.urandom(6).hex()
+    if persist:
+        with locked_state() as st:
+            mid = st.setdefault("machine_id", mid)  # a concurrent generator wins
+        state["machine_id"] = mid
+    return mid
+
+
+def machine_tag(persist=True):
+    """The --comment ownership tag for jobs submitted by this machine."""
+    return f"hpc-alloc:{machine_id(persist=persist)}:{MACHINE_HOST}"
 
 
 def login_alias(cluster):
@@ -751,27 +774,49 @@ def parse_squeue(text):
     return out
 
 
+_remote_now = {}  # cluster -> (cluster-local 'date' string, monotonic anchor)
+
+
 def squeue_all(cluster):
     """All of the user's queued/running jobs as {jobid: Job}.
     Raises ClusterError if the queue could not actually be queried — absence
-    of a job is only meaningful when this returns normally."""
-    r = login_run(cluster, f"squeue --me -h -o '{SQUEUE_FORMAT}'", check=False)
-    if r.returncode != 0:
+    of a job is only meaningful when this returns normally.
+
+    The same round trip captures the CLUSTER's wall clock (for submit_age):
+    squeue %V stamps are cluster-local time, and any comparison against the
+    client clock inherits the timezone offset (live-proven PT-vs-ET skew)."""
+    r = login_run(cluster, f"squeue --me -h -o '{SQUEUE_FORMAT}' && "
+                           "printf '\\036' && date +%Y-%m-%dT%H:%M:%S", check=False)
+    if r.returncode != 0 or "\x1e" not in r.stdout:
         raise SlurmError(f"squeue failed: {r.stderr.strip() or 'unknown error'}")
-    return parse_squeue(r.stdout)
+    text, _, now_str = r.stdout.partition("\x1e")
+    _remote_now[cluster] = (now_str.strip(), time.monotonic())
+    return parse_squeue(text)
 
 
-def job_owner(comment):
-    """The machine that created a job, from its --comment tag, or None."""
-    return comment.split(":", 1)[1] if comment.startswith("hpc-alloc:") else None
+def parse_owner(comment):
+    """(owner_id, owner_host) from a job's --comment ownership tag."""
+    if not comment.startswith("hpc-alloc:"):
+        return None, None
+    parts = comment.split(":")
+    return parts[1] or None, (parts[2] if len(parts) > 2 else "") or None
 
 
-def submit_age(submit):
-    """Seconds since a squeue %V submit timestamp, or None if unparseable."""
+def submit_age(submit, cluster):
+    """Seconds between a squeue %V submit stamp and the cluster's own clock
+    (captured by squeue_all in the same round trip). Both stamps are cluster-
+    local wall time parsed with the same local mktime, so the client's timezone
+    cancels out. None if either stamp is missing/unparseable."""
+    clock = _remote_now.get(cluster)
+    if clock is None:
+        return None
+    now_str, anchor = clock
     try:
-        return max(0.0, time.time() - time.mktime(time.strptime(submit, "%Y-%m-%dT%H:%M:%S")))
+        now = time.mktime(time.strptime(now_str, "%Y-%m-%dT%H:%M:%S"))
+        sub = time.mktime(time.strptime(submit, "%Y-%m-%dT%H:%M:%S"))
     except ValueError:
         return None
+    return max(0.0, now + (time.monotonic() - anchor) - sub)
 
 
 def squeue_query(cluster, jobids):
@@ -971,11 +1016,11 @@ def sleeper_command(idle_minutes):
     )
 
 
-def resource_args(args, jobname, logfile):
+def resource_args(args, jobname, logfile, tag):
     out = [
         "sbatch", "--parsable",
         f"--job-name={jobname}",
-        f"--comment=hpc-alloc:{MACHINE_ID}",
+        f"--comment={tag}",
         f"--time={args.time}",
         "--nodes=1", "--ntasks=1",
         f"--cpus-per-task={args.cpus}",
@@ -1060,7 +1105,8 @@ def cmd_up(args):
         info("--idle-timeout only applies to GPU allocations (it watches nvidia-smi); ignoring")
         idle = None
 
-    sbatch = resource_args(args, f"{JOB_PREFIX}{name}", f"{REMOTE_LOG_DIR}/%j.log")
+    sbatch = resource_args(args, f"{JOB_PREFIX}{name}", f"{REMOTE_LOG_DIR}/%j.log",
+                           machine_tag(persist=not args.dry_run))
     sbatch += [f"--partition={partition}", "--wrap", sleeper_command(idle)]
     remote_cmd = submit_prefix() + " ".join(shlex.quote(a) for a in sbatch)
     if args.dry_run:
@@ -1231,6 +1277,7 @@ def refresh_status(state):
     only records that already existed at snapshot time may be reaped — an alloc
     inserted by a concurrent `up` must not be judged by a pre-submission snapshot."""
     pre = {(n, a.get("jobid")) for n, a in state.get("allocs", {}).items()}
+    my_id = machine_id(state)  # before the lock below: it may take the lock itself
     queues = {c: squeue_all(c) for c in state.get("clusters", {})}
     # A single absent poll is not death evidence (controller failovers blip rows
     # out of squeue): confirm absence with a second look before reaping anything.
@@ -1275,21 +1322,23 @@ def refresh_status(state):
             if (not row.name.startswith(JOB_PREFIX) or (cluster, jid) in tracked
                     or row.state in ENDED_STATES):
                 continue
-            owner = job_owner(row.comment)
+            owner_id, owner_host = parse_owner(row.comment)
             is_run = row.name == JOB_PREFIX + "run"  # exact: 'hpcalloc-run2' is an alloc name
             if is_run:
                 kind = "run"
-            elif owner and owner != MACHINE_ID:
+            elif owner_id and owner_id != my_id:
                 kind = "other-machine"  # explicit ownership: never a cancel candidate
             else:
-                age = submit_age(row.submit)
+                age = submit_age(row.submit, cluster)
                 # a just-submitted sleeper is usually an `up` from another window
                 # whose record isn't written yet — never offer to cancel those
-                kind = "recent" if age is not None and age < 120 else "orphan"
+                # (the race is sub-second; ages are exact via the cluster clock)
+                kind = "recent" if age is not None and age < 20 else "orphan"
             runs.append({"jobid": jid, "cluster": cluster, "state": row.state,
                          "node": row.node or None, "partition": row.partition,
                          "time_left": row.time_left, "jobname": row.name,
-                         "owner": owner, "kind": kind, "orphan": kind == "orphan",
+                         "owner": owner_host or owner_id, "kind": kind,
+                         "orphan": kind == "orphan",
                          "log": f"~/{REMOTE_LOG_DIR}/{'run-' if is_run else ''}{jid}.log"})
     return rows, runs
 
@@ -1476,7 +1525,8 @@ def cmd_run(args):
             rest = args.chdir[1:].lstrip("/")
             args.chdir = f"{home}/{rest}" if rest else home
 
-    sbatch = resource_args(args, f"{JOB_PREFIX}run", logfile)
+    sbatch = resource_args(args, f"{JOB_PREFIX}run", logfile,
+                           machine_tag(persist=not args.dry_run))
     sbatch.append(f"--partition={partition}")
     if args.chdir:
         sbatch.append(f"--chdir={args.chdir}")

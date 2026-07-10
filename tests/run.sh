@@ -22,7 +22,8 @@ contains() {  # contains <description> <needle> <haystack-file>
 mkstate() {  # mkstate <node-json>
   rm -rf "$work/home" && mkdir -p "$work/home/.config/hpc-alloc" "$work/home/.ssh"
   cat > "$work/home/.config/hpc-alloc/state.json" <<EOF
-{"netid":"ab1234","clusters":{"bouchet":{"host":"bouchet.ycrc.yale.edu"}},
+{"netid":"ab1234","machine_id":"testid123456",
+ "clusters":{"bouchet":{"host":"bouchet.ycrc.yale.edu"}},
  "allocs":{"h200":{"name":"h200","cluster":"bouchet","jobid":"9123","node":$1,
  "partition":"gpu_h200","time":"8:00:00","gpus":"h200:1","idle_timeout":30,"created":"x"}}}
 EOF
@@ -168,7 +169,7 @@ python3 -c "
 import json; d = json.load(open('$work/out'))    # stdout must be pure JSON
 kinds = {r['jobid']: r['kind'] for r in d['runs']}
 assert kinds == {'9200': 'run', '9400': 'orphan', '9500': 'recent',
-                 '9600': 'other-machine'}, kinds
+                 '9600': 'other-machine', '9650': 'other-machine'}, kinds
 assert [r['orphan'] for r in d['runs']] == [r['kind'] == 'orphan' for r in d['runs']]
 owners = {r['jobid']: r['owner'] for r in d['runs']}
 assert owners['9600'] == 'othermachine' and owners['9300'] is None if '9300' in owners else True
@@ -414,6 +415,34 @@ rm -f "$work/flap.n"
 HPCTEST_COUNT="$work/flap.n" hpc flap run -- echo hi > "$work/out" 2>&1
 check "run survives a one-poll queue blip (exit 0)" 0 $?
 contains "stream continued after the blip" "after-blip" "$work/out"
+
+echo "== stage-B: ownership by persisted id, not hostname =="
+mkstate null
+hpc running status --json > "$work/out" 2>/dev/null
+python3 -c "
+import json; d = json.load(open('$work/out'))
+kinds = {r['jobid']: r['kind'] for r in d['runs']}
+assert kinds['9650'] == 'other-machine', kinds  # same hostname, different id
+print('  ok: same-hostname/different-id job is other-machine')" || fails=$((fails + 1))
+python3 -c "
+import json; p = '$work/home/.config/hpc-alloc/state.json'
+d = json.load(open(p)); d.pop('machine_id', None); json.dump(d, open(p, 'w'))"
+hpc running status > /dev/null 2>&1
+id1=$(python3 -c "import json;print(json.load(open('$work/home/.config/hpc-alloc/state.json')).get('machine_id',''))")
+hpc running status > /dev/null 2>&1
+id2=$(python3 -c "import json;print(json.load(open('$work/home/.config/hpc-alloc/state.json')).get('machine_id',''))")
+check "machine id persisted and stable across runs" "$id1" "$id2"
+case "$id1" in ????????????) echo "  ok: generated id is 12 hex chars";;
+  *) echo "  FAIL: bad machine id '$id1'"; fails=$((fails + 1));; esac
+
+echo "== stage-B: ages computed against the CLUSTER clock, not the client's =="
+mkstate null
+hpc tz status --json > "$work/out" 2>/dev/null
+python3 -c "
+import json; d = json.load(open('$work/out'))
+kinds = {r['jobid']: r['kind'] for r in d['runs']}
+assert kinds == {'9700': 'orphan', '9800': 'recent'}, kinds
+print('  ok: UTC-cluster stamps classified correctly from any client timezone')" || fails=$((fails + 1))
 
 echo "== stage-A: nvidia-smi failure must not kill a healthy node master =="
 mkstate '"r806u23n04"'

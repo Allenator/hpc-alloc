@@ -131,13 +131,13 @@ VPN drops, laptop sleep, and network changes are detected and healed rather than
 - **Node unreachable but job RUNNING** — `hpc-alloc connect` probes and heals each node connection; then try `ssh -v <alias>`.
 - **A hung interactive `ssh` session** — type `~.` (tilde, dot) at the start of a line to force-close it, then `hpc-alloc connect`.
 - **"HOST KEY VERIFICATION FAILED"** — the server's key changed (login-node reimage, or worst case interception). The tool surfaces ssh's warning and refuses to proceed; verify with YCRC, then `ssh-keygen -R <hostname>`.
-- **An UNTRACKED-allocation entry in `status`** — a running hpc-alloc job this machine doesn't track. Jobs are ownership-tagged (`--comment=hpc-alloc:<machine>`), so allocations created from your *other* machine are labelled "created on '<machine>' — manage it there" and never get a cancel hint; a genuine orphan (lost record on this machine) shows the `hpc-alloc cancel <jobid>` hint. Entries marked "just submitted" are an `up` from another window — leave them alone.
+- **An UNTRACKED-allocation entry in `status`** — a running hpc-alloc job this machine doesn't track. Jobs are ownership-tagged (`--comment=hpc-alloc:<id>:<hostname>`, where the id is a random per-machine identity persisted in state.json — hostname changes and DHCP renames can't disown your jobs), so allocations created from your *other* machine are labelled "created on '<machine>' — manage it there" and never get a cancel hint; a genuine orphan (lost record on this machine) shows the `hpc-alloc cancel <jobid>` hint. Entries marked "just submitted" are an `up` from another window — leave them alone.
 - **Exit codes and streams**: `run` mirrors the job's exit code (non-COMPLETED ends are nonzero; it refuses to claim success without a final accounting record); `logs -f` always exits 0 after a clean stream; connection loss is exit 3; Slurm/scheduler failures are exit 1 (the message says reconnecting won't help — don't loop on `connect`); a closed output pipe is exit 141. All progress notices go to stderr — stdout of `--json` commands is pure JSON.
 - **Walltime cannot be extended.** Slurm won't let users raise a running job's time limit; sync your work out and re-allocate.
 
 ## Files it manages
 
-- `~/.config/hpc-alloc/state.json` — NetID, clusters, live allocations.
+- `~/.config/hpc-alloc/state.json` — NetID, machine identity, clusters, live allocations.
 - `~/.config/hpc-alloc/ssh_config` — regenerated from state; included from `~/.ssh/config` via one `Include` line (the only edit ever made to your own config).
 - `~/.ssh/hpc-alloc-*` — ControlMaster sockets.
 
