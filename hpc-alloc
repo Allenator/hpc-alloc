@@ -1484,6 +1484,8 @@ def cmd_config(args):
           f"{ident or '(not pinned — ssh offers every key)':<28} "
           f"[{'config' if ident else 'builtin'}]")
     for cname, over in sorted((out["cluster_overrides"] or {}).items()):
+        if not over:  # section exists but everything is commented out
+            continue
         pairs = ", ".join(f"{k}={v}" for k, v in over.items())
         print(f"  cluster.{cname}: {pairs}")
 
