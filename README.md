@@ -129,6 +129,8 @@ VPN drops, laptop sleep, and network changes are detected and healed rather than
 - **"allocation has ended"** — `hpc-alloc why <jobid>` says whether it was walltime, OOM, the idle watchdog, or an admin cancellation, with a log tail. `hpc-alloc status` cleans up; `hpc-alloc up` re-creates it.
 - **Node unreachable but job RUNNING** — `hpc-alloc connect` probes and heals each node connection; then try `ssh -v <alias>`.
 - **A hung interactive `ssh` session** — type `~.` (tilde, dot) at the start of a line to force-close it, then `hpc-alloc connect`.
+- **"HOST KEY VERIFICATION FAILED"** — the server's key changed (login-node reimage, or worst case interception). The tool surfaces ssh's warning and refuses to proceed; verify with YCRC, then `ssh-keygen -R <hostname>`.
+- **An ORPHANED entry in `status`** — a running hpc-alloc job the tool no longer tracks (e.g. a `down` whose record was lost). `hpc-alloc cancel <jobid>` reclaims it.
 - **Walltime cannot be extended.** Slurm won't let users raise a running job's time limit; sync your work out and re-allocate.
 
 ## Files it manages

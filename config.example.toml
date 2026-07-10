@@ -14,6 +14,8 @@
 [ssh]
 # Pin the key used for the clusters. Without this, ssh offers every key it has
 # and the server may hit "Too many authentication failures" before the right one.
+# Make sure this is the key REGISTERED with the cluster; comment it out if you
+# authenticate via an SSH agent or certificates (pinning excludes agent-only keys).
 identity_file = "~/.ssh/id_ed25519"
 
 # Per-cluster overrides. The section name after "cluster." is the --cluster value.

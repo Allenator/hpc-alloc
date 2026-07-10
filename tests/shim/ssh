@@ -34,7 +34,9 @@ fi
 
 case "$all" in
   *sbatch*) echo 7777 ;;
-  *scancel*) echo "SCANCEL: $all" >> "${HPCTEST_LOG:-/dev/null}" ;;
+  *scancel*)
+    echo "SCANCEL: $all" >> "${HPCTEST_LOG:-/dev/null}"
+    exit "${HPCTEST_SCANCEL_RC:-0}" ;;
   *"squeue --me"*)
     case "$mode" in
       squeue-err) echo "slurm_load_jobs error: Unable to contact slurm controller" >&2; exit 1 ;;
@@ -42,7 +44,8 @@ case "$all" in
       running)
         printf '9123|RUNNING|r806u23n04|None|3:59:00|gpu_h200|hpcalloc-h200\n'
         printf '9200|RUNNING|r801u01n01|None|1:00:00|gpu|hpcalloc-run\n'
-        printf '9300|RUNNING|r802u02n02|None|2:00:00|day|myjob\n' ;;
+        printf '9300|RUNNING|r802u02n02|None|2:00:00|day|myjob\n'
+        printf '9400|RUNNING|r803u03n03|None|5:00:00|day|hpcalloc-stale\n' ;;
       pending-qos) echo '9123|PENDING||QOSMaxGRESPerUser|8:00:00|gpu_h200|hpcalloc-h200' ;;
       expiring) echo '9123|RUNNING|r806u23n04|None|0:12:00|gpu_h200|hpcalloc-h200' ;;
     esac ;;

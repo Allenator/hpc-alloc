@@ -22,8 +22,8 @@ description: Allocate and use Yale YCRC compute nodes (Bouchet) for development 
 | `hpc-alloc config --json` | Effective defaults: the user's config.toml merged over built-ins, with provenance. No cluster contact. |
 | `hpc-alloc avail [--json] [-p PART]` | Free capacity digest: idle CPUs and free GPUs by type per partition. **Run before requesting GPUs.** |
 | `hpc-alloc up [--name N] [-p PART] [-t TIME] [-c CPUS] [--mem M] [-G GPUS] [--idle-timeout MIN]` | Allocate a dev node; blocks until it starts (`--no-wait` for busy partitions). |
-| `hpc-alloc run [resources] [--chdir DIR] [--detach] -- CMD...` | Run CMD as a batch job. Foreground streams output and mirrors the exit code; `--detach` returns immediately. **Preferred for GPU work.** |
-| `hpc-alloc logs JOBID\|NAME [-f]` | Show (or follow, `-f`) a job's log — reattach to detached/interrupted runs. |
+| `hpc-alloc run [resources] [--chdir DIR] [--detach] -- CMD...` | Run CMD as a batch job. Foreground streams output and mirrors the exit code (non-COMPLETED ends are nonzero); Ctrl-C cancels the job. One arg after `--` = shell string; several = exact argv. **Preferred for GPU work.** |
+| `hpc-alloc logs JOBID\|NAME [-f]` | Show (or follow, `-f`) a job's log — reattach to detached/interrupted runs. Ctrl-C/stop detaches and **never cancels** the job. |
 | `hpc-alloc why [NAME\|JOBID] [--json]` | Diagnose a job: why pending (contention vs. quota cap vs. maintenance), how it's doing, or why it died (walltime/OOM/cancelled). **Use whenever a job is stuck or gone.** |
 | `hpc-alloc ssh [name] -- CMD...` | Run a command on an allocated node (non-interactive, safe for you to call). Interactive shell (no CMD) is for the user only. |
 | `hpc-alloc sync NAME SRC DST [--pull] [--delete]` | rsync local→node (or node→local with `--pull`). |

@@ -37,7 +37,7 @@ allocs_left() {
 }
 
 echo "== unit: python helpers =="
-python3 - "$cli" <<'PY' || fails=$((fails + 1))
+HOME="$work" python3 - "$cli" <<'PY' || fails=$((fails + 1))
 import sys
 m = {}
 exec(open(sys.argv[1]).read().split("if __name__")[0], m)
@@ -66,7 +66,7 @@ case "$out" in *"--wrap 'python train.py --epochs 5'"*) echo "  ok: run captures
   *) echo "  FAIL: run command capture"; fails=$((fails + 1));; esac
 
 echo "== unit: toml fallback parser =="
-python3 - "$cli" <<'PY' || fails=$((fails + 1))
+HOME="$work" python3 - "$cli" <<'PY' || fails=$((fails + 1))
 import sys
 m = {}
 exec(open(sys.argv[1]).read().split("if __name__")[0], m)
@@ -158,13 +158,40 @@ hpc running status > "$work/out" 2>&1; check "status exit" 0 $?
 contains "node discovered" "r806u23n04" "$work/out"
 contains "gpu util shown" "42%" "$work/out"
 contains "run job listed" "9200" "$work/out"
+contains "orphan sleeper surfaced" "ORPHANED" "$work/out"
 hpc running status --json > "$work/out" 2>&1
 contains "json run job" '"jobid": "9200"' "$work/out"
 python3 -c "
 import json; d = json.load(open('$work/out'))
-assert len(d['runs']) == 1, d['runs']         # foreign job 9300 excluded
+ids = {r['jobid'] for r in d['runs']}
+assert ids == {'9200', '9400'}, ids           # run job + orphan; foreign 9300 and tracked 9123 excluded
 assert d['allocs'][0]['gpu_util'] == 42
-print('  ok: json runs filtered, gpu_util=42')" || fails=$((fails + 1))
+print('  ok: json runs filtered (run + orphan), gpu_util=42')" || fails=$((fails + 1))
+
+echo "== review fixes: regression checks =="
+mkstate null
+out="$(hpc running up --dry-run -G 1 2>/dev/null)"
+case "$out" in *'case "$u" in'*) echo "  ok: watchdog validates nvidia-smi output";;
+  *) echo "  FAIL: watchdog validation missing"; fails=$((fails + 1));; esac
+out="$(hpc running run --dry-run -- python -c 'x = 1' 2>/dev/null)"
+case "$out" in *"--wrap 'python -c x = 1'"*) echo "  FAIL: run argv boundaries lost"; fails=$((fails + 1));;
+  *"x = 1"*) echo "  ok: run preserves argv quoting";;
+  *) echo "  FAIL: run command missing"; fails=$((fails + 1));; esac
+echo 'partition = week' > "$work/home/.config/hpc-alloc/config.toml"   # invalid TOML
+hpc running up --dry-run > "$work/out" 2>&1; check "invalid config tolerated" 0 $?
+contains "config warning printed" "ignoring config.toml" "$work/out"
+mkstate '"r806u23n04"'
+HPCTEST_SCANCEL_RC=1 hpc running down h200 > "$work/out" 2>&1
+check "down survives scancel failure" 0 $?
+contains "state kept on scancel failure" "keeping it in state" "$work/out"
+check "alloc preserved after failed scancel" 1 "$(allocs_left)"
+echo '{"netid":"ab1234","clusters":{"bouchet":{"host":"bouchet.ycrc.yale.edu"}},"allocs":{}}' \
+  > "$work/home/.config/hpc-alloc/state.json"
+hpc running down > "$work/out" 2>&1; check "down with zero allocs exits 1" 1 $?
+contains "clear empty message" "no active allocations" "$work/out"
+mkstate null
+hpc gone run -- echo hi > "$work/out" 2>&1; check "run mirrors TIMEOUT as exit 1" 1 $?
+contains "final state reported" "TIMEOUT" "$work/out"
 
 echo "== scenario: cancel safety =="
 mkstate '"r806u23n04"'; : > "$HPCTEST_LOG"
