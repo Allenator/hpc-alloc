@@ -106,8 +106,10 @@ class ConnectionLost(Exception):
 
 
 def info(msg):
-    # flush: backgrounded/piped runs (e.g. agents) must see progress promptly
-    print(f"hpc-alloc: {msg}", flush=True)
+    # stderr: stdout is reserved for payload (--json, logs, tables) — a stale-
+    # master or requeue notice must never corrupt machine-parsed output.
+    # flush: backgrounded/piped runs (e.g. agents) must see progress promptly.
+    print(f"hpc-alloc: {msg}", file=sys.stderr, flush=True)
 
 
 def die(msg, code=1):
@@ -585,14 +587,26 @@ def login_run(cluster, remote_cmd, check=True, timeout=60, _retry=True, binary=F
 
 
 def wait_reconnect(cluster, budget=600):
-    """Patiently re-probe after a drop (interactive use). True once reconnected."""
+    """Patiently re-probe after a drop. Probes are NON-interactive; when the
+    network returns and re-auth is needed, at most ONE interactive attempt is
+    made — a reconnect loop must never strafe the user with repeated Duo
+    prompts (push fatigue). True once reconnected."""
     info(f"retrying for up to {budget // 60} minutes — Ctrl-C is safe, jobs stay queued")
     deadline = time.monotonic() + budget
     while time.monotonic() < deadline:
         time.sleep(15)
-        if try_login(cluster):
+        if try_login(cluster, interactive=False):
             info("reconnected")
             return True
+        if _last_probe == "hostkey":
+            return False  # surfaced by ensure_login on the next command
+        if _last_probe == "auth":
+            if can_prompt() and try_login(cluster):  # exactly one Duo attempt
+                info("reconnected")
+                return True
+            info("network is back but re-authentication is needed — run "
+                 "`hpc-alloc connect` (or `hpc-alloc connect --push`)")
+            return False
     return False
 
 
@@ -1100,6 +1114,12 @@ def check_node_reachable(state, alloc):
         st = probe(alias)
     if st == "ok":
         return
+    if st == "hostkey":
+        first = _probe_detail.splitlines()[0] if _probe_detail else "host key mismatch"
+        die(f"node {alloc['node']}: HOST KEY VERIFICATION FAILED — {first}\n"
+            f"  If the node was reimaged this is expected: remove its entry from\n"
+            f"  {KNOWN_HOSTS} and retry. If unexpected, treat it as a possible\n"
+            "  interception and contact hpc@yale.edu.", code=EXIT_CONNLOST)
     try:
         live = squeue_query(alloc["cluster"], [alloc["jobid"]])
         q = live.get(alloc["jobid"])
@@ -1405,7 +1425,10 @@ def cmd_connect(args):
         heal_connections(state, cluster)
         info("closed login and compute-node master connections; swept dead sockets")
     if args.push and not try_login(cluster, interactive=False):
-        push_login(cluster)
+        if _last_probe == "auth":
+            push_login(cluster)
+        # 'net'/'hostkey': a push cannot help — fall through to ensure_login,
+        # whose diagnosis (VPN down / host key changed) is the accurate one.
     ensure_login(cluster)
     r = login_run(cluster, "hostname")
     info(f"login OK: {r.stdout.strip()} (multiplexed — no Duo again for ~4h of idle)")
@@ -1419,6 +1442,9 @@ def cmd_connect(args):
             st = probe(alias)
         if st == "ok":
             info(f"node {alloc['node']} ('{name}'): OK")
+        elif st == "hostkey":
+            info(f"node {alloc['node']} ('{name}'): HOST KEY CHANGED — verify (reimage vs "
+                 f"interception), then remove its entry from {KNOWN_HOSTS}")
         else:
             info(f"node {alloc['node']} ('{name}'): unreachable — allocation may have ended; "
                  "run `hpc-alloc status`")

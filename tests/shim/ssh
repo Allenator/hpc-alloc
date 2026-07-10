@@ -14,7 +14,7 @@ case "$all" in
   *"-O exit"*) exit 0 ;;
   *"-O check"*)
     case "$mode" in
-      down) echo "no master" >&2; exit 255 ;;
+      down|hostkey) echo "no master" >&2; exit 255 ;;
       duo) [ -f "${HPCTEST_MARK:?}" ] && exit 0 || exit 1 ;;
     esac
     exit 0 ;;
@@ -22,6 +22,12 @@ esac
 
 if [ "$mode" = down ]; then
   echo "ssh: Could not resolve hostname bouchet.ycrc.yale.edu" >&2
+  exit 255
+fi
+
+if [ "$mode" = hostkey ]; then
+  echo "@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@" >&2
+  echo "Host key verification failed." >&2
   exit 255
 fi
 

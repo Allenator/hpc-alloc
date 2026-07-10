@@ -232,6 +232,27 @@ mkstate '"r806u23n04"'
 hpc expiring status --json > "$work/out" 2>&1
 contains "expiring_soon flag" '"expiring_soon": true' "$work/out"
 
+echo "== stage-2: stdout purity and hostkey classification =="
+mkstate null
+out_only="$(hpc running up --dry-run -G 1 2>/dev/null)"
+# note: the sbatch payload itself contains 'hpc-alloc:' inside the watchdog
+# echo — only a LINE starting with the prefix is a leaked notice
+if printf '%s\n' "$out_only" | grep -q '^hpc-alloc:'; then
+  echo "  FAIL: info notice leaked to stdout"; fails=$((fails + 1))
+else echo "  ok: stdout carries only payload"; fi
+err_only="$(hpc running up --dry-run -G 1 2>&1 >/dev/null)"
+case "$err_only" in *"--gpus given"*) echo "  ok: notices go to stderr";;
+  *) echo "  FAIL: notice missing from stderr"; fails=$((fails + 1));; esac
+mkstate '"r806u23n04"'
+hpc hostkey status > "$work/out" 2>&1; check "hostkey probe exits 3" 3 $?
+contains "hostkey surfaced, not masked as VPN" "HOST KEY VERIFICATION FAILED" "$work/out"
+check "alloc preserved on hostkey failure" 1 "$(allocs_left)"
+hpc hostkey connect --push > "$work/out" 2>&1; check "push refused on hostkey" 3 $?
+contains "no push attempted" "HOST KEY VERIFICATION FAILED" "$work/out"
+if grep -q "requesting Duo push" "$work/out"; then
+  echo "  FAIL: push was sent despite hostkey failure"; fails=$((fails + 1))
+else echo "  ok: no Duo push sent on hostkey failure"; fi
+
 echo "== scenario: Duo push auth (connect --push) =="
 mkstate null
 rm -f "$work/duo.mark"
