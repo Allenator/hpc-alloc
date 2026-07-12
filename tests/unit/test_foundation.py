@@ -144,19 +144,23 @@ class StateRepositoryTests(unittest.TestCase):
 
     def test_submission_ack_and_lifecycle_update(self) -> None:
         operation = self.reserve()
+        reserved = self.repo.get_job(operation.operation_id)
         self.assertEqual(operation.phase, OperationPhase.PREPARED)
         self.assertEqual(len(self.repo.list_unresolved_operations()), 1)
         job = self.repo.acknowledge_submission(operation.operation_id, "1234")
+        self.assertGreater(job.updated_at, reserved.updated_at)
         self.assertEqual(job.phase, JobPhase.QUEUED)
         self.assertEqual(job.ref.job_id, "1234")
         self.assertEqual(job.resources["cpus"], 2)
         self.assertEqual(self.repo.list_unresolved_operations(), [])
+        queued_updated_at = job.updated_at
         job = self.repo.update_job(
             operation.operation_id,
             phase=JobPhase.ACTIVE,
             ever_started=True,
             current_node="node01",
         )
+        self.assertGreater(job.updated_at, queued_updated_at)
         self.assertTrue(job.ever_started)
         self.assertEqual(job.current_node, "node01")
         self.assertEqual(job.last_node, "node01")
@@ -165,7 +169,18 @@ class StateRepositoryTests(unittest.TestCase):
             self.repo.acknowledge_submission(operation.operation_id, "1234").phase,
             JobPhase.ACTIVE,
         )
+        active_updated_at = job.updated_at
+        unchanged = self.repo.update_job(
+            operation.operation_id,
+            expected_updated_at=active_updated_at,
+            phase=JobPhase.ACTIVE,
+            ever_started=True,
+            current_node="node01",
+            last_node="node01",
+        )
+        self.assertEqual(unchanged.updated_at, active_updated_at)
         job = self.repo.update_job(operation.operation_id, phase=JobPhase.REQUEUEING)
+        self.assertGreater(job.updated_at, active_updated_at)
         self.assertIsNone(job.current_node)
         self.assertEqual(job.last_node, "node01")
         with self.assertRaisesRegex(StateConflict, "monotonic"):

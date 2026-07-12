@@ -89,10 +89,11 @@ class JobMonitor:
         *,
         auth: AuthMode = AuthMode.NONINTERACTIVE,
         confirm: bool = True,
+        tracker: EvidenceTracker | None = None,
     ) -> MonitorResult:
         if job.ref is None:
-            return MonitorResult(self.tracker(job).assessment)
-        tracker = self.tracker(job)
+            return MonitorResult((tracker or self.tracker(job)).assessment)
+        tracker = tracker or self.tracker(job)
         accounting_checked = False
 
         def exact_final(attempts: tuple[float, ...]) -> AccountingRecord | None:
@@ -144,13 +145,14 @@ class JobMonitor:
 
 def persist_assessment(repository: object, job: JobRecord, assessment: JobAssessment) -> JobRecord:
     if assessment.phase == AssessmentPhase.UNCERTAIN:
-        # The caller may hold a stale object while another process records
-        # stronger evidence.  Never return that stale copy as if it were the
-        # durable result of this persistence attempt.
-        return repository.get_job(job.operation_id)
+        # No evidence is persisted.  Keep the returned row from the same
+        # snapshot as ``assessment`` so callers never combine a fresh durable
+        # job with stale process-local policy.
+        return job
     phase = JobPhase(assessment.phase.value)
     return repository.update_job(
         job.operation_id,
+        expected_updated_at=job.updated_at,
         phase=phase,
         # ``False`` means this tracker has not observed a start; it is not
         # evidence that another process's persisted start history is wrong.

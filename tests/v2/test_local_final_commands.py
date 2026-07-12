@@ -17,11 +17,17 @@ from hpc_alloc.errors import (
     SchedulerUnavailable,
     StateConflict,
 )
-from hpc_alloc.models import FinalSource, JobKind, JobPhase, OperationPhase
+from hpc_alloc.models import (
+    EvidenceProvenance,
+    FinalSource,
+    JobKind,
+    JobPhase,
+    OperationPhase,
+)
 from hpc_alloc.monitor import JobMonitor
 from hpc_alloc.ownership import format_tag, slurm_job_name
 from hpc_alloc.paths import AppPaths
-from hpc_alloc.slurm import LogSizeResult, QueueRow
+from hpc_alloc.slurm import AccountingRecord, LogSizeResult, QueueRow
 from hpc_alloc.state import StateRepository
 
 
@@ -275,6 +281,128 @@ host = "grace.example.edu"
         self.assertEqual(payload["terminal_state"], "COMPLETED")
         self.assertEqual(payload["final_source"], FinalSource.ACCOUNTING.value)
         self.assertIn(HISTORICAL_ID, client.path)
+
+    def test_why_persists_delayed_accounting_before_rendering_json(self) -> None:
+        self.state.update_job(
+            RECYCLED_ID,
+            phase=JobPhase.FINAL,
+            terminal_state="COMPLETED",
+            evidence_provenance=EvidenceProvenance.ABSENT,
+            evidence_detail="job was absent from two exact queue observations",
+            final_source=FinalSource.CONFIRMED_QUEUE,
+        )
+        record = AccountingRecord(
+            job_id="54321",
+            state="FAILED",
+            exit_code="7:0",
+            job_name=slurm_job_name("allocation", RECYCLED_ID),
+            comment=format_tag(
+                self.owner, RECYCLED_ID, "laptop", "allocation", "recycled"
+            ),
+            extra=("00:12:34", "01:00:00"),
+        )
+
+        class Transport:
+            def bootstrap(self, *_args: object, **_kwargs: object) -> None:
+                return None
+
+        class Client:
+            def __init__(self) -> None:
+                self.final_calls: list[dict[str, object]] = []
+
+            def final(self, *_args: object, **kwargs: object):
+                self.final_calls.append(kwargs)
+                return record if kwargs.get("extra_fields") else None
+
+            def tail_log(self, _path: str, _lines: int) -> bytes:
+                return b"failed output\n"
+
+        client = Client()
+        stdout = io.StringIO()
+        with (
+            patch(
+                "hpc_alloc.commands._services",
+                return_value=(Transport(), client),
+            ),
+            patch(
+                "hpc_alloc.commands._sync_ssh_projection",
+                return_value=True,
+            ) as projection,
+            redirect_stdout(stdout),
+        ):
+            result = cmd_why(
+                SimpleNamespace(
+                    target=f"grace:@{RECYCLED_ID}",
+                    cluster=None,
+                    json=True,
+                ),
+                ctx=self.context,
+                paths=self.paths,
+                entrypoint=Path("/tmp/hpc-alloc"),
+            )
+
+        self.assertEqual(result, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["status"], JobPhase.FINAL.value)
+        self.assertEqual(payload["phase"], JobPhase.FINAL.value)
+        self.assertEqual(payload["terminal_state"], "FAILED")
+        self.assertEqual(payload["exit_code"], "7:0")
+        self.assertEqual(payload["final_source"], FinalSource.ACCOUNTING.value)
+        self.assertEqual(payload["diagnosis"], "final state FAILED")
+        self.assertEqual(payload["elapsed"], "00:12:34")
+        self.assertEqual(payload["timelimit"], "01:00:00")
+        stored = self.state.get_job(RECYCLED_ID)
+        self.assertEqual(stored.final_source, FinalSource.ACCOUNTING)
+        self.assertEqual(stored.terminal_state, "FAILED")
+        self.assertEqual(stored.exit_code, "7:0")
+        self.assertGreaterEqual(projection.call_count, 2)
+
+    def test_why_no_result_retry_keeps_queue_final_without_timing_fields(self) -> None:
+        self.state.update_job(
+            RECYCLED_ID,
+            phase=JobPhase.FINAL,
+            terminal_state="COMPLETED",
+            evidence_provenance=EvidenceProvenance.ABSENT,
+            evidence_detail="job was absent from two exact queue observations",
+            final_source=FinalSource.CONFIRMED_QUEUE,
+        )
+
+        class Transport:
+            def bootstrap(self, *_args: object, **_kwargs: object) -> None:
+                return None
+
+        client = SimpleNamespace(final=Mock(return_value=None))
+        stdout = io.StringIO()
+        with (
+            patch(
+                "hpc_alloc.commands._services",
+                return_value=(Transport(), client),
+            ),
+            redirect_stdout(stdout),
+        ):
+            result = cmd_why(
+                SimpleNamespace(
+                    target=f"grace:@{RECYCLED_ID}",
+                    cluster=None,
+                    json=True,
+                ),
+                ctx=self.context,
+                paths=self.paths,
+                entrypoint=Path("/tmp/hpc-alloc"),
+            )
+
+        self.assertEqual(result, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(
+            payload["final_source"], FinalSource.CONFIRMED_QUEUE.value
+        )
+        self.assertNotIn("elapsed", payload)
+        self.assertNotIn("timelimit", payload)
+        self.assertEqual(client.final.call_count, 2)
+        self.assertEqual(
+            self.state.get_job(RECYCLED_ID).final_source,
+            FinalSource.CONFIRMED_QUEUE,
+        )
 
     def test_why_preserves_access_failures_from_optional_log_tail(self) -> None:
         class Transport:

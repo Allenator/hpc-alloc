@@ -22,6 +22,14 @@ One-time setup is:
 hpc-alloc setup --netid NETID
 ```
 
+`setup --force` is scope-safe. While any durable job is non-final or operation
+is unresolved, it may replace configuration only with the same NetID and the
+same normalized host for every blocker-referenced cluster; it may not remove
+those clusters. Run `hpc-alloc status`, finish or cancel remaining jobs, and
+use each printed `hpc-alloc recover OPERATION_ID` command before changing
+scope. Unrelated inactive clusters may change, and all scope changes are
+allowed after every job is final and every operation resolved.
+
 The user uploads the printed key at <https://sshkeys.ycrc.yale.edu/> and then
 runs `hpc-alloc connect` in a terminal.
 
@@ -72,7 +80,10 @@ absence alone does not mean a job died. If a secondary cluster is unavailable,
 its local jobs remain `UNCERTAIN`; never reap them based on that absence.
 Final evidence is monotonic: missing or weaker observations cannot erase a
 persisted terminal state or exit code, while exact accounting may enrich a
-queue-confirmed final record.
+queue-confirmed final record. A `why` retry that discovers delayed accounting
+persists its final source, state, and exit code before reporting them;
+`Elapsed` and `Timelimit` are output-only enrichment and are discarded if the
+accounting result is no longer applicable after reconciliation.
 
 A present `COMPLETING` row is started-but-inactive and log-eligible, not final
 evidence. Numeric job IDs may be recycled: reconcile the old job through its
@@ -103,6 +114,13 @@ Shared resource flags are `--cluster`, `-p/--partition`, `-t/--time`,
 `-c/--cpus`, `--mem`, `-G/--gpus`, and `-C/--constraint`. Pass only values the
 task requires; let authoritative config supply the rest. Use `--dry-run` to
 inspect an `up` or `run` submission without connecting or changing state.
+
+Numeric `--time` values accept `minutes`, `minutes:seconds`,
+`hours:minutes:seconds`, `days-hours`, `days-hours:minutes`, or
+`days-hours:minutes:seconds`. Minute and second subfields must be two digits
+from `00` through `59`. Do not use signs, whitespace, `INFINITE`, or
+`UNLIMITED`. All-zero spellings are also invalid because Slurm treats zero as
+a request for no time limit; always choose a finite nonzero duration.
 
 ## Durable job selectors
 
@@ -147,6 +165,19 @@ When `status` reports an unresolved operation, run the printed command:
 ```bash
 hpc-alloc recover OPERATION_ID
 ```
+
+If Ctrl-C or SIGTERM interrupts submission after dispatch may have begun,
+preserve exit 130 and follow the printed `do not resubmit` recovery guidance.
+When Slurm returned a trusted job ID but the local acknowledgement write
+failed, the notice includes that ID. Even if the ambiguity marker itself
+cannot be written, the durable `PREPARED` operation remains recoverable; never
+replace this workflow with a fresh submission.
+
+For `recover OPERATION_ID --cluster NAME`, the explicit cluster must equal the
+cluster recorded on the operation. A mismatch fails before confirmation,
+abandonment, local projection changes, or remote access. Explicit recovery of
+an already-resolved operation reports its durable phase successfully, while
+`--abandon` still rejects it.
 
 Recovery requires the exact operation-derived v2 Slurm name. A live queue row
 must also match the complete persisted comment. Accounting reads request

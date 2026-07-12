@@ -36,10 +36,11 @@ cd hpc-alloc
 hpc-alloc setup --netid YOUR_NETID
 ```
 
-`install.sh` verifies Python before linking the executable into
-`~/.local/bin` and the bundled Claude Code skill into
-`~/.claude/skills/hpc-alloc`. These are symlinks, so keep the checked-out
-repository at its installed path.
+`install.sh` verifies Python, the launcher and skill sources, and the complete
+runtime-module manifest under an isolated Python startup before creating any
+links. It then links the executable into `~/.local/bin` and the bundled Claude
+Code skill into `~/.claude/skills/hpc-alloc`. These are symlinks, so keep the
+checked-out repository at its installed path.
 
 `setup` validates and writes the authoritative v2 config, initializes the
 SQLite state database, finds or creates an SSH key, and adds one `Include` to
@@ -50,6 +51,15 @@ SQLite state database, finds or creates an SSH key, and adds one `Include` to
 hpc-alloc connect
 ```
 
+Stateful commands hold a shared configuration-scope lock, while `setup` holds
+the exclusive side through its authoritative recheck and all mutations. A
+forced setup cannot change the NetID, remove a blocker-referenced cluster, or
+change that cluster's normalized login host while any job is non-final or any
+operation is unresolved. Same-scope replacement remains allowed. Use
+`hpc-alloc status`, finish or cancel remaining jobs, and run the printed
+`hpc-alloc recover OPERATION_ID` commands before changing scope. Once every job
+is final and every operation resolved, `setup --force` may change it.
+
 `connect --push` performs the same bootstrap with one Duo push. Tell the user
 to expect and approve that push before invoking it from an unattended agent.
 
@@ -57,9 +67,10 @@ to expect and approve that push before invoking it from an unattended agent.
 
 There is no migration path in the executable. A v1 `state.json` is ignored,
 and jobs carrying a v1 name or comment are not considered owned. Replace an
-old config with `hpc-alloc setup --force --netid YOUR_NETID`; archive or remove
-old files separately if they are no longer needed. Existing v1 jobs must be
-handled outside v2 rather than adopted by a heuristic match.
+old config with `hpc-alloc setup --force --netid YOUR_NETID` only after the v2
+journal has no setup blockers; archive or remove old files separately if they
+are no longer needed. Existing v1 jobs must be handled outside v2 rather than
+adopted by a heuristic match.
 
 ## Common workflow
 
@@ -118,6 +129,14 @@ Resource flags shared by `up` and `run` are `--cluster`, `-p/--partition`,
 `--dry-run`. `up` additionally accepts `--idle-timeout`, `--no-wait`, and
 `--wait-timeout`.
 
+Numeric Slurm durations support all six documented forms: `minutes`,
+`minutes:seconds`, `hours:minutes:seconds`, `days-hours`,
+`days-hours:minutes`, and `days-hours:minutes:seconds`. Minute and second
+subfields must be two digits from `00` through `59`; signs, whitespace, and
+symbolic values such as `INFINITE` or `UNLIMITED` are not accepted. Every
+all-zero spelling is also rejected because Slurm interprets a zero duration as
+requesting no time limit; specify an explicit, finite nonzero duration instead.
+
 ## Authoritative configuration
 
 The only application config is `~/.config/hpc-alloc/config.toml`. Its schema is
@@ -147,7 +166,12 @@ host = "bouchet.ycrc.yale.edu"
 `[identity].netid` and at least one `[cluster.NAME].host` are required. The
 `[ssh]` and `[defaults]` tables may be empty. Every resource key accepted in
 `[defaults]` may also appear in a cluster table; a cluster value overrides the
-global default. Invocation precedence is:
+global default.
+
+Cluster IP literals may be bare or enclosed in matching brackets. Brackets
+must enclose a valid IP address and are removed before generating SSH config.
+
+Invocation precedence is:
 
 ```text
 CLI flag > selected [cluster.NAME] value > [defaults] value > built-in fallback
@@ -219,6 +243,19 @@ prints the relevant operation ID. Reconcile it with:
 hpc-alloc recover OPERATION_ID
 ```
 
+If submission is interrupted after dispatch may have begun, hpc-alloc prints
+that exact recovery command and a `do not resubmit` warning before preserving
+the normal interrupt exit status (130). The same guidance includes the trusted
+Slurm job ID when the remote acknowledgement arrived but its local journal
+write failed. If even the ambiguity update cannot be recorded, the existing
+`PREPARED` operation remains unresolved and recoverable by the printed ID.
+
+With an explicit operation ID, `recover --cluster NAME` validates the requested
+cluster against the operation's recorded cluster before prompting, changing
+local state, or contacting a cluster. A mismatch fails closed. Recovering an
+already-resolved operation reports its durable phase and succeeds; `--abandon`
+continues to reject resolved operations.
+
 Recovery requires the exact operation-derived v2 job name. A live queue match
 must also contain the complete expected comment. Accounting reads explicitly
 request full-width identity columns; Bouchet accounting may still omit
@@ -288,7 +325,11 @@ operation; partial name/comment matches remain hard identity conflicts.
 
 Final evidence is monotonic. Later missing or weaker observations cannot erase
 persisted terminal state or exit code; exact accounting may enrich a
-queue-confirmed final record.
+queue-confirmed final record. When `why` discovers delayed exact accounting,
+it persists the accounting final source, terminal state, and exit code before
+rendering its diagnosis. `Elapsed` and `Timelimit` remain display enrichment
+and are omitted if reconciliation finds that the accounting result no longer
+applies.
 
 Foreground stream behavior is intentionally command-specific:
 

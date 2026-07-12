@@ -6,6 +6,7 @@ lifecycle policy, and durable transactions remain in their dedicated modules.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import platform
@@ -13,10 +14,13 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
+from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from .config import Config
 from .errors import (
@@ -26,12 +30,20 @@ from .errors import (
     HpcAllocError,
     HostKeyChanged,
     IdentityMismatch,
+    LifecycleRevisionConflict,
     LocalToolUnavailable,
-    RecordNotFound,
     StateConflict,
     TransportLost,
 )
-from .models import FinalSource, JobKind, JobPhase, OperationKind, OperationPhase
+from .locking import configuration_scope_lock
+from .models import (
+    EvidenceProvenance,
+    FinalSource,
+    JobKind,
+    JobPhase,
+    OperationKind,
+    OperationPhase,
+)
 from .ownership import normalize_host_label, parse_tag, slurm_job_name
 from .paths import AppPaths
 from .selectors import SelectorKind, canonical_job_selector, parse_selector, unique_job
@@ -76,6 +88,57 @@ def _sync_ssh_projection(ctx: Any, paths: AppPaths) -> bool:
     )
 
 
+@contextmanager
+def _ssh_projection_scope(ctx: Any, paths: AppPaths) -> Iterator[None]:
+    """Synchronize derived SSH aliases after success or while unwinding.
+
+    A projection error is authoritative on the successful path.  During
+    exception unwinding it is only a secondary local-repair failure, so report
+    it without replacing the exception that interrupted reconciliation.
+    """
+
+    try:
+        yield
+    except BaseException:
+        try:
+            _sync_ssh_projection(ctx, paths)
+        except BaseException as projection_error:
+            try:
+                info(
+                    "warning: could not synchronize managed SSH config while "
+                    f"recovering from another error ({projection_error})"
+                )
+            except BaseException:
+                pass
+        raise
+    else:
+        _sync_ssh_projection(ctx, paths)
+
+
+def _submission_recovery_guidance(
+    operation_id: str, *, job_id: str | None = None
+) -> str:
+    known_job = f" (trusted Slurm job ID {job_id})" if job_id is not None else ""
+    return (
+        f"submission {operation_id} may have committed{known_job}; do not resubmit; "
+        f"run `hpc-alloc recover {operation_id}`"
+    )
+
+
+def _best_effort_mark_submission_ambiguous(
+    ctx: Any, operation_id: str, detail: str
+) -> None:
+    """Retain recovery intent without ever replacing the primary failure."""
+
+    try:
+        ctx.state.mark_submission_ambiguous(operation_id, detail)
+    except BaseException:
+        # The operation remains recoverable from PREPARED if this write could
+        # not commit.  It may also already be ACKNOWLEDGED if an interruption
+        # arrived after the acknowledgement transaction committed.
+        pass
+
+
 def _toml_string(value: str) -> str:
     # TOML basic strings use JSON-compatible escaping for this validated subset.
     return json.dumps(value, ensure_ascii=False)
@@ -102,6 +165,106 @@ def _render_initial_config(netid: str, cluster: str, host: str, identity_file: s
         f"[cluster.{cluster}]\n"
         f"host = {_toml_string(host)}\n"
     )
+
+
+def _validated_initial_config(
+    netid: str,
+    cluster: str,
+    host: str,
+    identity_file: str | None,
+) -> tuple[str, Config]:
+    """Render and parse a setup candidate without touching application state."""
+
+    text = _render_initial_config(netid, cluster, host, identity_file)
+    with tempfile.TemporaryDirectory(prefix="hpc-alloc-setup-") as directory:
+        staged = Path(directory) / "config.toml"
+        atomic_write_600(staged, text)
+        return text, Config.load(staged)
+
+
+def _setup_blocker_ids(jobs: list[Any], operations: list[Any]) -> str:
+    identities = sorted(
+        {job.operation_id for job in jobs}
+        | {operation.operation_id for operation in operations}
+    )
+    return ", ".join(identities)
+
+
+def _setup_scope_conflict(
+    reason: str,
+    jobs: list[Any],
+    operations: list[Any],
+) -> StateConflict:
+    recovery = ""
+    if operations:
+        commands = ", ".join(
+            f"`hpc-alloc recover {operation.operation_id}`"
+            for operation in operations
+        )
+        recovery = f" Resolve unresolved operations with {commands}."
+    return StateConflict(
+        f"forced setup cannot {reason} while durable work remains; "
+        f"blocking operation IDs: {_setup_blocker_ids(jobs, operations)}. "
+        "Run `hpc-alloc status`, finish or cancel non-final jobs, and retry."
+        f"{recovery}"
+    )
+
+
+def _setup_host_identity(host: str) -> tuple[str, str]:
+    """Canonicalize one already-validated host for setup-scope comparison."""
+
+    try:
+        # Config parsing has already removed matching brackets.  Parse before
+        # DNS normalization so an IPv6 zone identifier remains opaque and
+        # case-sensitive, including a trailing dot that belongs to the zone.
+        return ("ip", str(ipaddress.ip_address(host)))
+    except ValueError:
+        return ("dns", host.removesuffix(".").lower())
+
+
+def _validate_setup_scope(
+    prior: Config | None,
+    candidate: Config,
+    jobs: list[Any],
+    operations: list[Any],
+) -> None:
+    """Reject an unprovable or changed scope while durable work remains."""
+
+    if not jobs and not operations:
+        return
+    if prior is None:
+        raise _setup_scope_conflict(
+            "replace a missing or invalid prior configuration",
+            jobs,
+            operations,
+        )
+    if prior.identity.netid != candidate.identity.netid:
+        raise _setup_scope_conflict("change the configured NetID", jobs, operations)
+
+    referenced_clusters = sorted(
+        {job.cluster for job in jobs} | {operation.cluster for operation in operations}
+    )
+    for cluster in referenced_clusters:
+        old = prior.clusters.get(cluster)
+        new = candidate.clusters.get(cluster)
+        if old is None:
+            raise _setup_scope_conflict(
+                f"replace cluster {cluster!r} whose prior host cannot be proven",
+                jobs,
+                operations,
+            )
+        if new is None:
+            raise _setup_scope_conflict(
+                f"remove blocker-referenced cluster {cluster!r}",
+                jobs,
+                operations,
+            )
+        if _setup_host_identity(old.host) != _setup_host_identity(new.host):
+            raise _setup_scope_conflict(
+                f"change the host for blocker-referenced cluster {cluster!r}",
+                jobs,
+                operations,
+            )
 
 
 def _existing_ssh_key(paths: AppPaths) -> tuple[Path, str] | None:
@@ -149,6 +312,7 @@ def _find_or_create_ssh_key(paths: AppPaths) -> tuple[Path, str]:
 
 def cmd_setup(args: Any, *, paths: AppPaths, entrypoint: Path) -> int:
     from .state import StateRepository
+    from .ssh_config import resolve_user_ssh_config
 
     netid = args.netid
     if not netid and sys.stdin.isatty():
@@ -160,57 +324,74 @@ def cmd_setup(args: Any, *, paths: AppPaths, entrypoint: Path) -> int:
         raise ConfigInvalid(f"invalid cluster name {cluster!r}")
     host = args.host or f"{cluster}.ycrc.yale.edu"
 
-    if paths.config_file.exists() and not args.force:
-        raise ConfigInvalid(
-            "v2 configuration already exists; pass setup --force to replace it",
-            path=paths.config_file,
-        )
-
-    # Validate all user input and the SSH-config target before generating a key
-    # or committing durable state.
-    from .ssh_config import resolve_user_ssh_config
-
+    # Candidate and dotfile-target validation intentionally precede the lock.
+    # Invalid setup input must not create an application lock, key, or journal.
+    _candidate_text, candidate = _validated_initial_config(
+        netid,
+        cluster,
+        host,
+        "~/.ssh/id_ed25519_hpc_alloc",
+    )
     resolve_user_ssh_config(paths.user_ssh_config)
-    existing_key = _existing_ssh_key(paths)
-    planned_identity = (
-        existing_key[1] if existing_key else "~/.ssh/id_ed25519_hpc_alloc"
-    )
-    text = _render_initial_config(netid, cluster, host, planned_identity)
-    try:
-        paths.config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        paths.config_dir.chmod(0o700)
-    except OSError as exc:
-        raise ConfigInvalid(f"cannot prepare {paths.config_dir}: {exc}") from exc
-    # Parse the staged bytes before committing anything.
-    staged = paths.config_dir / f".config.validate.{uuid.uuid4().hex}.toml"
-    atomic_write_600(staged, text)
-    try:
-        Config.load(staged)
-    finally:
-        staged.unlink(missing_ok=True)
 
-    public_key, identity_file = _find_or_create_ssh_key(paths)
-    if identity_file != planned_identity:
-        raise StateConflict("SSH key selection changed during setup; rerun setup")
-    try:
-        encoded_key = public_key.read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeError) as exc:
-        raise ConfigInvalid(f"cannot read SSH public key {public_key}: {exc}") from exc
-    if not encoded_key:
-        raise ConfigInvalid(f"SSH public key {public_key} is empty")
+    with configuration_scope_lock(paths.config_scope_lock, exclusive=True):
+        # This check is authoritative: another setup may have completed while
+        # this invocation was validating its candidate.
+        config_exists = paths.config_file.exists()
+        if config_exists and not args.force:
+            raise ConfigInvalid(
+                "v2 configuration already exists; pass setup --force to replace it",
+                path=paths.config_file,
+            )
 
-    repository = StateRepository(paths.state_db)
-    repository.initialize()
-    repository.get_or_create_machine_id(machine_host())
-    atomic_write_600(paths.config_file, text)
-    sync_managed_config(
-        config_path=paths.config_file,
-        repository=repository,
-        managed_path=paths.managed_ssh_config,
-        lock_path=paths.ssh_config_lock,
-        known_hosts=paths.known_hosts,
-    )
-    ensure_include(paths.user_ssh_config)
+        repository = StateRepository(paths.state_db)
+        repository.initialize()
+        jobs, operations = repository.snapshot_setup_scope_blockers()
+
+        prior: Config | None = None
+        if config_exists:
+            try:
+                prior = Config.load(paths.config_file)
+            except ConfigInvalid:
+                # Invalid prior input is replaceable only when no durable work
+                # depends on proving that input's identity and cluster hosts.
+                prior = None
+        _validate_setup_scope(prior, candidate, jobs, operations)
+
+        # Key choice is authoritative only under the same exclusive lock that
+        # serializes other setup invocations.
+        existing_key = _existing_ssh_key(paths)
+        planned_identity = (
+            existing_key[1] if existing_key else "~/.ssh/id_ed25519_hpc_alloc"
+        )
+        text, committed_candidate = _validated_initial_config(
+            netid,
+            cluster,
+            host,
+            planned_identity,
+        )
+        _validate_setup_scope(prior, committed_candidate, jobs, operations)
+
+        public_key, identity_file = _find_or_create_ssh_key(paths)
+        if identity_file != planned_identity:
+            raise StateConflict("SSH key selection changed during setup; rerun setup")
+        try:
+            encoded_key = public_key.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError) as exc:
+            raise ConfigInvalid(f"cannot read SSH public key {public_key}: {exc}") from exc
+        if not encoded_key:
+            raise ConfigInvalid(f"SSH public key {public_key} is empty")
+
+        repository.get_or_create_machine_id(machine_host())
+        atomic_write_600(paths.config_file, text)
+        sync_managed_config(
+            config_path=paths.config_file,
+            repository=repository,
+            managed_path=paths.managed_ssh_config,
+            lock_path=paths.ssh_config_lock,
+            known_hosts=paths.known_hosts,
+        )
+        ensure_include(paths.user_ssh_config)
     info(f"configured cluster {cluster!r} ({host}) for NetID {netid!r}")
     print("Your SSH public key:")
     print("  " + encoded_key)
@@ -553,9 +734,9 @@ def _assessment_payload(job: Any, assessment: Any) -> dict[str, Any]:
     }
 
 
-def cmd_status(
-    args: Any, *, ctx: Any, paths: AppPaths, entrypoint: Path, **_kwargs: Any
-) -> int:
+def _reconcile_status(
+    *, ctx: Any, paths: AppPaths, entrypoint: Path
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     from .errors import AuthRequired, HostKeyChanged, SchedulerUnavailable
     from .monitor import JobMonitor, persist_assessment
     from .ssh import AuthMode
@@ -712,7 +893,18 @@ def cmd_status(
         }
         for op in ctx.state.list_unresolved_operations()
     ]
-    _sync_ssh_projection(ctx, paths)
+    return rows, discovered, operations
+
+
+def cmd_status(
+    args: Any, *, ctx: Any, paths: AppPaths, entrypoint: Path, **_kwargs: Any
+) -> int:
+    with _ssh_projection_scope(ctx, paths):
+        rows, discovered, operations = _reconcile_status(
+            ctx=ctx,
+            paths=paths,
+            entrypoint=entrypoint,
+        )
     if args.json:
         print(
             json.dumps(
@@ -819,18 +1011,66 @@ def _submit_job(
         slurm_comment=spec.comment,
         resources=resources,
     )
+    result: Any | None = None
+    dispatch_may_have_started = True
     try:
-        result = client.submit(spec, auth=AuthMode.NONINTERACTIVE)
-    except (AuthRequired, HostKeyChanged) as exc:
-        # These typed SSH failures prove the mutation was never dispatched.
-        ctx.state.fail_submission(operation_id, str(exc))
+        try:
+            result = client.submit(spec, auth=AuthMode.NONINTERACTIVE)
+        except (AuthRequired, HostKeyChanged) as exc:
+            # These typed SSH failures prove the mutation was never dispatched.
+            # Clear the dispatch flag before the local failure write so an
+            # interrupt there cannot turn definitive pre-dispatch evidence
+            # into a false ambiguous-submit warning.
+            dispatch_may_have_started = False
+            ctx.state.fail_submission(operation_id, str(exc))
+            raise
+        except AmbiguousSubmission as exc:
+            guidance = _submission_recovery_guidance(operation_id)
+            try:
+                ctx.state.mark_submission_ambiguous(operation_id, str(exc))
+            except Exception:
+                # PREPARED is itself an unresolved, recoverable phase.  A
+                # journal problem here must not replace the no-replay
+                # instruction with a generic persistence failure.
+                pass
+            raise AmbiguousSubmission(guidance) from exc
+
+        job_id = result.job_id
+        guidance = _submission_recovery_guidance(operation_id, job_id=job_id)
+        try:
+            return ctx.state.acknowledge_submission(operation_id, job_id)
+        except Exception as exc:
+            _best_effort_mark_submission_ambiguous(
+                ctx,
+                operation_id,
+                f"Slurm acknowledged job {job_id}, but local acknowledgement failed: {exc}",
+            )
+            raise AmbiguousSubmission(guidance) from exc
+    except KeyboardInterrupt:
+        if not dispatch_may_have_started:
+            raise
+        # This outer guard covers the entire post-dispatch region, including
+        # the narrow interval after submit returns and before acknowledgement
+        # handling starts.  Recover a trusted job ID when the reply made it
+        # back, but never let diagnostic inspection replace the interrupt.
+        job_id = None
+        if result is not None:
+            try:
+                job_id = result.job_id
+            except BaseException:
+                pass
+        guidance = _submission_recovery_guidance(operation_id, job_id=job_id)
+        # Guidance must be visible before a journal failure can prevent the
+        # ambiguity marker from being written.
+        info(guidance)
+        detail = "submission was interrupted after remote dispatch may have started"
+        if job_id is not None:
+            detail = (
+                f"Slurm acknowledged job {job_id}, but local acknowledgement "
+                "was interrupted"
+            )
+        _best_effort_mark_submission_ambiguous(ctx, operation_id, detail)
         raise
-    except AmbiguousSubmission as exc:
-        ctx.state.mark_submission_ambiguous(operation_id, str(exc))
-        raise AmbiguousSubmission(
-            f"submission {operation_id} may have committed; run `hpc-alloc recover {operation_id}`"
-        ) from exc
-    return ctx.state.acknowledge_submission(operation_id, result.job_id)
 
 
 def _persist_and_render(ctx: Any, paths: AppPaths, job: Any, assessment: Any) -> Any:
@@ -839,6 +1079,104 @@ def _persist_and_render(ctx: Any, paths: AppPaths, job: Any, assessment: Any) ->
     updated = persist_assessment(ctx.state, job, assessment)
     _sync_ssh_projection(ctx, paths)
     return updated
+
+
+def _persist_reconciled_assessment(
+    *,
+    ctx: Any,
+    paths: AppPaths,
+    client: Any,
+    job: Any,
+    assessment: Any,
+    monotonic_evidence: Any | None = None,
+) -> tuple[Any, Any, Any | None]:
+    """Persist lifecycle evidence, replacing stale policy after revision races.
+
+    The first candidate may have been collected by a long-lived follower.  If
+    its source revision changed, that candidate is never retried.  Each later
+    candidate comes from a fresh exact scheduler assessment seeded only with
+    durable authority and the follower's monotonic start/last-node evidence.
+    """
+
+    from .monitor import JobMonitor
+    from .ssh import AuthMode
+
+    source = job
+    candidate = assessment
+    fresh_tracker = None
+    evidence = monotonic_evidence or assessment
+    monotonic_started = bool(evidence.ever_started)
+    monotonic_last_node = evidence.last_node
+    while True:
+        try:
+            updated = _persist_and_render(ctx, paths, source, candidate)
+        except LifecycleRevisionConflict:
+            durable = ctx.state.get_job(job.operation_id)
+            seeded = replace(
+                durable,
+                ever_started=(durable.ever_started or monotonic_started),
+                last_node=(durable.last_node or monotonic_last_node),
+            )
+            fresh_tracker = JobMonitor.tracker(seeded)
+            candidate = JobMonitor(client).assess(
+                seeded,
+                auth=AuthMode.NONINTERACTIVE,
+                tracker=fresh_tracker,
+            ).assessment
+            monotonic_started = monotonic_started or candidate.ever_started
+            if candidate.last_node:
+                monotonic_last_node = candidate.last_node
+            source = seeded
+            continue
+        if updated.phase is JobPhase.FINAL:
+            authoritative_tracker = JobMonitor.tracker(updated)
+            return (
+                updated,
+                authoritative_tracker.assessment,
+                authoritative_tracker if fresh_tracker is not None else None,
+            )
+        return updated, candidate, fresh_tracker
+
+
+def _follow_with_reconciliation(
+    *,
+    ctx: Any,
+    paths: AppPaths,
+    client: Any,
+    job: Any,
+    follower: Any,
+) -> tuple[Any, Any]:
+    """Follow and persist until one reconciled final assessment is durable."""
+
+    source = job
+    while True:
+        outcome = follower.follow()
+        updated, assessment, fresh_tracker = _persist_reconciled_assessment(
+            ctx=ctx,
+            paths=paths,
+            client=client,
+            job=source,
+            assessment=outcome.assessment,
+            monotonic_evidence=outcome.assessment,
+        )
+        if assessment.final:
+            if fresh_tracker is not None:
+                # The stale terminal path drained before its CAS failed.  A
+                # requeue may have appended or restarted the log while the
+                # fresh scheduler assessment was collected, so drain once
+                # more from the preserved offset under durable authority.
+                follower.rebase(fresh_tracker)
+                follower.drain()
+            return updated, assessment
+        # Only a lifecycle revision race can turn follow()'s terminal result
+        # back into a live assessment.  Continue on the same follower so its
+        # byte offset and counters remain attached to the stream.
+        if fresh_tracker is None:
+            from .monitor import JobMonitor
+
+            fresh_tracker = JobMonitor.tracker(updated)
+        follower.rebase(fresh_tracker)
+        source = updated
 
 
 def cmd_up(
@@ -931,55 +1269,121 @@ def _remote_home(ctx: Any, client: Any, cluster: str) -> str:
     return home
 
 
+def _cancellation_lifecycle_evidence(
+    assessment: Any,
+    *,
+    cancellation_detail: str | None = None,
+) -> dict[str, Any]:
+    """Translate one canonical assessment into repository merge arguments."""
+
+    provenance = assessment.evidence_provenance
+    evidence_detail = (assessment.detail or None) if provenance is not None else None
+    if cancellation_detail is not None and provenance is None:
+        provenance = EvidenceProvenance.CANCELLATION
+        evidence_detail = cancellation_detail
+    evidence = {
+        # False is lack of evidence, not evidence that a durable True is wrong.
+        "ever_started": True if assessment.ever_started else None,
+        "last_node": assessment.last_node,
+        "observation_epoch": assessment.observation_epoch,
+    }
+    if provenance is not None:
+        evidence["evidence_provenance"] = provenance
+        evidence["evidence_detail"] = evidence_detail
+    return evidence
+
+
 def _cancel_record(ctx: Any, client: Any, job: Any) -> Any:
     from .errors import ProtocolViolation, SchedulerUnavailable
+    from .lifecycle import EvidenceEvent
+    from .monitor import JobMonitor
     from .slurm import CancellationInspectionStatus, CancellationStatus
 
     if job.ref is None:
         raise StateConflict("cannot cancel a submission without a confirmed Slurm job ID")
     operation = ctx.state.begin_cancel(job.operation_id)
-    try:
-        inspection = client.inspect_cancel(job.ref)
-    except HpcAllocError as exc:
-        ctx.state.fail_cancel_operation(operation.operation_id, str(exc))
-        raise
+    current = job
+    while True:
+        assert current.ref is not None
+        try:
+            inspection = client.inspect_cancel(current.ref)
+        except HpcAllocError as exc:
+            ctx.state.fail_cancel_operation(operation.operation_id, str(exc))
+            raise
 
-    if inspection.status == CancellationInspectionStatus.ALREADY_FINAL:
-        record = inspection.final_record
-        if record is None:
-            detail = "cancellation inspection omitted its final accounting record"
-            ctx.state.fail_cancel_operation(operation.operation_id, detail)
-            raise ProtocolViolation(detail)
-        ctx.state.resolve_operation(
-            operation.operation_id,
-            final_source=FinalSource.ACCOUNTING,
-            detail=inspection.detail,
-            terminal_state=record.state,
-            exit_code=record.exit_code,
-        )
-        return inspection
-    if inspection.status == CancellationInspectionStatus.CONFIRMED_ABSENT:
-        ctx.state.resolve_cancel_departed(
-            operation.operation_id,
-            detail=inspection.detail or "job absence was confirmed before cancellation",
-        )
-        return inspection
-    if inspection.status == CancellationInspectionStatus.IDENTITY_MISMATCH:
-        ctx.state.fail_cancel_operation(
-            operation.operation_id,
-            inspection.detail or "job identity changed before cancellation",
-        )
-        raise IdentityMismatch(inspection.detail)
-    if inspection.status != CancellationInspectionStatus.READY:
-        detail = f"unsupported cancellation inspection status {inspection.status}"
-        ctx.state.fail_cancel_operation(operation.operation_id, detail)
-        raise ProtocolViolation(detail)
+        tracker = JobMonitor.tracker(current)
+        assessment = tracker.assessment
+        try:
+            if inspection.status == CancellationInspectionStatus.ALREADY_FINAL:
+                record = inspection.final_record
+                if record is None:
+                    detail = "cancellation inspection omitted its final accounting record"
+                    ctx.state.fail_cancel_operation(operation.operation_id, detail)
+                    raise ProtocolViolation(detail)
+                tracker.begin_observation_epoch()
+                assessment = tracker.accept(EvidenceEvent.final(record))
+                ctx.state.resolve_operation(
+                    operation.operation_id,
+                    final_source=assessment.final_source or FinalSource.ACCOUNTING,
+                    expected_target_updated_at=current.updated_at,
+                    detail=inspection.detail,
+                    terminal_state=assessment.terminal_state,
+                    exit_code=assessment.exit_code,
+                    **_cancellation_lifecycle_evidence(assessment),
+                )
+                return inspection
+            if inspection.status == CancellationInspectionStatus.CONFIRMED_ABSENT:
+                ctx.state.resolve_cancel_departed(
+                    operation.operation_id,
+                    detail=(
+                        inspection.detail
+                        or "job absence was confirmed before cancellation"
+                    ),
+                    expected_target_updated_at=current.updated_at,
+                )
+                return inspection
+            if inspection.status == CancellationInspectionStatus.IDENTITY_MISMATCH:
+                ctx.state.fail_cancel_operation(
+                    operation.operation_id,
+                    inspection.detail or "job identity changed before cancellation",
+                )
+                raise IdentityMismatch(inspection.detail)
+            if inspection.status != CancellationInspectionStatus.READY:
+                detail = f"unsupported cancellation inspection status {inspection.status}"
+                ctx.state.fail_cancel_operation(operation.operation_id, detail)
+                raise ProtocolViolation(detail)
 
-    # Commit the may-have-run state before crossing the mutation boundary.
-    # A crash can now create only a false ambiguity, never a false-safe retry.
-    ctx.state.mark_cancel_dispatching(operation.operation_id)
+            # The real Slurm adapter always returns the exact row that
+            # authorized this cancellation.  The optional field keeps
+            # compatibility for callers constructing the public result type.
+            if inspection.queue_row is not None:
+                tracker.begin_observation_epoch()
+                assessment = tracker.accept(EvidenceEvent.queue(inspection.queue_row))
+
+            # Commit the may-have-run state immediately before the mutation.
+            # A revision race rolls this transaction back to CANCEL_PENDING,
+            # so it is safe to discard the inspection and repeat read-only
+            # preflight.  Once this commits, execute_cancel must run once.
+            dispatch_evidence = _cancellation_lifecycle_evidence(assessment)
+            if not assessment.uncertain:
+                dispatch_evidence["phase"] = JobPhase(assessment.phase.value)
+                dispatch_evidence["current_node"] = assessment.current_node
+            ctx.state.mark_cancel_dispatching(
+                operation.operation_id,
+                expected_target_updated_at=current.updated_at,
+                terminal_state=assessment.terminal_state,
+                exit_code=assessment.exit_code,
+                **dispatch_evidence,
+            )
+        except LifecycleRevisionConflict:
+            current = ctx.state.get_job(job.operation_id)
+            continue
+        dispatch_ref = current.ref
+        break
+
+    assert dispatch_ref is not None
     try:
-        outcome = client.execute_cancel(job.ref)
+        outcome = client.execute_cancel(dispatch_ref)
     except (AuthRequired, HostKeyChanged) as exc:
         # The adapter preserves these only when guarded cancellation never
         # crossed the remote dispatch boundary.
@@ -1096,7 +1500,13 @@ def cmd_run(
         info=info,
     )
     try:
-        outcome = follower.follow()
+        updated, assessment = _follow_with_reconciliation(
+            ctx=ctx,
+            paths=paths,
+            client=client,
+            job=job,
+            follower=follower,
+        )
     except BrokenPipeError:
         info(f"output pipe closed — cancelling foreground job {cluster}:{job.job_id}")
         try:
@@ -1111,10 +1521,9 @@ def cmd_run(
         except HpcAllocError as exc:
             info(f"could not confirm cancellation: {exc}")
         raise
-    updated = _persist_and_render(ctx, paths, job, outcome.assessment)
-    state = (outcome.assessment.terminal_state or "").split()[0].rstrip("+")
-    if outcome.assessment.exit_code and ":" in outcome.assessment.exit_code:
-        code = int(outcome.assessment.exit_code.split(":", 1)[0])
+    state = (assessment.terminal_state or "").split()[0].rstrip("+")
+    if assessment.exit_code and ":" in assessment.exit_code:
+        code = int(assessment.exit_code.split(":", 1)[0])
     else:
         code = 0 if state == "COMPLETED" else 1
     if not state:
@@ -1156,10 +1565,10 @@ def cmd_cancel(
         args.target,
         explicit_cluster=args.cluster,
     )
-    transport, client = _services(ctx, paths, entrypoint, job.cluster)
-    transport.bootstrap(job.cluster)
-    outcome = _cancel_record(ctx, client, job)
-    _sync_ssh_projection(ctx, paths)
+    with _ssh_projection_scope(ctx, paths):
+        transport, client = _services(ctx, paths, entrypoint, job.cluster)
+        transport.bootstrap(job.cluster)
+        outcome = _cancel_record(ctx, client, job)
     info(f"{outcome.status.value.lower().replace('_', ' ')}: {job.cluster}:{job.job_id}")
     return 0
 
@@ -1208,34 +1617,30 @@ def cmd_down(
         info("no matching active allocations")
         return 0
     failed = 0
-    for job in jobs:
-        try:
-            transport, client = _services(ctx, paths, entrypoint, job.cluster)
-            transport.bootstrap(job.cluster)
-            outcome = _cancel_record(ctx, client, job)
-            info(
-                f"{outcome.status.value.lower().replace('_', ' ')} allocation "
-                f"{job.cluster}:{job.logical_name} ({job.job_id})"
-            )
-        except (AuthRequired, HostKeyChanged) as exc:
-            info(f"could not release {job.cluster}:{job.logical_name}: {exc}")
-            # Security/authentication failures are not best-effort scheduler
-            # errors.  Stop before touching another allocation, but project
-            # any state changes made for earlier jobs first.
+    successes: list[str] = []
+    with _ssh_projection_scope(ctx, paths):
+        for job in jobs:
             try:
-                _sync_ssh_projection(ctx, paths)
-            except HpcAllocError as sync_exc:
-                # Projection is derived state.  Report a projection failure,
-                # but do not replace the security/authentication failure that
-                # stopped the cancellation loop.
-                info(f"could not update managed SSH config: {sync_exc}")
-            raise
-        except HpcAllocError as exc:
-            failed += 1
-            info(f"could not release {job.cluster}:{job.logical_name}: {exc}")
-            if not args.all:
+                transport, client = _services(ctx, paths, entrypoint, job.cluster)
+                transport.bootstrap(job.cluster)
+                outcome = _cancel_record(ctx, client, job)
+                successes.append(
+                    f"{outcome.status.value.lower().replace('_', ' ')} allocation "
+                    f"{job.cluster}:{job.logical_name} ({job.job_id})"
+                )
+            except (AuthRequired, HostKeyChanged) as exc:
+                info(f"could not release {job.cluster}:{job.logical_name}: {exc}")
+                # Security/authentication failures are not best-effort
+                # scheduler errors.  Stop before touching another allocation;
+                # the projection scope repairs state changed by earlier jobs.
                 raise
-    _sync_ssh_projection(ctx, paths)
+            except HpcAllocError as exc:
+                failed += 1
+                info(f"could not release {job.cluster}:{job.logical_name}: {exc}")
+                if not args.all:
+                    raise
+    for message in successes:
+        info(message)
     return 1 if failed else 0
 
 
@@ -1313,7 +1718,13 @@ def cmd_logs(
         info=info,
     )
     try:
-        outcome = follower.follow()
+        _updated, assessment = _follow_with_reconciliation(
+            ctx=ctx,
+            paths=paths,
+            client=client,
+            job=job,
+            follower=follower,
+        )
     except BrokenPipeError:
         info(
             f"output pipe closed — detached; job {job.cluster}:{job.job_id} continues "
@@ -1326,16 +1737,15 @@ def cmd_logs(
             f"(reattach: hpc-alloc logs {job.cluster}:{job.job_id} -f)"
         )
         raise
-    _persist_and_render(ctx, paths, job, outcome.assessment)
-    if outcome.assessment.terminal_state:
-        info(f"job {job.job_id} ended: {outcome.assessment.terminal_state}")
+    if assessment.terminal_state:
+        info(f"job {job.job_id} ended: {assessment.terminal_state}")
     return 0
 
 
 def cmd_why(
     args: Any, *, ctx: Any, paths: AppPaths, entrypoint: Path, **_kwargs: Any
 ) -> int:
-    from .lifecycle import AssessmentPhase
+    from .lifecycle import AssessmentPhase, EvidenceEvent
     from .monitor import JobMonitor
     from .ssh import AuthMode
 
@@ -1371,8 +1781,56 @@ def cmd_why(
     else:
         transport, client = _services(ctx, paths, entrypoint, job.cluster)
         transport.bootstrap(job.cluster, AuthMode.INTERACTIVE_BOOTSTRAP)
+        queue_final_input = (
+            job.phase is JobPhase.FINAL
+            and job.final_source is FinalSource.CONFIRMED_QUEUE
+        )
         assessment = JobMonitor(client).assess(job, auth=AuthMode.NONINTERACTIVE).assessment
-        job = _persist_and_render(ctx, paths, job, assessment)
+        job, assessment, _tracker = _persist_reconciled_assessment(
+            ctx=ctx,
+            paths=paths,
+            client=client,
+            job=job,
+            assessment=assessment,
+            monotonic_evidence=assessment,
+        )
+
+        # A queue-derived final may predate slurmdbd.  Retry exact accounting,
+        # route any delayed record through the canonical lifecycle tracker, and
+        # make that stronger authority durable before constructing output.
+        accounting_record = None
+        if assessment.final and (
+            job.final_source is FinalSource.CONFIRMED_QUEUE
+            or (queue_final_input and job.final_source is FinalSource.ACCOUNTING)
+        ):
+            record = client.final(
+                job.ref,
+                attempts=(0, 2, 2),
+                auth=AuthMode.NONINTERACTIVE,
+                extra_fields=("Elapsed", "Timelimit"),
+            )
+            if record is not None:
+                if job.final_source is FinalSource.CONFIRMED_QUEUE:
+                    tracker = JobMonitor.tracker(job)
+                    enriched = tracker.accept(EvidenceEvent.final(record))
+                    job, assessment, _tracker = _persist_reconciled_assessment(
+                        ctx=ctx,
+                        paths=paths,
+                        client=client,
+                        job=job,
+                        assessment=enriched,
+                        monotonic_evidence=enriched,
+                    )
+                if (
+                    assessment.final
+                    and job.final_source is FinalSource.ACCOUNTING
+                    and assessment.terminal_state == record.state
+                    and assessment.exit_code == record.exit_code
+                ):
+                    accounting_record = record
+
+        # Build every durable field only after reconciliation so phase,
+        # terminal state, source, exit code, and diagnosis share one authority.
         result = _assessment_payload(job, assessment)
         result["status"] = assessment.phase.value
         detail: list[str] = []
@@ -1402,29 +1860,15 @@ def cmd_why(
         elif assessment.phase in {AssessmentPhase.STARTED_INACTIVE, AssessmentPhase.REQUEUEING}:
             diagnosis = f"{state or assessment.phase.value}; previously started and may run again"
         elif assessment.final:
-            # Accounting and local final verdicts are already durable.  Only
-            # a queue-confirmed final can benefit from exact accounting
-            # enrichment; querying by a recycled numeric ID must not replace
-            # or invalidate stronger persisted history.
-            record = None
-            if job.final_source is FinalSource.CONFIRMED_QUEUE:
-                record = client.final(
-                    job.ref,
-                    attempts=(0, 2, 2),
-                    auth=AuthMode.NONINTERACTIVE,
-                    extra_fields=("Elapsed", "Timelimit"),
-                )
-            final_state = record.state if record else assessment.terminal_state
+            final_state = assessment.terminal_state
             diagnosis = (
                 f"final state {final_state}"
                 if final_state
                 else assessment.detail or "final state unknown"
             )
-            if record:
-                result["exit_code"] = record.exit_code
-                if record.extra:
-                    result["elapsed"] = record.extra[0]
-                    result["timelimit"] = record.extra[1]
+            if accounting_record is not None and len(accounting_record.extra) >= 2:
+                result["elapsed"] = accounting_record.extra[0]
+                result["timelimit"] = accounting_record.extra[1]
             if assessment.log_eligible:
                 try:
                     tail = client.tail_log(_job_log_path(job), 15).decode(errors="replace").splitlines()
@@ -1613,30 +2057,40 @@ def _recover_cancel(ctx: Any, client: Any | None, operation: Any, job: Any) -> b
     if client is None:
         raise StateConflict("ambiguous cancellation recovery requires a read-only scheduler client")
 
-    # JobMonitor performs only exact queue/accounting reads.  Its confirmation
-    # rule requires either authoritative final accounting or two conclusive
-    # observations before producing a final verdict.
-    assessment = JobMonitor(client).assess(
-        job,
-        auth=AuthMode.NONINTERACTIVE,
-        confirm=True,
-    ).assessment
-    if not assessment.final:
-        observed = assessment.scheduler_state or assessment.phase.value
-        ctx.state.mark_cancel_ambiguous(
-            operation.operation_id,
-            f"read-only recovery remains inconclusive ({observed})",
-        )
-        return False
-    if assessment.final_source is None:
-        raise ProtocolViolation("final cancellation recovery evidence lacks provenance")
-    ctx.state.resolve_operation(
-        operation.operation_id,
-        final_source=assessment.final_source,
-        detail="read-only cancellation recovery confirmed the job is final",
-        terminal_state=assessment.terminal_state,
-        exit_code=assessment.exit_code,
-    )
+    # JobMonitor performs only exact queue/accounting reads.  If another
+    # observer advances the target before the atomic resolution, discard the
+    # stale verdict and assess the fresh durable revision.  Recovery remains
+    # read-only throughout and never replays the cancellation mutation.
+    current = job
+    while True:
+        assessment = JobMonitor(client).assess(
+            current,
+            auth=AuthMode.NONINTERACTIVE,
+            confirm=True,
+        ).assessment
+        if not assessment.final:
+            observed = assessment.scheduler_state or assessment.phase.value
+            ctx.state.mark_cancel_ambiguous(
+                operation.operation_id,
+                f"read-only recovery remains inconclusive ({observed})",
+            )
+            return False
+        if assessment.final_source is None:
+            raise ProtocolViolation("final cancellation recovery evidence lacks provenance")
+        try:
+            ctx.state.resolve_operation(
+                operation.operation_id,
+                final_source=assessment.final_source,
+                expected_target_updated_at=current.updated_at,
+                detail="read-only cancellation recovery confirmed the job is final",
+                terminal_state=assessment.terminal_state,
+                exit_code=assessment.exit_code,
+                **_cancellation_lifecycle_evidence(assessment),
+            )
+        except LifecycleRevisionConflict:
+            current = ctx.state.get_job(job.operation_id)
+            continue
+        break
     info(f"recovered final cancellation {operation.cluster}:{operation.job_id}")
     return True
 
@@ -1644,59 +2098,83 @@ def _recover_cancel(ctx: Any, client: Any | None, operation: Any, job: Any) -> b
 def cmd_recover(
     args: Any, *, ctx: Any, paths: AppPaths, entrypoint: Path, **_kwargs: Any
 ) -> int:
-    operations = ctx.state.list_unresolved_operations()
     if args.operation_id:
-        operations = [op for op in operations if op.operation_id == args.operation_id]
-        if not operations:
-            raise RecordNotFound(f"unresolved operation {args.operation_id!r} does not exist")
-    if args.cluster:
-        ctx.config.resolve_cluster(args.cluster)
-        operations = [op for op in operations if op.cluster == args.cluster]
-    if not operations:
-        info("no unresolved operations")
-        return 0
-    if args.abandon:
-        if args.operation_id is None or len(operations) != 1:
-            raise StateConflict("--abandon requires one explicit operation ID")
-        operation = operations[0]
-        if not args.yes:
-            if not sys.stdin.isatty():
-                raise StateConflict("--abandon requires --yes without a terminal")
-            answer = input(
-                f"Abandon {operation.operation_id}? A remote orphan may remain [y/N]: "
-            ).strip().lower()
-            if answer not in {"y", "yes"}:
-                info("not abandoned")
-                return 1
-        ctx.state.abandon_operation(
-            operation.operation_id,
-            "explicitly abandoned; remote side effect was not changed",
-        )
-        info(f"abandoned local operation {operation.operation_id}")
-        return 0
-    unresolved = 0
-    for operation in operations:
-        job = ctx.state.get_job(operation.target_job_operation_id)
-        if (
-            operation.kind == OperationKind.CANCEL
-            and operation.phase is OperationPhase.CANCEL_PENDING
-        ):
-            resolved = _recover_cancel(ctx, None, operation, job)
-        else:
-            transport, client = _services(ctx, paths, entrypoint, operation.cluster)
-            transport.bootstrap(operation.cluster)
-            if operation.kind == OperationKind.SUBMIT:
-                resolved = _recover_submission(ctx, client, operation, job)
-            else:
-                resolved = _recover_cancel(ctx, client, operation, job)
-        if not resolved:
-            unresolved += 1
+        operation = ctx.state.get_operation(args.operation_id)
+        if args.cluster:
+            requested_cluster = ctx.config.resolve_cluster(args.cluster)
+            if operation.cluster != requested_cluster:
+                raise IdentityMismatch(
+                    f"operation {operation.operation_id} belongs to cluster "
+                    f"{operation.cluster!r}, not requested cluster {requested_cluster!r}"
+                )
+        operations = [operation]
+    else:
+        operations = ctx.state.list_unresolved_operations()
+        if args.cluster:
+            requested_cluster = ctx.config.resolve_cluster(args.cluster)
+            operations = [
+                operation
+                for operation in operations
+                if operation.cluster == requested_cluster
+            ]
+
+    with _ssh_projection_scope(ctx, paths):
+        if args.operation_id and not operations[0].unresolved:
+            operation = operations[0]
+            if args.abandon:
+                raise StateConflict(
+                    f"operation {operation.operation_id} is not unresolved "
+                    f"(durable phase {operation.phase.value})"
+                )
             info(
-                f"operation {operation.operation_id} remains unresolved; "
-                "no conclusive remote outcome found"
+                f"operation {operation.operation_id} is already resolved "
+                f"with durable phase {operation.phase.value}"
             )
-    _sync_ssh_projection(ctx, paths)
-    return 1 if unresolved else 0
+            return 0
+        if not operations:
+            info("no unresolved operations")
+            return 0
+        if args.abandon:
+            if args.operation_id is None or len(operations) != 1:
+                raise StateConflict("--abandon requires one explicit operation ID")
+            operation = operations[0]
+            if not args.yes:
+                if not sys.stdin.isatty():
+                    raise StateConflict("--abandon requires --yes without a terminal")
+                answer = input(
+                    f"Abandon {operation.operation_id}? A remote orphan may remain [y/N]: "
+                ).strip().lower()
+                if answer not in {"y", "yes"}:
+                    info("not abandoned")
+                    return 1
+            ctx.state.abandon_operation(
+                operation.operation_id,
+                "explicitly abandoned; remote side effect was not changed",
+            )
+            info(f"abandoned local operation {operation.operation_id}")
+            return 0
+        unresolved = 0
+        for operation in operations:
+            job = ctx.state.get_job(operation.target_job_operation_id)
+            if (
+                operation.kind == OperationKind.CANCEL
+                and operation.phase is OperationPhase.CANCEL_PENDING
+            ):
+                resolved = _recover_cancel(ctx, None, operation, job)
+            else:
+                transport, client = _services(ctx, paths, entrypoint, operation.cluster)
+                transport.bootstrap(operation.cluster)
+                if operation.kind == OperationKind.SUBMIT:
+                    resolved = _recover_submission(ctx, client, operation, job)
+                else:
+                    resolved = _recover_cancel(ctx, client, operation, job)
+            if not resolved:
+                unresolved += 1
+                info(
+                    f"operation {operation.operation_id} remains unresolved; "
+                    "no conclusive remote outcome found"
+                )
+        return 1 if unresolved else 0
 
 
 HANDLERS: dict[str, Callable[..., int]] = {
@@ -1723,5 +2201,13 @@ def dispatch(args: Any, *, entrypoint: Path) -> int:
     handler = HANDLERS[args.command_name]
     if args.command_name == "setup":
         return handler(args, paths=paths, entrypoint=entrypoint)
-    ctx = _load_context(args, paths)
-    return handler(args, ctx=ctx, paths=paths, entrypoint=entrypoint)
+    lock_free = args.command_name == "config" or (
+        args.command_name in {"up", "run"}
+        and getattr(args, "dry_run", False)
+    )
+    if lock_free:
+        ctx = _load_context(args, paths)
+        return handler(args, ctx=ctx, paths=paths, entrypoint=entrypoint)
+    with configuration_scope_lock(paths.config_scope_lock, exclusive=False):
+        ctx = _load_context(args, paths)
+        return handler(args, ctx=ctx, paths=paths, entrypoint=entrypoint)

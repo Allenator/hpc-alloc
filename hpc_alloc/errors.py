@@ -33,6 +33,10 @@ class StateConflict(HpcAllocError):
     """A requested mutation conflicts with durable state or an active intent."""
 
 
+class LifecycleRevisionConflict(StateConflict):
+    """Scheduler evidence was collected against an outdated job revision."""
+
+
 class RecordNotFound(HpcAllocError):
     """A requested durable job or operation does not exist."""
 

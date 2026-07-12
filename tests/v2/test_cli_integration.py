@@ -9,6 +9,7 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 
+from hpc_alloc.config import Config
 from hpc_alloc.state import SCHEMA_VERSION
 
 
@@ -78,11 +79,50 @@ class CliIntegrationTests(unittest.TestCase):
         self.write_config()
         for arguments in (
             ("up", "--dry-run", "--time", "1:99"),
+            ("up", "--dry-run", "--time", "90 "),
+            ("up", "--dry-run", "--time", "90;--constraint=evil"),
             ("run", "--dry-run", "--gpus", "h200:0", "--", "true"),
         ):
             with self.subTest(arguments=arguments):
                 result = self.run_cli(*arguments)
                 self.assertEqual(result.returncode, 1)
+                self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse((self.home / ".config" / "hpc-alloc" / "state.db").exists())
+
+    def test_all_documented_duration_forms_are_accepted_as_cli_overrides(self) -> None:
+        self.write_config()
+        for duration in (
+            "90",
+            "90:30",
+            "4:30:00",
+            "2-00",
+            "2-04:30",
+            "2-04:30:00",
+        ):
+            with self.subTest(duration=duration):
+                result = self.run_cli(
+                    "up", "--dry-run", "--name", "duration", "--time", duration
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"--time={duration}", result.stdout)
+        self.assertFalse((self.home / ".config" / "hpc-alloc" / "state.db").exists())
+
+    def test_all_zero_duration_forms_are_rejected_as_cli_overrides(self) -> None:
+        self.write_config()
+        for duration in (
+            "0",
+            "0:00",
+            "0:00:00",
+            "0-0",
+            "0-0:00",
+            "0-0:00:00",
+        ):
+            with self.subTest(duration=duration):
+                result = self.run_cli(
+                    "up", "--dry-run", "--name", "duration", "--time", duration
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("Slurm duration", result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
         self.assertFalse((self.home / ".config" / "hpc-alloc" / "state.db").exists())
 
@@ -117,6 +157,49 @@ class CliIntegrationTests(unittest.TestCase):
             self.assertIsNotNone(
                 connection.execute("SELECT machine_id FROM machine").fetchone()[0]
             )
+
+    def test_concurrent_setups_serialize_and_waiter_rechecks_existing_config(self) -> None:
+        ssh = self.home / ".ssh"
+        ssh.mkdir(mode=0o700)
+        (ssh / "id_ed25519").write_text("fake private key\n")
+        (ssh / "id_ed25519.pub").write_text(
+            "ssh-ed25519 AAAATEST user@test\n"
+        )
+        command = [
+            str(CLI),
+            "setup",
+            "--netid",
+            "ab1234",
+            "--cluster",
+            "grace",
+            "--host",
+            "grace.example.edu",
+        ]
+        processes = [
+            subprocess.Popen(
+                command,
+                cwd=REPO,
+                env=self.environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for _ in range(2)
+        ]
+        results = [process.communicate(timeout=10) for process in processes]
+
+        self.assertEqual(sorted(process.returncode for process in processes), [0, 1])
+        failed_stderr = next(
+            stderr
+            for process, (_stdout, stderr) in zip(processes, results, strict=True)
+            if process.returncode == 1
+        )
+        self.assertIn("configuration already exists", failed_stderr)
+        configured = Config.load(
+            self.home / ".config" / "hpc-alloc" / "config.toml"
+        )
+        self.assertEqual(configured.identity.netid, "ab1234")
 
     def test_invalid_setup_preflight_creates_no_key_or_state(self) -> None:
         result = self.run_cli(

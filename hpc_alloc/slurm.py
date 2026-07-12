@@ -242,6 +242,7 @@ class CancellationInspection:
     status: CancellationInspectionStatus
     detail: str = ""
     final_record: AccountingRecord | None = None
+    queue_row: QueueRow | None = None
 
 
 class CancellationStatus(StrEnum):
@@ -925,7 +926,10 @@ class SlurmClient:
                     str(exc),
                 )
             if row is not None:
-                return CancellationInspection(CancellationInspectionStatus.READY)
+                return CancellationInspection(
+                    CancellationInspectionStatus.READY,
+                    queue_row=row,
+                )
             try:
                 record = self.final(ref, auth=auth)
             except IdentityMismatch as exc:

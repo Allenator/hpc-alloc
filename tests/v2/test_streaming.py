@@ -301,7 +301,11 @@ class StreamingTests(unittest.TestCase):
         output = io.BytesIO()
         script = StrictScript(
             [
-                ExpectedCall("observe", result=row("RUNNING", node="node01"), args=(self.ref,)),
+                ExpectedCall(
+                    "observe",
+                    result=row("RUNNING", node="node01"),
+                    args=(self.ref,),
+                ),
                 ExpectedCall("log_size", result=LogSizeResult.available(5), args=(LOG_PATH,)),
                 ExpectedCall(
                     "read_log_chunk",
@@ -653,6 +657,55 @@ class StreamingTests(unittest.TestCase):
         self.assertEqual(script.count("observe"), 0)
         self.assertEqual(script.count("final"), 0)
         self.assertEqual(script.count("log_size"), 1)
+        script.assert_complete()
+
+    def test_rebase_replaces_only_lifecycle_tracker_and_preserves_stream_progress(self) -> None:
+        output = io.BytesIO()
+        script = StrictScript(
+            [
+                ExpectedCall("observe", result=row("RUNNING", node="node01"), args=(self.ref,)),
+                ExpectedCall(
+                    "log_size",
+                    result=LogSizeResult.available(5),
+                    args=(LOG_PATH,),
+                ),
+                ExpectedCall(
+                    "read_log_chunk",
+                    result=b"part\n",
+                    args=(LOG_PATH, 0),
+                    kwargs={"limit": 5},
+                ),
+                ExpectedCall("observe", result=row("PENDING"), args=(self.ref,)),
+                ExpectedCall(
+                    "log_size",
+                    result=LogSizeResult.available(5),
+                    args=(LOG_PATH,),
+                ),
+            ]
+        )
+        follower = self.follower(script, output=output)
+        follower.poll_once()
+        replacement = EvidenceTracker(
+            ever_started=True,
+            last_node="node01",
+            observation_epoch=4,
+            restart_boundary=True,
+            phase=AssessmentPhase.REQUEUEING,
+        )
+
+        follower.rebase(replacement)
+
+        self.assertIs(follower.tracker, replacement)
+        self.assertEqual(follower.offset, 5)
+        self.assertEqual(follower.total_bytes_written, 5)
+        self.assertEqual(output.getvalue(), b"part\n")
+        result = follower.poll_once()
+        self.assertEqual(result.assessment.phase, AssessmentPhase.REQUEUEING)
+        self.assertEqual(result.assessment.observation_epoch, 5)
+        self.assertEqual(result.bytes_written, 0)
+        self.assertEqual(follower.offset, 5)
+        self.assertEqual(follower.total_bytes_written, 5)
+        self.assertEqual(output.getvalue(), b"part\n")
         script.assert_complete()
 
 

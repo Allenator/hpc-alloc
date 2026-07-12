@@ -74,6 +74,18 @@ class LogFollower:
         self.total_bytes_written = 0
         self._last_note = float("-inf")
 
+    def rebase(self, tracker: EvidenceTracker) -> None:
+        """Replace lifecycle evidence without restarting the byte stream.
+
+        Reconciliation may discover that another process advanced the durable
+        job while this follower was running.  The fresh tracker becomes the
+        authority for later scheduler observations, while the existing byte
+        offset, byte counter, output stream, and notification cadence remain
+        attached to this follower.
+        """
+
+        self.tracker = tracker
+
     def _observe(self) -> tuple[QueueRow | None, JobAssessment]:
         return accept_observation(self.tracker, lambda: self.client.observe(self.ref))
 

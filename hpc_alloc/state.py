@@ -17,11 +17,16 @@ import stat
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .errors import RecordNotFound, StateConflict, StateInvalid
+from .errors import (
+    LifecycleRevisionConflict,
+    RecordNotFound,
+    StateConflict,
+    StateInvalid,
+)
 from .models import (
     EvidenceProvenance,
     FinalSource,
@@ -537,10 +542,12 @@ class StateRepository:
                     f"submission {operation_id} is already bound to a different Slurm job"
                 )
             if operation_phase is not OperationPhase.ACKNOWLEDGED:
+                job = self._require_job_row(connection, operation_id)
+                job_now = self._next_job_timestamp(now, job["updated_at"])
                 connection.execute(
                     """UPDATE jobs SET job_id = ?, phase = ?, updated_at = ?
                        WHERE operation_id = ?""",
-                    (job_id, JobPhase.QUEUED.value, now, operation_id),
+                    (job_id, JobPhase.QUEUED.value, job_now, operation_id),
                 )
                 connection.execute(
                     """UPDATE operations SET job_id = ?, phase = ?, detail = NULL,
@@ -612,6 +619,17 @@ class StateRepository:
         self,
         operation_id: str,
         detail: str = "guarded cancellation dispatch started; outcome is not yet known",
+        *,
+        expected_target_updated_at: str | None = None,
+        phase: JobPhase | str | None = None,
+        ever_started: bool | None = None,
+        current_node: str | None | object = _UNSET,
+        last_node: str | None | object = _UNSET,
+        terminal_state: str | None | object = _UNSET,
+        exit_code: str | None | object = _UNSET,
+        observation_epoch: int | None = None,
+        evidence_provenance: EvidenceProvenance | str | None | object = _UNSET,
+        evidence_detail: str | None | object = _UNSET,
     ) -> OperationRecord:
         """Make a cancel conservatively ambiguous before remote dispatch.
 
@@ -623,6 +641,21 @@ class StateRepository:
 
         self._validate_text_fields(operation_id=operation_id)
         detail = self._sanitize_detail(detail)
+        self._validate_job_update_values(
+            current_node=current_node,
+            last_node=last_node,
+            terminal_state=terminal_state,
+            exit_code=exit_code,
+        )
+        provenance, evidence_detail = self._prepare_lifecycle_evidence(
+            last_node=last_node,
+            observation_epoch=observation_epoch,
+            evidence_provenance=evidence_provenance,
+            evidence_detail=evidence_detail,
+        )
+        target_phase = phase
+        if target_phase is None and provenance is not _UNSET and provenance is not None:
+            target_phase = JobPhase.TERMINAL_CANDIDATE
         now = self._now()
         with self.transaction() as connection:
             operation = self._require_operation_row(connection, operation_id)
@@ -640,6 +673,33 @@ class StateRepository:
                     operation_id,
                 ),
             )
+            if (
+                expected_target_updated_at is not None
+                or target_phase is not None
+                or ever_started is not None
+                or current_node is not _UNSET
+                or last_node is not _UNSET
+                or terminal_state is not _UNSET
+                or exit_code is not _UNSET
+                or observation_epoch is not None
+                or provenance is not _UNSET
+                or evidence_detail is not _UNSET
+            ):
+                self._update_job_row(
+                    connection,
+                    operation["target_job_operation_id"],
+                    now=now,
+                    expected_updated_at=expected_target_updated_at,
+                    phase=target_phase,
+                    ever_started=ever_started,
+                    current_node=current_node,
+                    last_node=last_node,
+                    terminal_state=terminal_state,
+                    exit_code=exit_code,
+                    observation_epoch=observation_epoch,
+                    evidence_provenance=provenance,
+                    evidence_detail=evidence_detail,
+                )
         return self.get_operation(operation_id)
 
     def mark_cancel_ambiguous(self, operation_id: str, detail: str) -> OperationRecord:
@@ -665,9 +725,15 @@ class StateRepository:
         operation_id: str,
         *,
         final_source: FinalSource | str,
+        expected_target_updated_at: str | None = None,
         detail: str | None = None,
         terminal_state: str | None = None,
         exit_code: str | None = None,
+        ever_started: bool | None = None,
+        last_node: str | None | object = _UNSET,
+        observation_epoch: int | None = None,
+        evidence_provenance: EvidenceProvenance | str | None | object = _UNSET,
+        evidence_detail: str | None | object = _UNSET,
     ) -> OperationRecord:
         """Resolve a cancellation with durable final scheduler evidence.
 
@@ -683,8 +749,15 @@ class StateRepository:
         if source in {FinalSource.SUBMIT_FAILED, FinalSource.ABANDONED}:
             raise StateConflict("local final verdicts require their atomic operation API")
         self._validate_job_update_values(
+            last_node=last_node,
             terminal_state=terminal_state,
             exit_code=exit_code,
+        )
+        provenance, evidence_detail = self._prepare_lifecycle_evidence(
+            last_node=last_node,
+            observation_epoch=observation_epoch,
+            evidence_provenance=evidence_provenance,
+            evidence_detail=evidence_detail,
         )
         now = self._now()
         with self.transaction() as connection:
@@ -707,16 +780,28 @@ class StateRepository:
                 connection,
                 operation["target_job_operation_id"],
                 now=now,
+                expected_updated_at=expected_target_updated_at,
                 phase=JobPhase.FINAL,
+                ever_started=ever_started,
+                last_node=last_node,
                 terminal_state=terminal_state,
                 exit_code=exit_code,
+                observation_epoch=observation_epoch,
                 evidence_provenance=(
                     EvidenceProvenance.CANCELLATION
+                    if source is FinalSource.CONFIRMED_QUEUE
+                    and provenance is _UNSET
+                    else provenance
                     if source is FinalSource.CONFIRMED_QUEUE
                     else None
                 ),
                 evidence_detail=(
-                    detail if source is FinalSource.CONFIRMED_QUEUE else None
+                    detail
+                    if source is FinalSource.CONFIRMED_QUEUE
+                    and evidence_detail is _UNSET
+                    else evidence_detail
+                    if source is FinalSource.CONFIRMED_QUEUE
+                    else None
                 ),
                 final_source=source,
             )
@@ -728,9 +813,15 @@ class StateRepository:
         operation_id: str,
         detail: str | None = None,
         *,
+        expected_target_updated_at: str | None = None,
         terminal_state: str | None = None,
         exit_code: str | None = None,
         final_source: FinalSource | str | None = None,
+        ever_started: bool | None = None,
+        last_node: str | None | object = _UNSET,
+        observation_epoch: int | None = None,
+        evidence_provenance: EvidenceProvenance | str | None | object = _UNSET,
+        evidence_detail: str | None | object = _UNSET,
     ) -> OperationRecord:
         """Atomically close a cancellation and record target departure.
 
@@ -746,8 +837,24 @@ class StateRepository:
         if source in {FinalSource.SUBMIT_FAILED, FinalSource.ABANDONED}:
             raise StateConflict("local final verdicts require their atomic operation API")
         self._validate_job_update_values(
+            last_node=last_node,
             terminal_state=terminal_state,
             exit_code=exit_code,
+        )
+        provenance, evidence_detail = self._prepare_lifecycle_evidence(
+            last_node=last_node,
+            observation_epoch=observation_epoch,
+            evidence_provenance=evidence_provenance,
+            evidence_detail=evidence_detail,
+        )
+        has_explicit_lifecycle_evidence = (
+            ever_started is not None
+            or last_node is not _UNSET
+            or observation_epoch is not None
+            or provenance is not _UNSET
+            or evidence_detail is not _UNSET
+            or terminal_state is not None
+            or exit_code is not None
         )
         now = self._now()
         with self.transaction() as connection:
@@ -771,29 +878,75 @@ class StateRepository:
                     connection,
                     target_id,
                     now=now,
+                    expected_updated_at=expected_target_updated_at,
                     phase=JobPhase.FINAL,
+                    ever_started=ever_started,
+                    last_node=last_node,
                     terminal_state=terminal_state,
                     exit_code=exit_code,
+                    observation_epoch=observation_epoch,
                     evidence_provenance=(
                         EvidenceProvenance.CANCELLATION
+                        if source is FinalSource.CONFIRMED_QUEUE
+                        and provenance is _UNSET
+                        else provenance
                         if source is FinalSource.CONFIRMED_QUEUE
                         else None
                     ),
                     evidence_detail=(
-                        detail if source is FinalSource.CONFIRMED_QUEUE else None
+                        detail
+                        if source is FinalSource.CONFIRMED_QUEUE
+                        and evidence_detail is _UNSET
+                        else evidence_detail
+                        if source is FinalSource.CONFIRMED_QUEUE
+                        else None
                     ),
                     final_source=source,
                 )
             elif target["phase"] != JobPhase.FINAL.value:
+                retain_preflight_evidence = (
+                    target["phase"] == JobPhase.TERMINAL_CANDIDATE.value
+                    and not has_explicit_lifecycle_evidence
+                )
                 self._update_job_row(
                     connection,
                     target_id,
                     now=now,
+                    expected_updated_at=expected_target_updated_at,
                     phase=JobPhase.TERMINAL_CANDIDATE,
+                    ever_started=ever_started,
+                    last_node=last_node,
                     terminal_state=terminal_state,
                     exit_code=exit_code,
-                    evidence_provenance=EvidenceProvenance.CANCELLATION,
-                    evidence_detail=detail,
+                    observation_epoch=observation_epoch,
+                    evidence_provenance=(
+                        _UNSET
+                        if retain_preflight_evidence
+                        else EvidenceProvenance.CANCELLATION
+                        if provenance is _UNSET
+                        else provenance
+                    ),
+                    evidence_detail=(
+                        _UNSET
+                        if retain_preflight_evidence
+                        else detail
+                        if evidence_detail is _UNSET
+                        else evidence_detail
+                    ),
+                )
+            else:
+                # The target may have finalized after cancellation dispatch.
+                # With no explicit fresh evidence, preserve it byte-for-byte;
+                # pre-dispatch evidence must never be replayed here.
+                self._update_job_row(
+                    connection,
+                    target_id,
+                    now=now,
+                    expected_updated_at=expected_target_updated_at,
+                    phase=JobPhase.FINAL,
+                    ever_started=ever_started,
+                    last_node=last_node,
+                    observation_epoch=observation_epoch,
                 )
             result = self._require_operation_row(connection, operation_id)
         return self._operation_from_row(result)
@@ -921,10 +1074,52 @@ class StateRepository:
     def list_jobs(self, *, include_final: bool = True) -> list[JobRecord]:
         return self.find_jobs(include_final=include_final)
 
+    def snapshot_setup_scope_blockers(
+        self,
+    ) -> tuple[list[JobRecord], list[OperationRecord]]:
+        """Read every setup-scope blocker from one SQLite snapshot.
+
+        Forced setup uses both non-final jobs and unresolved operation intents
+        to decide which configured cluster identities remain authoritative.
+        The explicit read transaction prevents a concurrent lifecycle update
+        from being observed between the two queries.
+        """
+
+        unresolved = tuple(
+            phase.value
+            for phase in sorted(UNRESOLVED_OPERATION_PHASES, key=lambda item: item.value)
+        )
+        placeholders = ",".join("?" for _ in unresolved)
+        with self._read_connection() as connection:
+            connection.execute("BEGIN")
+            try:
+                job_rows = connection.execute(
+                    """SELECT * FROM jobs WHERE phase <> ?
+                       ORDER BY created_at, operation_id""",
+                    (JobPhase.FINAL.value,),
+                ).fetchall()
+                operation_rows = connection.execute(
+                    f"""SELECT * FROM operations WHERE phase IN ({placeholders})
+                        ORDER BY created_at, operation_id""",
+                    unresolved,
+                ).fetchall()
+                connection.execute("COMMIT")
+            except BaseException:
+                try:
+                    connection.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+        return (
+            [self._job_from_row(row) for row in job_rows],
+            [self._operation_from_row(row) for row in operation_rows],
+        )
+
     def update_job(
         self,
         operation_id: str,
         *,
+        expected_updated_at: str | None = None,
         phase: JobPhase | str | None = None,
         ever_started: bool | None = None,
         current_node: str | None | object = _UNSET,
@@ -977,6 +1172,7 @@ class StateRepository:
                 connection,
                 operation_id,
                 now=now,
+                expected_updated_at=expected_updated_at,
                 phase=phase,
                 ever_started=ever_started,
                 current_node=current_node,
@@ -996,6 +1192,7 @@ class StateRepository:
         operation_id: str,
         *,
         now: str,
+        expected_updated_at: str | None = None,
         phase: JobPhase | str | None = None,
         ever_started: bool | None = None,
         current_node: str | None | object = _UNSET,
@@ -1014,6 +1211,11 @@ class StateRepository:
         # boundary.  Callers must not derive merge policy from a JobRecord read
         # before the transaction.
         row = self._require_job_row(connection, operation_id)
+        if expected_updated_at is not None and row["updated_at"] != expected_updated_at:
+            raise LifecycleRevisionConflict(
+                f"job {operation_id} changed while scheduler evidence was collected; "
+                "rerun the command"
+            )
         new_phase = JobPhase(phase) if phase is not None else JobPhase(row["phase"])
         old_phase = JobPhase(row["phase"])
         if old_phase is JobPhase.FINAL and new_phase is not JobPhase.FINAL:
@@ -1197,6 +1399,48 @@ class StateRepository:
         if merged_detail is not None and merged_provenance is None:
             raise StateConflict("evidence detail requires evidence provenance")
 
+        merged_provenance_value = (
+            merged_provenance.value
+            if isinstance(merged_provenance, EvidenceProvenance)
+            else merged_provenance
+        )
+        merged_source_value = merged_source.value if merged_source is not None else None
+        merged_values = (
+            new_phase.value,
+            int(started),
+            node,
+            prior_last_node,
+            merged_terminal,
+            merged_exit,
+            merged_epoch,
+            merged_provenance_value,
+            merged_detail,
+            merged_source_value,
+            finalized_at,
+        )
+        current_values = tuple(
+            row[column]
+            for column in (
+                "phase",
+                "ever_started",
+                "current_node",
+                "last_node",
+                "terminal_state",
+                "exit_code",
+                "observation_epoch",
+                "evidence_provenance",
+                "evidence_detail",
+                "final_source",
+                "finalized_at",
+            )
+        )
+        if merged_values == current_values:
+            return row
+
+        now = self._next_job_timestamp(now, row["updated_at"])
+        if old_phase is not JobPhase.FINAL and new_phase is JobPhase.FINAL:
+            finalized_at = now
+
         connection.execute(
             """UPDATE jobs SET phase = ?, ever_started = ?, current_node = ?,
                last_node = ?, terminal_state = ?, exit_code = ?, observation_epoch = ?,
@@ -1210,19 +1454,33 @@ class StateRepository:
                 merged_terminal,
                 merged_exit,
                 merged_epoch,
-                (
-                    merged_provenance.value
-                    if isinstance(merged_provenance, EvidenceProvenance)
-                    else merged_provenance
-                ),
+                merged_provenance_value,
                 merged_detail,
-                merged_source.value if merged_source is not None else None,
+                merged_source_value,
                 now,
                 finalized_at,
                 operation_id,
             ),
         )
         return self._require_job_row(connection, operation_id)
+
+    def _next_job_timestamp(self, candidate: str, previous: str) -> str:
+        """Return a job version timestamp strictly newer than ``previous``."""
+
+        try:
+            candidate_time = datetime.fromisoformat(candidate)
+            previous_time = datetime.fromisoformat(previous)
+            if candidate_time.tzinfo is None:
+                candidate_time = candidate_time.replace(tzinfo=timezone.utc)
+            if previous_time.tzinfo is None:
+                previous_time = previous_time.replace(tzinfo=timezone.utc)
+            candidate_time = candidate_time.astimezone(timezone.utc)
+            previous_time = previous_time.astimezone(timezone.utc)
+            if candidate_time <= previous_time:
+                candidate_time = previous_time + timedelta(microseconds=1)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise StateInvalid("job revision timestamp is malformed", path=self.path) from exc
+        return _timestamp(candidate_time)
 
     @staticmethod
     def _merge_equal_final_value(
@@ -1358,6 +1616,31 @@ class StateRepository:
         for field_name, value in (("current_node", current_node), ("last_node", last_node)):
             if value is not _UNSET and value is not None and _NODE_NAME.fullmatch(value) is None:
                 raise StateConflict(f"{field_name} is not a safe compute-node name")
+
+    def _prepare_lifecycle_evidence(
+        self,
+        *,
+        last_node: str | None | object,
+        observation_epoch: int | None,
+        evidence_provenance: EvidenceProvenance | str | None | object,
+        evidence_detail: str | None | object,
+    ) -> tuple[EvidenceProvenance | None | object, str | None | object]:
+        """Validate lifecycle fields shared by atomic cancellation updates."""
+
+        self._validate_job_update_values(last_node=last_node)
+        if observation_epoch is not None and (
+            isinstance(observation_epoch, bool)
+            or not isinstance(observation_epoch, int)
+            or observation_epoch < 0
+        ):
+            raise StateConflict("observation_epoch must be a non-negative integer")
+        if evidence_provenance is _UNSET or evidence_provenance is None:
+            provenance = evidence_provenance
+        else:
+            provenance = self._evidence_provenance(evidence_provenance)
+        if evidence_detail is not _UNSET and evidence_detail is not None:
+            evidence_detail = self._sanitize_detail(evidence_detail)
+        return provenance, evidence_detail
 
     @staticmethod
     def _final_source(value: FinalSource | str) -> FinalSource:

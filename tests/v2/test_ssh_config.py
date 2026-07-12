@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from hpc_alloc.config import Config
 from hpc_alloc.errors import ConfigInvalid
 from hpc_alloc.models import JobKind
 from hpc_alloc.ssh_config import (
@@ -58,6 +59,23 @@ class SshConfigTests(unittest.TestCase):
         self.assertIn('UserKnownHostsFile "/tmp/home with space/known\\"hosts"', text)
         self.assertIn("HostKeyAlias hpc-alloc-node.grace.node01", text)
         self.assertIn("ControlPath ~/.ssh/hpc-alloc-e010fd1c-%C", text)
+
+    def test_render_projects_bracketed_config_ip_literals_without_brackets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            path.write_text(
+                '[identity]\nnetid = "ab1234"\n'
+                '[cluster.ipv4]\nhost = "[192.0.2.7]"\n'
+                '[cluster.ipv6]\nhost = "[2001:0DB8:0000::7]"\n'
+            )
+            config = Config.load(path)
+            text = render(config, [], Path(directory) / "known_hosts")
+
+        ipv4 = stanza(text, "hpc-ipv4.login")
+        ipv6 = stanza(text, "hpc-ipv6.login")
+        self.assertIn("HostName 192.0.2.7", ipv4)
+        self.assertIn("HostName 2001:0DB8:0000::7", ipv6)
+        self.assertNotIn("HostName [", text)
 
     def test_compute_identity_uses_cluster_and_physical_node_not_allocation(self) -> None:
         config = SimpleNamespace(

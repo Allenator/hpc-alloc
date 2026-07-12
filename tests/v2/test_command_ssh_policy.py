@@ -5,8 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, call, patch
 
-from hpc_alloc.commands import cmd_connect, cmd_down, cmd_ssh, cmd_sync
-from hpc_alloc.errors import AuthRequired, HostKeyChanged, TransportLost
+from hpc_alloc.commands import cmd_cancel, cmd_connect, cmd_down, cmd_ssh, cmd_sync
+from hpc_alloc.errors import AuthRequired, ConfigInvalid, HostKeyChanged, TransportLost
 from hpc_alloc.models import JobKind
 from hpc_alloc.paths import AppPaths
 
@@ -226,6 +226,118 @@ class CommandSshPolicyTests(unittest.TestCase):
                 self.assertEqual(services.call_count, 2)
                 self.assertEqual(transport.bootstrap.call_count, 2)
                 project.assert_called_once_with(context, self.paths)
+
+    def test_cmd_cancel_projects_once_without_masking_cancellation_failure(self) -> None:
+        failure = TransportLost("guarded cancellation reply was lost")
+        projection_failure = HostKeyChanged("managed SSH projection failed")
+        job = SimpleNamespace(
+            cluster="grace",
+            logical_name="dev",
+            job_id="101",
+        )
+        context = object()
+        transport = SimpleNamespace(bootstrap=Mock())
+
+        with (
+            patch("hpc_alloc.commands._resolve_managed_job", return_value=job),
+            patch(
+                "hpc_alloc.commands._services",
+                return_value=(transport, object()),
+            ),
+            patch("hpc_alloc.commands._cancel_record", side_effect=failure),
+            patch(
+                "hpc_alloc.commands._sync_ssh_projection",
+                side_effect=projection_failure,
+            ) as project,
+            patch("hpc_alloc.commands.info") as report,
+        ):
+            with self.assertRaises(TransportLost) as raised:
+                cmd_cancel(
+                    SimpleNamespace(target="101", cluster=None),
+                    ctx=context,
+                    paths=self.paths,
+                    entrypoint=self.entrypoint,
+                )
+
+        self.assertIs(raised.exception, failure)
+        transport.bootstrap.assert_called_once_with("grace")
+        project.assert_called_once_with(context, self.paths)
+        self.assertIn("managed SSH projection failed", report.call_args.args[0])
+
+    def test_single_target_down_projects_once_without_masking_failure(self) -> None:
+        failure = TransportLost("guarded cancellation reply was lost")
+        projection_failure = HostKeyChanged("managed SSH projection failed")
+        job = SimpleNamespace(
+            cluster="grace",
+            kind=JobKind.ALLOCATION,
+            logical_name="dev",
+            job_id="101",
+        )
+        context = object()
+        transport = SimpleNamespace(bootstrap=Mock())
+
+        with (
+            patch("hpc_alloc.commands._resolve_managed_job", return_value=job),
+            patch(
+                "hpc_alloc.commands._services",
+                return_value=(transport, object()),
+            ),
+            patch("hpc_alloc.commands._cancel_record", side_effect=failure),
+            patch(
+                "hpc_alloc.commands._sync_ssh_projection",
+                side_effect=projection_failure,
+            ) as project,
+            patch("hpc_alloc.commands.info") as report,
+        ):
+            with self.assertRaises(TransportLost) as raised:
+                cmd_down(
+                    SimpleNamespace(all=False, target="dev", cluster=None),
+                    ctx=context,
+                    paths=self.paths,
+                    entrypoint=self.entrypoint,
+                )
+
+        self.assertIs(raised.exception, failure)
+        transport.bootstrap.assert_called_once_with("grace")
+        project.assert_called_once_with(context, self.paths)
+        self.assertIn("managed SSH projection failed", report.call_args.args[0])
+
+    def test_down_does_not_announce_success_before_projection_succeeds(self) -> None:
+        job = SimpleNamespace(
+            cluster="grace",
+            kind=JobKind.ALLOCATION,
+            logical_name="dev",
+            job_id="101",
+        )
+        context = object()
+        transport = SimpleNamespace(bootstrap=Mock())
+        projection_failure = ConfigInvalid("managed SSH projection failed")
+
+        with (
+            patch("hpc_alloc.commands._resolve_managed_job", return_value=job),
+            patch("hpc_alloc.commands._services", return_value=(transport, object())),
+            patch(
+                "hpc_alloc.commands._cancel_record",
+                return_value=SimpleNamespace(status=SimpleNamespace(value="CANCELLED")),
+            ),
+            patch(
+                "hpc_alloc.commands._sync_ssh_projection",
+                side_effect=projection_failure,
+            ),
+            patch("hpc_alloc.commands.info") as report,
+        ):
+            with self.assertRaises(ConfigInvalid) as raised:
+                cmd_down(
+                    SimpleNamespace(all=False, target="dev", cluster=None),
+                    ctx=context,
+                    paths=self.paths,
+                    entrypoint=self.entrypoint,
+                )
+
+        self.assertIs(raised.exception, projection_failure)
+        self.assertFalse(
+            any("cancelled allocation" in str(call_.args[0]).lower() for call_ in report.call_args_list)
+        )
 
     def test_cmd_down_all_routes_each_allocation_to_its_own_cluster(self) -> None:
         jobs = [

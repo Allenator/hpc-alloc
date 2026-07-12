@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -12,6 +13,41 @@ REPO = Path(__file__).resolve().parents[2]
 
 
 class InstallerDeliveryTests(unittest.TestCase):
+    @staticmethod
+    def runtime_manifest() -> tuple[str, ...]:
+        installer = (REPO / "install.sh").read_text()
+        match = re.search(
+            r"^runtime_modules=\(\n(?P<body>.*?)^\)$",
+            installer,
+            flags=re.MULTILINE | re.DOTALL,
+        )
+        if match is None:
+            raise AssertionError("installer runtime-module manifest was not found")
+        return tuple(line.strip() for line in match.group("body").splitlines())
+
+    @staticmethod
+    def copy_complete_source(destination: Path) -> Path:
+        destination.mkdir()
+        installer = shutil.copy2(REPO / "install.sh", destination / "install.sh")
+        shutil.copy2(REPO / "hpc-alloc", destination / "hpc-alloc")
+        shutil.copytree(REPO / "hpc_alloc", destination / "hpc_alloc")
+        shutil.copytree(REPO / "skill", destination / "skill")
+        return installer
+
+    @staticmethod
+    def run_installer(
+        installer: Path, *, cwd: Path, home: Path
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", str(installer)],
+            cwd=cwd,
+            env={**os.environ, "HOME": str(home)},
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
     @staticmethod
     def assert_no_delivery(home: Path) -> None:
         if home.joinpath(".local").exists():
@@ -79,7 +115,8 @@ class InstallerDeliveryTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertEqual(result.stdout, "")
             self.assertIn(
-                "installation is incomplete: the adjacent Python package cannot be imported",
+                "installation is incomplete: the adjacent Python package cannot be "
+                "imported or does not match the runtime-module manifest",
                 result.stderr,
             )
             self.assert_no_delivery(home)
@@ -109,6 +146,61 @@ class InstallerDeliveryTests(unittest.TestCase):
             self.assertEqual(result.stdout, "")
             self.assertIn("/skill/SKILL.md is missing", result.stderr)
             self.assert_no_delivery(home)
+
+    def test_runtime_manifest_matches_every_adjacent_python_module(self) -> None:
+        manifested_sources = {
+            (
+                "__init__.py"
+                if name == "hpc_alloc"
+                else f"{name.removeprefix('hpc_alloc.')}.py"
+            )
+            for name in self.runtime_manifest()
+        }
+        package_sources = {path.name for path in (REPO / "hpc_alloc").glob("*.py")}
+
+        self.assertEqual(manifested_sources, package_sources)
+
+    def test_each_missing_runtime_module_fails_before_creating_links(self) -> None:
+        for module in self.runtime_manifest():
+            source_name = (
+                "__init__.py"
+                if module == "hpc_alloc"
+                else f"{module.removeprefix('hpc_alloc.')}.py"
+            )
+            with self.subTest(module=module), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / "incomplete-source"
+                home = root / "home"
+                home.mkdir()
+                installer = self.copy_complete_source(source)
+                source.joinpath("hpc_alloc", source_name).unlink()
+
+                result = self.run_installer(installer, cwd=source, home=home)
+
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("hpc-alloc installation is incomplete:", result.stderr)
+                self.assert_no_delivery(home)
+
+    def test_complete_source_is_linked_after_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "complete-source"
+            home = root / "home"
+            home.mkdir()
+            installer = self.copy_complete_source(source)
+
+            result = self.run_installer(installer, cwd=root, home=home)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                home.joinpath(".local", "bin", "hpc-alloc").resolve(),
+                source.joinpath("hpc-alloc").resolve(),
+            )
+            self.assertEqual(
+                home.joinpath(".claude", "skills", "hpc-alloc").resolve(),
+                source.joinpath("skill").resolve(),
+            )
 
 
 if __name__ == "__main__":

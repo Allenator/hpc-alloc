@@ -15,6 +15,30 @@ fi
 
 here="$(cd "$(dirname "$0")" && pwd)"
 
+# Keep this explicit: installation must never succeed from a partial source tree
+# merely because the command path used during preflight did not import a missing
+# runtime module.
+runtime_modules=(
+  hpc_alloc
+  hpc_alloc.cli
+  hpc_alloc.commands
+  hpc_alloc.config
+  hpc_alloc.context
+  hpc_alloc.errors
+  hpc_alloc.lifecycle
+  hpc_alloc.locking
+  hpc_alloc.models
+  hpc_alloc.monitor
+  hpc_alloc.ownership
+  hpc_alloc.paths
+  hpc_alloc.selectors
+  hpc_alloc.slurm
+  hpc_alloc.ssh
+  hpc_alloc.ssh_config
+  hpc_alloc.state
+  hpc_alloc.streaming
+)
+
 if [[ ! -f "$here/hpc_alloc/__init__.py" ]]; then
   echo "hpc-alloc installation is incomplete: $here/hpc_alloc is missing" >&2
   exit 1
@@ -28,19 +52,46 @@ if [[ ! -f "$here/skill/SKILL.md" ]]; then
   exit 1
 fi
 if ! python3 -I -B -c '
+import importlib
 import pathlib
 import sys
 
 root = pathlib.Path(sys.argv[1]).resolve()
-sys.path.insert(0, str(root))
-try:
-    import hpc_alloc.cli as cli
-except Exception:
+package = root / "hpc_alloc"
+manifest = tuple(sys.argv[2:])
+
+sources = {}
+for name in manifest:
+    if name == "hpc_alloc":
+        source = "__init__.py"
+    elif name.startswith("hpc_alloc."):
+        leaf = name.removeprefix("hpc_alloc.")
+        if not leaf.isidentifier() or "." in leaf:
+            raise SystemExit(1)
+        source = f"{leaf}.py"
+    else:
+        raise SystemExit(1)
+    if name in sources or source in sources.values():
+        raise SystemExit(1)
+    sources[name] = source
+
+actual_sources = {path.name for path in package.glob("*.py") if path.is_file()}
+if set(sources.values()) != actual_sources:
     raise SystemExit(1)
-module = pathlib.Path(cli.__file__).resolve()
-raise SystemExit(0 if module.is_relative_to(root / "hpc_alloc") else 1)
-' "$here"; then
-  echo "hpc-alloc installation is incomplete: the adjacent Python package cannot be imported" >&2
+
+sys.path.insert(0, str(root))
+for name, source in sources.items():
+    try:
+        module = importlib.import_module(name)
+        module_path = pathlib.Path(module.__file__).resolve()
+    except BaseException:
+        raise SystemExit(1)
+    if not module_path.is_relative_to(package):
+        raise SystemExit(1)
+    if module_path != (package / source).resolve():
+        raise SystemExit(1)
+' "$here" "${runtime_modules[@]}"; then
+  echo "hpc-alloc installation is incomplete: the adjacent Python package cannot be imported or does not match the runtime-module manifest" >&2
   exit 1
 fi
 

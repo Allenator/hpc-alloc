@@ -15,10 +15,24 @@ from .errors import ConfigInvalid
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$")
 _NETID = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{1,63}$")
 _PARTITION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
-_SLURM_TIME = re.compile(r"^(?:\d+-)?\d{1,3}:[0-5]\d(?::[0-5]\d)?$")
+_SLURM_TIME = re.compile(
+    r"^(?:"
+    r"[0-9]+"
+    r"|[0-9]+:[0-5][0-9](?::[0-5][0-9])?"
+    r"|[0-9]+-[0-9]+(?::[0-5][0-9](?::[0-5][0-9])?)?"
+    r")$"
+)
 _MEMORY = re.compile(r"^\d+(?:\.\d+)?(?:[KMGTPE](?:i?B)?)?$", re.IGNORECASE)
 _IDENTITY_PATH = re.compile(r"^(?:~/|/)[A-Za-z0-9_./@%+=:,~-]+$")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _valid_slurm_time(value: str) -> bool:
+    """Accept one finite numeric Slurm duration in a documented form."""
+
+    return _SLURM_TIME.fullmatch(value) is not None and any(
+        character in "123456789" for character in value
+    )
 
 
 def _table(value: Any, name: str, path: Path) -> Mapping[str, Any]:
@@ -64,23 +78,34 @@ def _positive_int(
     return value
 
 
-def _valid_host(host: str) -> bool:
-    candidate = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+def _normalize_host(host: str) -> str | None:
+    bracketed = host.startswith("[") or host.endswith("]")
+    if bracketed:
+        if not (host.startswith("[") and host.endswith("]")):
+            return None
+        candidate = host[1:-1]
+        try:
+            ipaddress.ip_address(candidate)
+        except ValueError:
+            return None
+        return candidate
+
     try:
-        ipaddress.ip_address(candidate)
-        return True
+        ipaddress.ip_address(host)
+        return host
     except ValueError:
         pass
-    if host.endswith("."):
-        host = host[:-1]
-    if len(host) > 253:
-        return False
-    labels = host.split(".")
-    return bool(labels) and all(
+
+    candidate = host[:-1] if host.endswith(".") else host
+    if len(candidate) > 253:
+        return None
+    labels = candidate.split(".")
+    valid = bool(labels) and all(
         0 < len(label) <= 63
         and re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", label)
         for label in labels
     )
+    return host if valid else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,11 +212,12 @@ class Config:
             _reject_unknown(table, cls.RESOURCE_KEYS | {"host"}, section, config_path)
             host = _string(table, "host", section, config_path, required=True)
             assert host is not None
-            if not _valid_host(host):
+            normalized_host = _normalize_host(host)
+            if normalized_host is None:
                 raise ConfigInvalid(f"[{section}].host is not a valid hostname or IP address", path=config_path)
             clusters[name] = ClusterConfig(
                 name=name,
-                host=host,
+                host=normalized_host,
                 **cls._resource_values(table, section, config_path),
             )
 
@@ -217,7 +243,7 @@ class Config:
             if value is not None and not _PARTITION.fullmatch(value):
                 raise ConfigInvalid(f"[{section}].{key} is not a valid partition name", path=path)
         slurm_time = _string(table, "time", section, path)
-        if slurm_time is not None and not _SLURM_TIME.fullmatch(slurm_time):
+        if slurm_time is not None and not _valid_slurm_time(slurm_time):
             raise ConfigInvalid(f"[{section}].time must be a quoted Slurm duration", path=path)
         memory = _string(table, "mem", section, path)
         if memory is not None and not _MEMORY.fullmatch(memory):

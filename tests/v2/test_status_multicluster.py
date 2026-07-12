@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from hpc_alloc.commands import cmd_status
 from hpc_alloc.config import Config
-from hpc_alloc.errors import HostKeyChanged, JobIdReused, TransportLost
+from hpc_alloc.errors import ConfigInvalid, HostKeyChanged, JobIdReused, TransportLost
 from hpc_alloc.monitor import JobMonitor
 from hpc_alloc.models import FinalSource, JobKind, JobPhase
 from hpc_alloc.ownership import format_tag, slurm_job_name
@@ -496,6 +496,110 @@ host = "secondary.example.edu"
         self.assertEqual(replacement["classification"], "untracked-owned")
         self.assertEqual(state.get_job(OPERATION_ID).phase, JobPhase.FINAL)
         client.assert_complete()
+
+    def test_projection_repairs_early_status_change_before_later_failure_escapes(self) -> None:
+        paths, context, state, owner = self.make_context(
+            clusters=("grace", "secondary")
+        )
+        self.reserve(state, owner, OPERATION_ID, job_id="12345")
+        second = "b" * 32
+        state.reserve_submission(
+            cluster="secondary",
+            logical_name="viz",
+            kind=JobKind.ALLOCATION,
+            owner_id=owner,
+            slurm_job_name=slurm_job_name("allocation", second),
+            slurm_comment=format_tag(
+                owner, second, "laptop", "allocation", "viz"
+            ),
+            operation_id=second,
+        )
+        state.acknowledge_submission(second, "23456")
+        grace = self.raw_row(OPERATION_ID, owner, "12345", node="node01")
+        secondary = RawQueueRow(
+            job_id="23456",
+            state="RUNNING",
+            node="node02",
+            reason="None",
+            time_left="1:00:00",
+            partition="day",
+            name=slurm_job_name("allocation", second),
+            submitted_at="2026-07-12T11:00:00",
+            comment=format_tag(
+                owner, second, "laptop", "allocation", "viz"
+            ),
+        )
+        failure = HostKeyChanged("secondary identity changed")
+        clients = {
+            "grace": StatusClient(
+                (grace,), observations=(self.strict_row(grace),)
+            ),
+            "secondary": StatusClient(
+                (secondary,), observations=(failure,)
+            ),
+        }
+
+        def services(_ctx: object, _paths: object, _entry: object, cluster: str):
+            return AvailableTransport(), clients[cluster]
+
+        with patch("hpc_alloc.commands._services", side_effect=services):
+            with self.assertRaises(HostKeyChanged) as raised:
+                cmd_status(
+                    SimpleNamespace(json=True),
+                    ctx=context,
+                    paths=paths,
+                    entrypoint=Path("/tmp/hpc-alloc"),
+                )
+
+        self.assertIs(raised.exception, failure)
+        projected = paths.managed_ssh_config.read_text()
+        self.assertIn("Host hpc-grace.dev", projected)
+        self.assertIn("    HostName node01", projected)
+        self.assertNotIn("Host hpc-secondary.viz", projected)
+
+    def test_successful_status_propagates_projection_failure_before_output(self) -> None:
+        paths, context, _state, _owner = self.make_context()
+        failure = ConfigInvalid("projection failed")
+        stdout = io.StringIO()
+        with (
+            patch(
+                "hpc_alloc.commands._services",
+                return_value=(AvailableTransport(), EmptyClient()),
+            ),
+            patch("hpc_alloc.commands._sync_ssh_projection", side_effect=failure),
+            redirect_stdout(stdout),
+        ):
+            with self.assertRaises(ConfigInvalid) as raised:
+                cmd_status(
+                    SimpleNamespace(json=True),
+                    ctx=context,
+                    paths=paths,
+                    entrypoint=Path("/tmp/hpc-alloc"),
+                )
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(stdout.getvalue(), "")
+
+    def test_projection_failure_during_unwind_does_not_mask_status_failure(self) -> None:
+        paths, context, _state, _owner = self.make_context()
+        primary = HostKeyChanged("primary failure")
+        projection = ConfigInvalid("projection failure")
+        with (
+            patch(
+                "hpc_alloc.commands._services",
+                return_value=(HostKeyTransport(primary), EmptyClient()),
+            ),
+            patch("hpc_alloc.commands._sync_ssh_projection", side_effect=projection),
+            patch("hpc_alloc.commands.info") as report,
+        ):
+            with self.assertRaises(HostKeyChanged) as raised:
+                cmd_status(
+                    SimpleNamespace(json=True),
+                    ctx=context,
+                    paths=paths,
+                    entrypoint=Path("/tmp/hpc-alloc"),
+                )
+        self.assertIs(raised.exception, primary)
+        self.assertIn("projection failure", report.call_args.args[0])
 
 
 if __name__ == "__main__":

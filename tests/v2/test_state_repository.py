@@ -8,7 +8,13 @@ from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from hpc_alloc.errors import JobIdReused, StateConflict, StateInvalid, TransportLost
+from hpc_alloc.errors import (
+    JobIdReused,
+    LifecycleRevisionConflict,
+    StateConflict,
+    StateInvalid,
+    TransportLost,
+)
 from hpc_alloc.lifecycle import AssessmentPhase, EvidenceEvent, EvidenceTracker
 from hpc_alloc.models import (
     EvidenceProvenance,
@@ -94,6 +100,24 @@ class StateRepositoryTests(unittest.TestCase):
         with self.assertRaisesRegex(StateConflict, "different Slurm job"):
             self.repo.acknowledge_submission(self.operation_id, "54321")
 
+    def test_setup_scope_snapshot_excludes_final_jobs_and_resolved_operations(self) -> None:
+        self.reserve()
+        self.repo.acknowledge_submission(self.operation_id, "12345")
+        self.repo.update_job(
+            self.operation_id,
+            phase=JobPhase.FINAL,
+            terminal_state="COMPLETED",
+            exit_code="0:0",
+            final_source=FinalSource.ACCOUNTING,
+        )
+        blocker_id = "b" * 32
+        self.reserve(operation_id=blocker_id, name="next")
+
+        jobs, operations = self.repo.snapshot_setup_scope_blockers()
+
+        self.assertEqual([job.operation_id for job in jobs], [blocker_id])
+        self.assertEqual([operation.operation_id for operation in operations], [blocker_id])
+
     def test_submission_identity_must_be_internally_exact(self) -> None:
         with self.assertRaisesRegex(StateConflict, "identity metadata is inconsistent"):
             self.repo.reserve_submission(
@@ -137,6 +161,108 @@ class StateRepositoryTests(unittest.TestCase):
         self.assertIn("mid-scancel", retained.detail or "")
         self.assertEqual(self.repo.get_job(self.operation_id).phase, JobPhase.QUEUED)
 
+    def test_cancel_dispatch_atomically_persists_live_start_evidence(self) -> None:
+        self.reserve()
+        self.repo.acknowledge_submission(self.operation_id, "12345")
+        cancel_id = "c" * 32
+        self.repo.begin_cancel(self.operation_id, operation_id=cancel_id)
+
+        dispatching = self.repo.mark_cancel_dispatching(
+            cancel_id,
+            ever_started=True,
+            last_node="node01",
+            observation_epoch=7,
+        )
+
+        stored = self.repo.get_job(self.operation_id)
+        self.assertEqual(dispatching.phase, OperationPhase.AMBIGUOUS)
+        self.assertTrue(stored.ever_started)
+        self.assertEqual(stored.last_node, "node01")
+        self.assertEqual(stored.observation_epoch, 7)
+
+    def test_cancel_dispatch_atomically_persists_non_live_provenance(self) -> None:
+        self.reserve()
+        self.repo.acknowledge_submission(self.operation_id, "12345")
+        cancel_id = "c" * 32
+        self.repo.begin_cancel(self.operation_id, operation_id=cancel_id)
+
+        self.repo.mark_cancel_dispatching(
+            cancel_id,
+            ever_started=True,
+            last_node="node02",
+            observation_epoch=8,
+            evidence_provenance=EvidenceProvenance.QUEUE_TERMINAL,
+            evidence_detail="exact queue row was terminal-looking",
+        )
+
+        stored = self.repo.get_job(self.operation_id)
+        self.assertEqual(stored.phase, JobPhase.TERMINAL_CANDIDATE)
+        self.assertTrue(stored.ever_started)
+        self.assertEqual(stored.last_node, "node02")
+        self.assertEqual(
+            stored.evidence_provenance,
+            EvidenceProvenance.QUEUE_TERMINAL,
+        )
+        self.assertEqual(
+            stored.evidence_detail,
+            "exact queue row was terminal-looking",
+        )
+
+    def test_cancel_dispatch_rolls_back_operation_when_evidence_merge_fails(self) -> None:
+        self.reserve()
+        self.repo.acknowledge_submission(self.operation_id, "12345")
+        cancel_id = "c" * 32
+        self.repo.begin_cancel(self.operation_id, operation_id=cancel_id)
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                """CREATE TRIGGER inject_cancel_dispatch_failure
+                   BEFORE UPDATE OF ever_started ON jobs
+                   BEGIN SELECT RAISE(ABORT, 'injected dispatch failure'); END"""
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "injected dispatch failure"):
+            self.repo.mark_cancel_dispatching(
+                cancel_id,
+                ever_started=True,
+                last_node="node01",
+            )
+
+        self.assertEqual(
+            self.repo.get_operation(cancel_id).phase,
+            OperationPhase.CANCEL_PENDING,
+        )
+        stored = self.repo.get_job(self.operation_id)
+        self.assertFalse(stored.ever_started)
+        self.assertIsNone(stored.last_node)
+
+    def test_cancel_dispatch_revision_conflict_rolls_back_and_preserves_newer_node(self) -> None:
+        self.reserve()
+        queued = self.repo.acknowledge_submission(self.operation_id, "12345")
+        cancel_id = "c" * 32
+        self.repo.begin_cancel(self.operation_id, operation_id=cancel_id)
+        newer = self.repo.update_job(
+            self.operation_id,
+            phase=JobPhase.ACTIVE,
+            ever_started=True,
+            current_node="node02",
+            last_node="node02",
+        )
+
+        with self.assertRaises(LifecycleRevisionConflict):
+            self.repo.mark_cancel_dispatching(
+                cancel_id,
+                expected_target_updated_at=queued.updated_at,
+                ever_started=True,
+                last_node="node01",
+            )
+
+        self.assertEqual(
+            self.repo.get_operation(cancel_id).phase,
+            OperationPhase.CANCEL_PENDING,
+        )
+        self.assertEqual(self.repo.get_job(self.operation_id), newer)
+
     def test_ever_started_is_monotonic_and_inactive_phase_clears_current_node(self) -> None:
         self.reserve()
         self.repo.acknowledge_submission(self.operation_id, "12345")
@@ -158,6 +284,56 @@ class StateRepositoryTests(unittest.TestCase):
         self.assertEqual(suspended.last_node, "node01")
         with self.assertRaisesRegex(StateConflict, "monotonic"):
             self.repo.update_job(self.operation_id, ever_started=False)
+
+    def test_update_job_rejects_a_stale_expected_timestamp(self) -> None:
+        self.reserve()
+        queued = self.repo.acknowledge_submission(self.operation_id, "12345")
+        active = self.repo.update_job(
+            self.operation_id,
+            expected_updated_at=queued.updated_at,
+            phase=JobPhase.ACTIVE,
+            ever_started=True,
+            current_node="node01",
+        )
+
+        with self.assertRaisesRegex(LifecycleRevisionConflict, "changed while.*rerun"):
+            self.repo.update_job(
+                self.operation_id,
+                expected_updated_at=queued.updated_at,
+                phase=JobPhase.REQUEUEING,
+            )
+
+        stored = self.repo.get_job(self.operation_id)
+        self.assertEqual(stored, active)
+
+    def test_semantic_noop_preserves_revision_token(self) -> None:
+        self.reserve()
+        queued = self.repo.acknowledge_submission(self.operation_id, "12345")
+        active = self.repo.update_job(
+            self.operation_id,
+            expected_updated_at=queued.updated_at,
+            phase=JobPhase.ACTIVE,
+            ever_started=True,
+            current_node="node01",
+            last_node="node01",
+        )
+
+        unchanged = self.repo.update_job(
+            self.operation_id,
+            expected_updated_at=active.updated_at,
+            phase=JobPhase.ACTIVE,
+            ever_started=True,
+            current_node="node01",
+            last_node="node01",
+        )
+
+        self.assertEqual(unchanged, active)
+        updated = self.repo.update_job(
+            self.operation_id,
+            expected_updated_at=active.updated_at,
+            phase=JobPhase.REQUEUEING,
+        )
+        self.assertGreater(updated.updated_at, active.updated_at)
 
     def test_non_database_bytes_raise_typed_state_error(self) -> None:
         path = Path(self.directory.name) / "corrupt.db"
@@ -309,6 +485,7 @@ class StateRepositoryTests(unittest.TestCase):
         )
         after = self.repo.get_job(self.operation_id)
         self.assertEqual(failed.phase, OperationPhase.FAILED)
+        self.assertEqual(after, before)
         self.assertEqual(after.phase, before.phase)
         self.assertEqual(after.job_id, before.job_id)
         retry = self.repo.begin_cancel(self.operation_id, operation_id="d" * 32)
@@ -346,6 +523,139 @@ class StateRepositoryTests(unittest.TestCase):
         self.assertEqual(
             self.repo.get_job(self.operation_id).phase,
             JobPhase.TERMINAL_CANDIDATE,
+        )
+
+    def test_cancel_resolution_retains_exact_non_live_evidence(self) -> None:
+        self.reserve()
+        self.repo.acknowledge_submission(self.operation_id, "12345")
+        cancel_id = "c" * 32
+        self.repo.begin_cancel(self.operation_id, operation_id=cancel_id)
+        self.repo.mark_cancel_dispatching(cancel_id)
+
+        self.repo.resolve_operation(
+            cancel_id,
+            final_source=FinalSource.CONFIRMED_QUEUE,
+            detail="read-only recovery confirmed finality",
+            terminal_state="COMPLETING",
+            ever_started=True,
+            last_node="node07",
+            observation_epoch=11,
+            evidence_provenance=EvidenceProvenance.QUEUE_TERMINAL,
+            evidence_detail="job remained terminal in exact queue observations",
+        )
+
+        stored = self.repo.get_job(self.operation_id)
+        self.assertEqual(stored.phase, JobPhase.FINAL)
+        self.assertTrue(stored.ever_started)
+        self.assertEqual(stored.last_node, "node07")
+        self.assertEqual(stored.observation_epoch, 11)
+        self.assertEqual(
+            stored.evidence_provenance,
+            EvidenceProvenance.QUEUE_TERMINAL,
+        )
+        self.assertEqual(
+            stored.evidence_detail,
+            "job remained terminal in exact queue observations",
+        )
+
+    def test_cancel_resolution_merges_start_history_into_concurrent_final(self) -> None:
+        self.reserve()
+        self.repo.acknowledge_submission(self.operation_id, "12345")
+        cancel_id = "c" * 32
+        self.repo.begin_cancel(self.operation_id, operation_id=cancel_id)
+        self.repo.mark_cancel_dispatching(cancel_id)
+        finalized = self.repo.update_job(
+            self.operation_id,
+            phase=JobPhase.FINAL,
+            terminal_state="BOOT_FAIL",
+            exit_code="1:0",
+            final_source=FinalSource.ACCOUNTING,
+        )
+
+        self.repo.resolve_cancel_departed(
+            cancel_id,
+            "cancellation request acknowledged",
+            ever_started=True,
+            last_node="node09",
+            observation_epoch=13,
+        )
+
+        stored = self.repo.get_job(self.operation_id)
+        self.assertEqual(stored.final_source, FinalSource.ACCOUNTING)
+        self.assertEqual(stored.terminal_state, "BOOT_FAIL")
+        self.assertEqual(stored.exit_code, "1:0")
+        self.assertEqual(stored.finalized_at, finalized.finalized_at)
+        self.assertTrue(stored.ever_started)
+        self.assertEqual(stored.last_node, "node09")
+        self.assertEqual(stored.observation_epoch, 13)
+
+    def test_cancel_ack_uses_fresh_live_node_without_replaying_preflight(self) -> None:
+        self.reserve()
+        queued = self.repo.acknowledge_submission(self.operation_id, "12345")
+        cancel_id = "c" * 32
+        self.repo.begin_cancel(self.operation_id, operation_id=cancel_id)
+        self.repo.mark_cancel_dispatching(
+            cancel_id,
+            expected_target_updated_at=queued.updated_at,
+            ever_started=True,
+            last_node="node01",
+        )
+        self.repo.update_job(
+            self.operation_id,
+            phase=JobPhase.ACTIVE,
+            ever_started=True,
+            current_node="node02",
+            last_node="node02",
+        )
+
+        self.repo.resolve_cancel_departed(
+            cancel_id,
+            "cancellation request acknowledged",
+        )
+
+        stored = self.repo.get_job(self.operation_id)
+        self.assertEqual(stored.phase, JobPhase.TERMINAL_CANDIDATE)
+        self.assertTrue(stored.ever_started)
+        self.assertIsNone(stored.current_node)
+        self.assertEqual(stored.last_node, "node02")
+        self.assertIsNone(stored.terminal_state)
+        self.assertEqual(
+            stored.evidence_provenance,
+            EvidenceProvenance.CANCELLATION,
+        )
+
+    def test_cancel_ack_preserves_concurrent_final_without_preflight_replay(self) -> None:
+        self.reserve()
+        queued = self.repo.acknowledge_submission(self.operation_id, "12345")
+        cancel_id = "c" * 32
+        self.repo.begin_cancel(self.operation_id, operation_id=cancel_id)
+        self.repo.mark_cancel_dispatching(
+            cancel_id,
+            expected_target_updated_at=queued.updated_at,
+            phase=JobPhase.ACTIVE,
+            ever_started=True,
+            current_node="node01",
+            last_node="node01",
+        )
+        final = self.repo.update_job(
+            self.operation_id,
+            phase=JobPhase.FINAL,
+            ever_started=True,
+            last_node="node02",
+            terminal_state="COMPLETED",
+            exit_code="0:0",
+            final_source=FinalSource.ACCOUNTING,
+        )
+
+        self.repo.resolve_cancel_departed(
+            cancel_id,
+            "cancellation request acknowledged",
+        )
+
+        self.assertEqual(self.repo.get_job(self.operation_id), final)
+        self.assertEqual(
+            self.repo.get_operation(cancel_id).phase,
+            OperationPhase.RESOLVED,
         )
 
     def test_final_merge_retains_missing_values_and_obeys_authority(self) -> None:
@@ -525,7 +835,7 @@ class StateRepositoryTests(unittest.TestCase):
             {"COMPLETED", "FAILED"},
         )
 
-    def test_persist_assessment_merges_against_fresh_row_without_metadata_loss(self) -> None:
+    def test_persist_assessment_rejects_stale_lifecycle_evidence(self) -> None:
         self.reserve()
         stale = self.repo.acknowledge_submission(self.operation_id, "12345")
         self.repo.update_job(
@@ -538,13 +848,71 @@ class StateRepositoryTests(unittest.TestCase):
         tracker.accept(EvidenceEvent.absent())
         assessment = tracker.accept(EvidenceEvent.absent())
 
-        merged = persist_assessment(self.repo, stale, assessment)
+        with self.assertRaisesRegex(LifecycleRevisionConflict, "changed while.*rerun"):
+            persist_assessment(self.repo, stale, assessment)
 
-        self.assertEqual(merged.phase, JobPhase.FINAL)
-        self.assertEqual(merged.final_source, FinalSource.CONFIRMED_QUEUE)
-        self.assertTrue(merged.ever_started)
-        self.assertEqual(merged.last_node, "node01")
-        self.assertEqual(merged.resources, {"cpus": 2, "partition": "day"})
+        stored = self.repo.get_job(self.operation_id)
+        self.assertEqual(stored.phase, JobPhase.ACTIVE)
+        self.assertIsNone(stored.final_source)
+        self.assertTrue(stored.ever_started)
+        self.assertEqual(stored.current_node, "node01")
+        self.assertEqual(stored.resources, {"cpus": 2, "partition": "day"})
+
+    def test_uncertain_assessment_returns_its_source_snapshot_without_mixing_versions(self) -> None:
+        self.reserve()
+        source = self.repo.acknowledge_submission(self.operation_id, "12345")
+        durable = self.repo.update_job(
+            self.operation_id,
+            phase=JobPhase.ACTIVE,
+            ever_started=True,
+            current_node="node04",
+        )
+        tracker = EvidenceTracker()
+        uncertain = tracker.accept(EvidenceEvent.transport_lost("VPN unavailable"))
+
+        returned = persist_assessment(self.repo, source, uncertain)
+
+        self.assertIs(returned, source)
+        self.assertEqual(self.repo.get_job(self.operation_id), durable)
+
+    def test_separate_observer_cannot_finalize_after_requeue_becomes_live(self) -> None:
+        self.reserve()
+        stale = self.repo.acknowledge_submission(self.operation_id, "12345")
+        tracker = EvidenceTracker()
+        tracker.accept(EvidenceEvent.absent())
+        stale_final = tracker.accept(EvidenceEvent.absent())
+        observer = StateRepository(self.path).initialize()
+        writer = StateRepository(self.path).initialize()
+        live_written = threading.Event()
+
+        def persist_live() -> None:
+            writer.update_job(
+                self.operation_id,
+                phase=JobPhase.ACTIVE,
+                ever_started=True,
+                current_node="node02",
+            )
+            live_written.set()
+
+        def persist_stale() -> str:
+            if not live_written.wait(timeout=5):
+                raise AssertionError("live requeue observation was not persisted")
+            try:
+                persist_assessment(observer, stale, stale_final)
+            except StateConflict:
+                return "conflict"
+            return "stored"
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            live_future = executor.submit(persist_live)
+            stale_future = executor.submit(persist_stale)
+            live_future.result()
+            self.assertEqual(stale_future.result(), "conflict")
+
+        stored = self.repo.get_job(self.operation_id)
+        self.assertEqual(stored.phase, JobPhase.ACTIVE)
+        self.assertEqual(stored.current_node, "node02")
+        self.assertIsNone(stored.final_source)
 
     def test_restart_error_cannot_bridge_a_durable_recycled_id_candidate(self) -> None:
         self.reserve()
