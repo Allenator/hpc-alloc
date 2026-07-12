@@ -1,25 +1,51 @@
-# hpc-alloc configuration. Precedence: CLI flags > this file > built-in defaults.
-# Copy to ~/.config/hpc-alloc/config.toml (or let `hpc-alloc setup` create it).
-# Values shown commented out are the built-in defaults.
+# Authoritative hpc-alloc v2 configuration (Python 3.11+).
+# Copy to ~/.config/hpc-alloc/config.toml, or let `hpc-alloc setup` create it.
+#
+# Resource precedence:
+#   CLI flag > selected [cluster.NAME] > [defaults] > built-in fallback
+# Unknown tables and keys are errors.
 
-[defaults]
-cluster = "bouchet"      # the primary cluster: full errors and Duo prompts here
-# partition = "day"        # partition for CPU work
-# gpu_partition = "gpu"    # partition when --gpus is set without -p
-# time = "4:00:00"         # walltime, Slurm format
-# cpus = 2
-# mem = "16G"              # per-node memory (unset: Slurm's 5120MB per CPU)
-# idle_timeout = 30        # GPU allocs self-release after this many idle minutes (0 disables)
+[identity]
+# Required. This identity is used for every configured cluster.
+netid = "YOUR_NETID"
 
 [ssh]
-# Pin the key used for the clusters. Without this, ssh offers every key it has
-# and the server may hit "Too many authentication failures" before the right one.
-# Make sure this is the key REGISTERED with the cluster; comment it out if you
-# authenticate via an SSH agent or certificates (pinning excludes agent-only keys).
+# Optional. Pinning a registered key prevents OpenSSH from offering unrelated
+# keys until the server's authentication-attempt limit is exhausted. The value
+# must be an absolute path or start with ~/ and may not contain whitespace.
 identity_file = "~/.ssh/id_ed25519"
 
-# Per-cluster overrides. The section name after "cluster." is the --cluster value.
+[defaults]
+# Optional when there is exactly one cluster; required to select a default when
+# several clusters are configured.
+cluster = "bouchet"
+
+# Optional resource defaults. These are the v2 built-in values shown here.
+partition = "day"
+gpu_partition = "gpu"
+time = "4:00:00"
+cpus = 2
+
+# If omitted, Slurm chooses memory according to cluster policy.
+# mem = "16G"
+
+# Used only for persistent GPU allocations. Zero disables the watchdog.
+idle_timeout = 30
+
+# Every cluster needs an explicit host. Any resource key from [defaults] may be
+# repeated here to override it for this cluster.
 [cluster.bouchet]
-# host = "bouchet.ycrc.yale.edu"   # default: <name>.ycrc.yale.edu
+host = "bouchet.ycrc.yale.edu"
 # partition = "day"
 # gpu_partition = "gpu"
+# time = "4:00:00"
+# cpus = 2
+# mem = "16G"
+# idle_timeout = 30
+
+# Additional clusters use the section name as the --cluster value. Qualify
+# ambiguous selectors as cluster:name or cluster:jobid.
+#
+# [cluster.grace]
+# host = "grace.ycrc.yale.edu"
+# partition = "day"

@@ -1,0 +1,528 @@
+from __future__ import annotations
+
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from hpc_alloc.commands import _recover_submission
+from hpc_alloc.errors import IdentityMismatch, ProtocolViolation, SchedulerUnavailable
+from hpc_alloc.models import JobKind, JobRef
+from hpc_alloc.ownership import format_tag, slurm_job_name
+from hpc_alloc.slurm import (
+    AccountingRecord,
+    CancellationInspectionStatus,
+    MAX_LOG_CHUNK_BYTES,
+    RawQueueScan,
+    SlurmClient,
+    SubmissionSpec,
+)
+from hpc_alloc.ssh import RemoteResult, RetryPolicy
+
+
+NONCE = "fixed"
+
+
+def framed(
+    payload: bytes | str,
+    *,
+    rc: int = 0,
+    declared: int | None = None,
+    stderr: str = "",
+) -> RemoteResult:
+    body = payload.encode() if isinstance(payload, str) else payload
+    length = len(body) if declared is None else declared
+    header = f"\x1eHPC_ALLOC_V2_{NONCE} {rc} {length}\n".encode()
+    return RemoteResult(0, b"banner before command\n" + header + body, stderr)
+
+
+class FakeTransport:
+    def __init__(self, replies: list[RemoteResult]) -> None:
+        self.replies = replies
+        self.calls: list[tuple[str, str, dict[str, object]]] = []
+
+    def run(self, cluster: str, command: str, **kwargs: object) -> RemoteResult:
+        self.calls.append((cluster, command, dict(kwargs)))
+        return self.replies.pop(0)
+
+
+class SlurmProtocolTests(unittest.TestCase):
+    def client(self, replies: list[RemoteResult]) -> tuple[SlurmClient, FakeTransport]:
+        transport = FakeTransport(replies)
+        return (
+            SlurmClient(transport, "grace", token_factory=lambda _size: NONCE),  # type: ignore[arg-type]
+            transport,
+        )
+
+    @staticmethod
+    def managed_ref() -> JobRef:
+        operation_id = "a" * 32
+        comment = format_tag("deadbeef1234", operation_id, "laptop", "run", None)
+        return JobRef(
+            cluster="grace",
+            job_id="123",
+            owner_id="deadbeef1234",
+            operation_id=operation_id,
+            slurm_job_name=slurm_job_name("run", operation_id),
+            slurm_comment=comment,
+        )
+
+    @staticmethod
+    def queue_payload(ref: JobRef, *, comment: str) -> str:
+        delimiter = f"__HPC_{NONCE}__"
+        fields = (
+            ref.job_id,
+            "RUNNING",
+            "node01",
+            "None",
+            "1:00:00",
+            "day",
+            ref.slurm_job_name,
+            "2026-07-10T11:00:00",
+            comment,
+        )
+        return delimiter.join(fields) + f"\n__HPC_TIME_{NONCE}__2026-07-10T12:00:00\n"
+
+    @staticmethod
+    def empty_queue_payload() -> str:
+        return f"\n__HPC_TIME_{NONCE}__2026-07-10T12:00:00\n"
+
+    def test_declared_length_mismatch_is_not_treated_as_valid_output(self) -> None:
+        client, _transport = self.client([framed(b"MISSING", declared=99)])
+        with self.assertRaisesRegex(ProtocolViolation, "length mismatch"):
+            client.log_size("log")
+
+    def test_payload_containing_exact_marker_is_not_reframed(self) -> None:
+        marker = b"\x1eHPC_ALLOC_V2_fixed 0 1\n"
+        payload = b"before" + marker + b"after\xff"
+        client, _transport = self.client([framed(payload)])
+        self.assertEqual(client.read_log_chunk("log", 0), payload)
+
+    def test_log_chunk_rejects_oversized_declared_frame_before_payload(self) -> None:
+        client, transport = self.client([framed(b"", declared=11)])
+        with self.assertRaisesRegex(ProtocolViolation, "payload limit"):
+            client.read_log_chunk("log", 7, limit=10)
+        command = transport.calls[0][1]
+        self.assertIn("tail -c +8 -- log | head -c 10", command)
+        self.assertIn('[ "$n" -le 10 ]', command)
+
+    def test_log_chunk_limit_validation_is_strict(self) -> None:
+        client, transport = self.client([])
+        for limit in (0, MAX_LOG_CHUNK_BYTES + 1, True, 1.5):
+            with self.subTest(limit=limit):
+                with self.assertRaises(ValueError):
+                    client.read_log_chunk("log", 0, limit=limit)  # type: ignore[arg-type]
+        self.assertEqual(transport.calls, [])
+
+    def test_tail_is_byte_bounded_even_when_line_count_is_large(self) -> None:
+        client, transport = self.client(
+            [framed(b"", declared=MAX_LOG_CHUNK_BYTES + 1)]
+        )
+        with self.assertRaisesRegex(ProtocolViolation, "payload limit"):
+            client.tail_log("log", 999_999)
+        command = transport.calls[0][1]
+        self.assertIn(f"tail -c {MAX_LOG_CHUNK_BYTES}", command)
+        self.assertIn(f'[ "$n" -le {MAX_LOG_CHUNK_BYTES} ]', command)
+
+    def test_nonzero_scheduler_status_is_typed_not_empty_snapshot(self) -> None:
+        client, _transport = self.client([framed(b"", rc=1)])
+        with self.assertRaises(SchedulerUnavailable):
+            client.snapshot()
+
+    def test_singleton_invalid_job_response_is_normalized_to_absence(self) -> None:
+        error = "slurm_load_jobs error: Invalid job id specified\n"
+        client, transport = self.client([framed(b"", rc=1, stderr=error)])
+        snapshot = client.snapshot(["123"])
+        self.assertEqual(dict(snapshot.rows), {})
+        self.assertIn(" -j 123 ", transport.calls[0][1])
+
+    def test_invalid_job_normalization_rejects_every_broader_shape(self) -> None:
+        exact_error = "slurm_load_jobs error: Invalid job id specified\n"
+        cases = (
+            ("unfiltered", None, framed(b"", rc=1, stderr=exact_error)),
+            ("multiple IDs", ["123", "124"], framed(b"", rc=1, stderr=exact_error)),
+            ("output bearing", ["123"], framed(b"\n", rc=1, stderr=exact_error)),
+            ("wrong rc", ["123"], framed(b"", rc=2, stderr=exact_error)),
+            (
+                "different error",
+                ["123"],
+                framed(b"", rc=1, stderr="slurm_load_jobs error: Socket timed out\n"),
+            ),
+            (
+                "extra stderr",
+                ["123"],
+                framed(b"", rc=1, stderr="warning\n" + exact_error),
+            ),
+            (
+                "extra trailing line",
+                ["123"],
+                framed(b"", rc=1, stderr=exact_error + "\n"),
+            ),
+        )
+        for label, selected, reply in cases:
+            with self.subTest(label=label):
+                client, _transport = self.client([reply])
+                with self.assertRaises(SchedulerUnavailable):
+                    client.snapshot(selected)
+
+    def test_broad_scan_preserves_valid_arrays_and_multi_node_expressions(self) -> None:
+        delimiter = f"__HPC_{NONCE}__"
+        rows = [
+            delimiter.join(
+                (
+                    "123_4",
+                    "RUNNING",
+                    "node[01-04]",
+                    "None",
+                    "1:00:00",
+                    "day",
+                    "foreign-array",
+                    "2026-07-10T11:00:00",
+                    "foreign-comment",
+                )
+            ),
+            delimiter.join(
+                (
+                    "987",
+                    "PENDING",
+                    "",
+                    "Resources",
+                    "2:00:00",
+                    "gpu*",
+                    "foreign-singleton",
+                    "2026-07-10T11:05:00",
+                    "",
+                )
+            ),
+        ]
+        payload = (
+            "\n".join(rows)
+            + f"\n__HPC_TIME_{NONCE}__2026-07-10T12:00:00\n"
+        )
+        client, transport = self.client([framed(payload)])
+        scan = client.scan()
+        self.assertEqual(
+            [candidate.job_id for candidate in scan.rows], ["123_4", "987"]
+        )
+        self.assertEqual(scan.rows[0].node, "node[01-04]")
+        self.assertEqual(scan.rows[1].partition, "gpu*")
+        self.assertNotIn(" -j ", transport.calls[0][1])
+
+    def test_targeted_observation_rejects_broad_only_shapes(self) -> None:
+        ref = self.managed_ref()
+        delimiter = f"__HPC_{NONCE}__"
+        array_row = delimiter.join(
+            (
+                "123_4",
+                "RUNNING",
+                "node01",
+                "None",
+                "1:00:00",
+                "day",
+                ref.slurm_job_name,
+                "2026-07-10T11:00:00",
+                ref.slurm_comment,
+            )
+        )
+        payload = (
+            array_row + f"\n__HPC_TIME_{NONCE}__2026-07-10T12:00:00\n"
+        )
+        client, _transport = self.client([framed(payload)])
+        with self.assertRaisesRegex(ProtocolViolation, "unexpected job IDs"):
+            client.observe(ref)
+
+        multi_node = self.queue_payload(ref, comment=ref.slurm_comment).replace(
+            "node01", "node[01-04]", 1
+        )
+        client, _transport = self.client([framed(multi_node)])
+        with self.assertRaisesRegex(ProtocolViolation, "compute-node name"):
+            client.observe(ref)
+
+    def test_broad_scan_fails_closed_on_malformed_or_control_bearing_rows(self) -> None:
+        delimiter = f"__HPC_{NONCE}__"
+        clock = f"\n__HPC_TIME_{NONCE}__2026-07-10T12:00:00\n"
+        valid = [
+            "123_4",
+            "RUNNING",
+            "node[01-04]",
+            "None",
+            "1:00:00",
+            "day",
+            "foreign",
+            "2026-07-10T11:00:00",
+            "comment",
+        ]
+        cases = {
+            "field count": delimiter.join(valid[:-1]) + clock,
+            "control": delimiter.join((*valid[:-1], "bad\tcomment")) + clock,
+            "oversized": delimiter.join(
+                (*valid[:-1], "x" * (64 * 1024 + 1))
+            )
+            + clock,
+        }
+        for label, payload in cases.items():
+            with self.subTest(label=label):
+                client, _transport = self.client([framed(payload)])
+                with self.assertRaises(ProtocolViolation):
+                    client.scan()
+
+        client, _transport = self.client(
+            [framed(b"123\xff\n__HPC_TIME_fixed__2026-07-10T12:00:00\n")]
+        )
+        with self.assertRaisesRegex(ProtocolViolation, "non-UTF-8"):
+            client.scan()
+
+    def test_broad_scan_frame_has_a_hard_payload_ceiling(self) -> None:
+        client, transport = self.client(
+            [framed(b"", declared=32 * 1024 * 1024 + 1)]
+        )
+        with self.assertRaisesRegex(ProtocolViolation, "payload limit"):
+            client.scan()
+        self.assertIn('[ "$n" -le 33554432 ]', transport.calls[0][1])
+
+    def test_singleton_absence_can_fall_through_to_exact_accounting(self) -> None:
+        ref = self.managed_ref()
+        invalid = framed(
+            b"",
+            rc=1,
+            stderr="slurm_load_jobs error: Invalid job id specified\n",
+        )
+        accounting = framed(
+            f"{ref.job_id}|COMPLETED|0:0|{ref.slurm_job_name}|\n"
+        )
+        client, _transport = self.client([invalid, accounting])
+        self.assertIsNone(client.observe(ref))
+        record = client.final(ref)
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.state_code, "COMPLETED")
+
+    def test_accounting_requires_exact_job_id_not_first_line(self) -> None:
+        payload = "999|COMPLETED|0:0|other|tag\n"
+        client, _transport = self.client([framed(payload)])
+        with self.assertRaisesRegex(ProtocolViolation, "no trustworthy exact record"):
+            client.accounting("123")
+
+    def test_accounting_accepts_only_exact_derived_name_when_comment_is_omitted(self) -> None:
+        ref = self.managed_ref()
+        payload = f"{ref.job_id}|COMPLETED|0:0|{ref.slurm_job_name}|\n"
+        client, _transport = self.client([framed(payload)])
+        record = client.accounting(ref)
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.comment, "")
+
+        wrong_name = slurm_job_name("run", "b" * 32)
+        client, _transport = self.client(
+            [framed(f"{ref.job_id}|COMPLETED|0:0|{wrong_name}|\n")]
+        )
+        self.assertIsNone(client.accounting(ref))
+
+        corrupt_ref = JobRef(
+            cluster=ref.cluster,
+            job_id=ref.job_id,
+            owner_id=ref.owner_id,
+            operation_id=ref.operation_id,
+            slurm_job_name="manually-chosen-name",
+            slurm_comment=ref.slurm_comment,
+        )
+        client, _transport = self.client(
+            [framed(f"{ref.job_id}|COMPLETED|0:0|manually-chosen-name|\n")]
+        )
+        with self.assertRaises(IdentityMismatch):
+            client.accounting(corrupt_ref)
+
+    def test_accounting_rejects_every_nonblank_comment_mismatch(self) -> None:
+        ref = self.managed_ref()
+        wrong_comment = format_tag(
+            "deadbeef1234", ref.operation_id, "other-host", "run", None
+        )
+        client, _transport = self.client(
+            [
+                framed(
+                    f"{ref.job_id}|COMPLETED|0:0|{ref.slurm_job_name}|{wrong_comment}\n"
+                )
+            ]
+        )
+        with self.assertRaises(IdentityMismatch):
+            client.accounting(ref)
+
+        client, _transport = self.client(
+            [framed(f"{ref.job_id}|COMPLETED|0:0|{ref.slurm_job_name}| \n")]
+        )
+        with self.assertRaises(IdentityMismatch):
+            client.accounting(ref)
+
+    def test_accounting_filters_recycled_ids_by_operation_name_before_duplicates(self) -> None:
+        ref = self.managed_ref()
+        old_name = slurm_job_name("run", "b" * 32)
+        old = f"{ref.job_id}|COMPLETED|0:0|{old_name}|old-comment\n"
+        current = (
+            f"{ref.job_id}|RUNNING|0:0|{ref.slurm_job_name}|{ref.slurm_comment}\n"
+        )
+        for payload in (old + current, current + old):
+            with self.subTest(old_record_first=payload.startswith(old)):
+                client, _transport = self.client([framed(payload)])
+                record = client.accounting(ref)
+                self.assertIsNotNone(record)
+                assert record is not None
+                self.assertEqual(record.job_name, ref.slurm_job_name)
+                self.assertEqual(record.state_code, "RUNNING")
+
+        client, _transport = self.client([framed(old)])
+        self.assertIsNone(client.accounting(ref))
+
+        client, _transport = self.client([framed(old + old)])
+        self.assertIsNone(
+            client.accounting(ref),
+            "duplicate records for foreign operations remain irrelevant",
+        )
+
+    def test_accounting_rejects_foreign_name_with_exact_operation_comment(self) -> None:
+        ref = self.managed_ref()
+        foreign_name = slurm_job_name("run", "b" * 32)
+        client, _transport = self.client(
+            [
+                framed(
+                    f"{ref.job_id}|COMPLETED|0:0|{foreign_name}|"
+                    f"{ref.slurm_comment}\n"
+                )
+            ]
+        )
+
+        with self.assertRaises(IdentityMismatch):
+            client.accounting(ref)
+
+    def test_accounting_still_rejects_ambiguous_current_or_raw_id_records(self) -> None:
+        ref = self.managed_ref()
+        current = (
+            f"{ref.job_id}|COMPLETED|0:0|{ref.slurm_job_name}|{ref.slurm_comment}\n"
+        )
+        client, _transport = self.client([framed(current + current)])
+        with self.assertRaisesRegex(ProtocolViolation, "duplicate parent"):
+            client.accounting(ref)
+
+        client, _transport = self.client([framed(current + current)])
+        with self.assertRaisesRegex(ProtocolViolation, "duplicate parent"):
+            client.accounting(ref.job_id)
+
+    def test_live_queue_and_mutation_still_require_the_full_comment(self) -> None:
+        ref = self.managed_ref()
+        client, _transport = self.client([framed(self.queue_payload(ref, comment=""))])
+        with self.assertRaises(IdentityMismatch):
+            client.observe(ref)
+
+        client, transport = self.client([framed(self.queue_payload(ref, comment=""))])
+        result = client.inspect_cancel(ref)
+        self.assertEqual(
+            result.status, CancellationInspectionStatus.IDENTITY_MISMATCH
+        )
+        self.assertEqual(len(transport.calls), 1, "blank live comment must stop before scancel")
+
+    def test_absent_cancel_may_use_exact_final_accounting_with_omitted_comment(self) -> None:
+        ref = self.managed_ref()
+        accounting = f"{ref.job_id}|COMPLETED|0:0|{ref.slurm_job_name}|\n"
+        client, transport = self.client(
+            [framed(self.empty_queue_payload()), framed(accounting)]
+        )
+        result = client.inspect_cancel(ref)
+        self.assertEqual(
+            result.status, CancellationInspectionStatus.ALREADY_FINAL
+        )
+        self.assertEqual(len(transport.calls), 2)
+        self.assertNotIn("scancel", transport.calls[-1][1])
+
+    def test_recovery_uses_accounting_specific_identity_rule(self) -> None:
+        ref = self.managed_ref()
+        record = AccountingRecord(
+            ref.job_id, "COMPLETED", "0:0", ref.slurm_job_name, ""
+        )
+
+        class State:
+            def __init__(self) -> None:
+                self.acknowledged: tuple[str, str] | None = None
+                self.updated = False
+
+            def acknowledge_submission(self, operation_id: str, job_id: str):
+                self.acknowledged = (operation_id, job_id)
+                return SimpleNamespace(operation_id=operation_id)
+
+            def update_job(self, _operation_id: str, **_changes: object) -> None:
+                self.updated = True
+
+        class Client:
+            def __init__(self) -> None:
+                self.accounting_verified = False
+
+            def scan(self, **_kwargs: object) -> RawQueueScan:
+                return RawQueueScan(())
+
+            def find_accounting_by_name(self, _job_name: str, **_kwargs: object):
+                return record
+
+            def verify_accounting_identity(
+                self, candidate: JobRef, job_name: str, comment: str
+            ) -> None:
+                SlurmClient.verify_accounting_identity(candidate, job_name, comment)
+                self.accounting_verified = True
+
+            def verify_live_identity(self, *_args: object) -> None:
+                raise AssertionError("recovery must not apply the live queue comment rule")
+
+        state = State()
+        client = Client()
+        context = SimpleNamespace(state=state)
+        operation = SimpleNamespace(operation_id=ref.operation_id, cluster=ref.cluster)
+        job = SimpleNamespace(
+            owner_id=ref.owner_id,
+            slurm_job_name=ref.slurm_job_name,
+            slurm_comment=ref.slurm_comment,
+        )
+        with patch("hpc_alloc.commands.info"):
+            recovered = _recover_submission(context, client, operation, job)
+        self.assertTrue(recovered)
+        self.assertTrue(client.accounting_verified)
+        self.assertEqual(state.acknowledged, (ref.operation_id, ref.job_id))
+        self.assertTrue(state.updated)
+
+    def test_recovery_lookup_filters_exact_name_and_refuses_duplicates(self) -> None:
+        name = "hpcalloc-v2-run-" + "a" * 32
+        one = f"123|COMPLETED|0:0|{name}|tag\n"
+        client, transport = self.client([framed(one)])
+        record = client.find_accounting_by_name(name)
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.job_id, "123")
+        self.assertIn("sacct -X", transport.calls[0][1])
+        self.assertEqual(transport.calls[0][2]["retry"], RetryPolicy.SAFE_READ)
+
+        duplicate = one + f"124|FAILED|1:0|{name}|tag\n"
+        client, _transport = self.client([framed(duplicate)])
+        with self.assertRaisesRegex(ProtocolViolation, "multiple records"):
+            client.find_accounting_by_name(name)
+
+    def test_submission_spec_owns_quoting_and_identity_metadata(self) -> None:
+        spec = SubmissionSpec(
+            operation_id="a" * 32,
+            owner_id="deadbeef1234",
+            owner_host="laptop",
+            kind=JobKind.RUN,
+            logical_name="run",
+            partition="day",
+            walltime="1:00:00",
+            cpus=2,
+            logfile="/home/me/a log-%j.txt",
+            wrap="python -c 'print(1)'",
+        )
+        command = spec.command()
+        self.assertIn("sbatch --parsable", command)
+        self.assertIn(spec.job_name, command)
+        self.assertIn("hpc-alloc:v2:deadbeef1234", command)
+        self.assertIn("'/home/me/a log-%j.txt'", command)
+        self.assertIn("mkdir -p", spec.preparation_command())
+        self.assertNotIn("sbatch", spec.preparation_command())
+        self.assertTrue(spec.sbatch_command().startswith("sbatch --parsable"))
+        self.assertNotIn("mkdir", spec.sbatch_command())
+
+
+if __name__ == "__main__":
+    unittest.main()

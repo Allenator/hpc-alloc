@@ -1,0 +1,1710 @@
+"""Command orchestration for hpc-alloc v2.
+
+Services in this module may format user output, but transport, Slurm parsing,
+lifecycle policy, and durable transactions remain in their dedicated modules.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import platform
+import re
+import shlex
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Callable
+
+from .config import Config
+from .errors import (
+    AmbiguousSubmission,
+    AuthRequired,
+    ConfigInvalid,
+    HpcAllocError,
+    HostKeyChanged,
+    IdentityMismatch,
+    LocalToolUnavailable,
+    RecordNotFound,
+    StateConflict,
+    TransportLost,
+)
+from .models import FinalSource, JobKind, JobPhase, OperationKind, OperationPhase
+from .ownership import normalize_host_label, parse_tag, slurm_job_name
+from .paths import AppPaths
+from .selectors import SelectorKind, canonical_job_selector, parse_selector, unique_job
+from .ssh_config import (
+    allocation_alias,
+    atomic_write_600,
+    ensure_include,
+    sync_managed_config,
+)
+
+
+DEFAULT_PARTITION = "day"
+DEFAULT_GPU_PARTITION = "gpu"
+DEFAULT_TIME = "4:00:00"
+DEFAULT_CPUS = 2
+DEFAULT_GPU_IDLE_MINUTES = 30
+REMOTE_LOG_DIR = ".hpc-alloc"
+NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}\Z")
+GPU_RE = re.compile(r"(?:[A-Za-z0-9][A-Za-z0-9_.-]*:)?[1-9][0-9]*\Z")
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _is_job_id(value: str) -> bool:
+    return re.fullmatch(r"[0-9]+", value) is not None
+
+
+def info(message: str) -> None:
+    print(f"hpc-alloc: {message}", file=sys.stderr, flush=True)
+
+
+def machine_host() -> str:
+    return normalize_host_label(platform.node())
+
+
+def _sync_ssh_projection(ctx: Any, paths: AppPaths) -> bool:
+    return sync_managed_config(
+        config_path=paths.config_file,
+        repository=ctx.state,
+        managed_path=paths.managed_ssh_config,
+        lock_path=paths.ssh_config_lock,
+        known_hosts=paths.known_hosts,
+    )
+
+
+def _toml_string(value: str) -> str:
+    # TOML basic strings use JSON-compatible escaping for this validated subset.
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _render_initial_config(netid: str, cluster: str, host: str, identity_file: str | None) -> str:
+    identity_line = (
+        f"identity_file = {_toml_string(identity_file)}\n" if identity_file else ""
+    )
+    return (
+        "# hpc-alloc v2 configuration (Python 3.11+).\n\n"
+        "[identity]\n"
+        f"netid = {_toml_string(netid)}\n\n"
+        "[ssh]\n"
+        f"{identity_line}\n"
+        "[defaults]\n"
+        f"cluster = {_toml_string(cluster)}\n"
+        "# partition = \"day\"\n"
+        "# gpu_partition = \"gpu\"\n"
+        "# time = \"4:00:00\"\n"
+        "# cpus = 2\n"
+        "# mem = \"16G\"\n"
+        "# idle_timeout = 30\n\n"
+        f"[cluster.{cluster}]\n"
+        f"host = {_toml_string(host)}\n"
+    )
+
+
+def _existing_ssh_key(paths: AppPaths) -> tuple[Path, str] | None:
+    for filename in (
+        "id_ed25519_hpc_alloc.pub",
+        "id_ed25519.pub",
+        "id_rsa.pub",
+        "id_ecdsa.pub",
+    ):
+        public = paths.ssh_dir / filename
+        private = public.with_suffix("")
+        if public.is_file() and private.is_file():
+            return public, "~/.ssh/" + filename.removesuffix(".pub")
+    return None
+
+
+def _find_or_create_ssh_key(paths: AppPaths) -> tuple[Path, str]:
+    existing = _existing_ssh_key(paths)
+    if existing is not None:
+        return existing
+    try:
+        paths.ssh_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        paths.ssh_dir.chmod(0o700)
+    except OSError as exc:
+        raise ConfigInvalid(f"cannot prepare {paths.ssh_dir}: {exc}") from exc
+    private = paths.ssh_dir / "id_ed25519_hpc_alloc"
+    if private.exists() or private.with_suffix(".pub").exists():
+        raise ConfigInvalid(
+            f"incomplete SSH key pair at {private}; repair or remove both key files"
+        )
+    info("no SSH key found — generating an ed25519 key")
+    command = ["ssh-keygen", "-t", "ed25519", "-f", str(private)]
+    if not sys.stdin.isatty():
+        command += ["-N", ""]
+    try:
+        subprocess.run(command, check=True)
+    except FileNotFoundError as exc:
+        raise ConfigInvalid("ssh-keygen is required for setup but was not found") from exc
+    except subprocess.CalledProcessError as exc:
+        raise ConfigInvalid(f"ssh-keygen failed with exit status {exc.returncode}") from exc
+    except OSError as exc:
+        raise ConfigInvalid(f"cannot execute ssh-keygen: {exc}") from exc
+    return private.with_suffix(".pub"), "~/.ssh/id_ed25519_hpc_alloc"
+
+
+def cmd_setup(args: Any, *, paths: AppPaths, entrypoint: Path) -> int:
+    from .state import StateRepository
+
+    netid = args.netid
+    if not netid and sys.stdin.isatty():
+        netid = input("Yale NetID: ").strip()
+    if not netid:
+        raise ConfigInvalid("NetID required: hpc-alloc setup --netid YOUR_NETID")
+    cluster = args.cluster
+    if not NAME_RE.fullmatch(cluster):
+        raise ConfigInvalid(f"invalid cluster name {cluster!r}")
+    host = args.host or f"{cluster}.ycrc.yale.edu"
+
+    if paths.config_file.exists() and not args.force:
+        raise ConfigInvalid(
+            "v2 configuration already exists; pass setup --force to replace it",
+            path=paths.config_file,
+        )
+
+    # Validate all user input and the SSH-config target before generating a key
+    # or committing durable state.
+    from .ssh_config import resolve_user_ssh_config
+
+    resolve_user_ssh_config(paths.user_ssh_config)
+    existing_key = _existing_ssh_key(paths)
+    planned_identity = (
+        existing_key[1] if existing_key else "~/.ssh/id_ed25519_hpc_alloc"
+    )
+    text = _render_initial_config(netid, cluster, host, planned_identity)
+    try:
+        paths.config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        paths.config_dir.chmod(0o700)
+    except OSError as exc:
+        raise ConfigInvalid(f"cannot prepare {paths.config_dir}: {exc}") from exc
+    # Parse the staged bytes before committing anything.
+    staged = paths.config_dir / f".config.validate.{uuid.uuid4().hex}.toml"
+    atomic_write_600(staged, text)
+    try:
+        Config.load(staged)
+    finally:
+        staged.unlink(missing_ok=True)
+
+    public_key, identity_file = _find_or_create_ssh_key(paths)
+    if identity_file != planned_identity:
+        raise StateConflict("SSH key selection changed during setup; rerun setup")
+    try:
+        encoded_key = public_key.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError) as exc:
+        raise ConfigInvalid(f"cannot read SSH public key {public_key}: {exc}") from exc
+    if not encoded_key:
+        raise ConfigInvalid(f"SSH public key {public_key} is empty")
+
+    repository = StateRepository(paths.state_db)
+    repository.initialize()
+    repository.get_or_create_machine_id(machine_host())
+    atomic_write_600(paths.config_file, text)
+    sync_managed_config(
+        config_path=paths.config_file,
+        repository=repository,
+        managed_path=paths.managed_ssh_config,
+        lock_path=paths.ssh_config_lock,
+        known_hosts=paths.known_hosts,
+    )
+    ensure_include(paths.user_ssh_config)
+    info(f"configured cluster {cluster!r} ({host}) for NetID {netid!r}")
+    print("Your SSH public key:")
+    print("  " + encoded_key)
+    print("\nNext: upload it at https://sshkeys.ycrc.yale.edu/, then run hpc-alloc connect")
+    return 0
+
+
+def _load_context(args: Any, paths: AppPaths) -> Any:
+    from .context import RuntimeContext
+
+    context_command = args.command_name
+    if context_command in {"up", "run"} and getattr(args, "dry_run", False):
+        # A dry run needs authoritative config, but must not initialize or
+        # mutate the journal merely to render a command.
+        context_command = "dry-run"
+    return RuntimeContext.load(
+        command=context_command,
+        explicit_cluster=getattr(args, "cluster", None),
+        paths=paths,
+    )
+
+
+def cmd_config(args: Any, *, ctx: Any, **_kwargs: Any) -> int:
+    if ctx.config is None:
+        assert ctx.config_error is not None
+        print(
+            json.dumps({"config_file": str(ctx.paths.config_file), "error": str(ctx.config_error)}, indent=2)
+            if args.json
+            else f"invalid configuration: {ctx.config_error}"
+        )
+        return 1
+    cluster = ctx.config.resolve_cluster(args.cluster)
+    payload = {
+        "config_file": str(ctx.config.path),
+        "state_file": str(ctx.paths.state_db),
+        "primary_cluster": cluster,
+        "config": ctx.config.as_dict(),
+        "effective": {
+            key: ctx.config.resolve_option(key, cluster, fallback=fallback)
+            for key, fallback in {
+                "partition": DEFAULT_PARTITION,
+                "gpu_partition": DEFAULT_GPU_PARTITION,
+                "time": DEFAULT_TIME,
+                "cpus": DEFAULT_CPUS,
+                "mem": None,
+                "idle_timeout": DEFAULT_GPU_IDLE_MINUTES,
+            }.items()
+        },
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return 0
+    info(f"validated config: {ctx.config.path}; effective for {cluster!r}")
+    print(f"  netid            {ctx.config.identity.netid}")
+    print(f"  identity_file    {ctx.config.ssh.identity_file or '(ssh defaults)'}")
+    for key, value in payload["effective"].items():
+        print(f"  {key:<16} {value if value is not None else '(Slurm default)'}")
+    return 0
+
+
+def _services(ctx: Any, paths: AppPaths, entrypoint: Path, cluster: str | None = None) -> tuple[Any, Any]:
+    from .slurm import SlurmClient
+    from .ssh import SshTransport
+    selected = ctx.config.resolve_cluster(cluster or getattr(ctx, "primary_cluster", None))
+    transport = SshTransport(
+        ctx.config,
+        paths,
+        entrypoint=entrypoint,
+        state_repository=ctx.state,
+        alias_provider=lambda name: (
+            allocation_alias(job.cluster, job.logical_name)
+            for job in ctx.state.list_jobs(include_final=False)
+            if job.cluster == name
+            and job.kind == JobKind.ALLOCATION
+            and job.current_node
+        ),
+        info=info,
+    )
+    return transport, SlurmClient(transport, selected)
+
+
+def _validate_positive(value: int | None, name: str, default: int) -> int:
+    result = default if value is None else value
+    if result <= 0:
+        raise ConfigInvalid(f"{name} must be positive")
+    return result
+
+
+def _resource_values(args: Any, config: Config, cluster: str) -> dict[str, Any]:
+    gpus = getattr(args, "gpus", None)
+    if gpus is not None and GPU_RE.fullmatch(gpus) is None:
+        raise ConfigInvalid("--gpus must be NUMBER or TYPE:NUMBER with a positive count")
+    partition = getattr(args, "partition", None)
+    if partition is None:
+        partition = config.resolve_option(
+            "gpu_partition" if gpus else "partition",
+            cluster,
+            fallback=DEFAULT_GPU_PARTITION if gpus else DEFAULT_PARTITION,
+        )
+        if gpus:
+            info(f"--gpus given without --partition; using {partition!r}")
+    walltime = getattr(args, "time", None) or config.resolve_option(
+        "time", cluster, fallback=DEFAULT_TIME
+    )
+    cpus = _validate_positive(
+        getattr(args, "cpus", None),
+        "--cpus",
+        int(config.resolve_option("cpus", cluster, fallback=DEFAULT_CPUS)),
+    )
+    memory = getattr(args, "mem", None)
+    if memory is None:
+        memory = config.resolve_option("mem", cluster, fallback=None)
+    idle = getattr(args, "idle_timeout", None)
+    if idle is not None and gpus is None:
+        raise ConfigInvalid("--idle-timeout applies only when --gpus is requested")
+    if idle is None:
+        idle = int(
+            config.resolve_option(
+                "idle_timeout", cluster, fallback=DEFAULT_GPU_IDLE_MINUTES
+            )
+        )
+    if idle < 0:
+        raise ConfigInvalid("--idle-timeout must be non-negative")
+    resources = {
+        "partition": partition,
+        "time": walltime,
+        "cpus": cpus,
+        "mem": memory,
+        "gpus": gpus,
+        "constraint": getattr(args, "constraint", None),
+        "idle_timeout": idle if gpus and idle else None,
+        "chdir": getattr(args, "chdir", None),
+    }
+    for key in ("partition", "time", "cpus", "mem"):
+        if resources[key] is not None:
+            Config.validate_resource_override(key, resources[key])
+    constraint = resources["constraint"]
+    if constraint is not None and (not constraint or CONTROL_RE.search(constraint)):
+        raise ConfigInvalid("--constraint must be non-empty and contain no control characters")
+    chdir = resources["chdir"]
+    if chdir is not None and (not chdir or CONTROL_RE.search(chdir)):
+        raise ConfigInvalid("--chdir must be non-empty and contain no control characters")
+    return resources
+
+
+def _sleeper_command(idle_minutes: int | None) -> str:
+    if not idle_minutes:
+        return "sleep infinity"
+    return (
+        f'echo "hpc-alloc: self-releases after {idle_minutes} min of GPU idleness"; '
+        "idle=0; while true; do sleep 60; "
+        "u=$(nvidia-smi --query-gpu=utilization.gpu "
+        "--format=csv,noheader,nounits 2>/dev/null | sort -rn | head -n1); "
+        'case "$u" in ""|*[!0-9]*) u=100;; esac; '
+        'if [ "$u" -gt 5 ]; then idle=0; else idle=$((idle+1)); fi; '
+        f'if [ "$idle" -ge {idle_minutes} ]; then '
+        'echo "hpc-alloc: GPU idle timeout, releasing"; exit 0; fi; done'
+    )
+
+
+def _remote_command(tokens: list[str]) -> str:
+    """Preserve one explicit shell string or quote a multi-token argv."""
+
+    if not tokens:
+        raise ConfigInvalid("remote command cannot be empty")
+    return tokens[0] if len(tokens) == 1 else shlex.join(tokens)
+
+
+def cmd_connect(
+    args: Any, *, ctx: Any, paths: AppPaths, entrypoint: Path, **_kwargs: Any
+) -> int:
+    from .errors import AuthRequired, HostKeyChanged
+    from .ssh import AuthMode, ProbeStatus, RetryPolicy
+    cluster = ctx.config.resolve_cluster(args.cluster)
+    transport, _client = _services(ctx, paths, entrypoint, cluster)
+    if args.reset:
+        transport.heal(cluster)
+        info(f"closed SSH masters for {cluster} and swept dead sockets")
+    if args.push:
+        status = transport.probe(cluster)
+        if status != ProbeStatus.OK and transport.master_alive(cluster):
+            transport.heal(cluster)
+            status = transport.probe(cluster)
+        if status == ProbeStatus.AUTH:
+            transport.push_login(cluster)
+    transport.bootstrap(cluster, AuthMode.INTERACTIVE_BOOTSTRAP)
+    result = transport.run(
+        cluster,
+        "hostname",
+        auth=AuthMode.NONINTERACTIVE,
+        retry=RetryPolicy.SAFE_READ,
+    )
+    if result.returncode != 0:
+        raise HpcAllocError(result.stderr.strip() or f"hostname failed on {cluster}")
+    info(f"login OK: {result.stdout_text.strip()}")
+    host_key_failure: HostKeyChanged | None = None
+    for job in ctx.state.list_jobs(include_final=False):
+        if job.cluster != cluster or job.kind != JobKind.ALLOCATION or not job.current_node:
+            continue
+        alias = allocation_alias(job.cluster, job.logical_name)
+        try:
+            transport.require_node(alias)
+        except HostKeyChanged as exc:
+            info(f"node {job.current_node} ({job.logical_name!r}): host-key")
+            host_key_failure = host_key_failure or exc
+        except AuthRequired:
+            info(f"node {job.current_node} ({job.logical_name!r}): auth")
+        except TransportLost:
+            info(f"node {job.current_node} ({job.logical_name!r}): network")
+        else:
+            info(f"node {job.current_node} ({job.logical_name!r}): ok")
+    if host_key_failure is not None:
+        raise host_key_failure
+    return 0
+
+
+def cmd_partitions(
+    args: Any, *, ctx: Any, paths: AppPaths, entrypoint: Path, **_kwargs: Any
+) -> int:
+    cluster = ctx.config.resolve_cluster(args.cluster)
+    transport, client = _services(ctx, paths, entrypoint, cluster)
+    transport.bootstrap(cluster)
+    text = client.partitions()
+    parsed = [line.split("|") for line in text.strip().splitlines() if line.strip()]
+    keys = ["partition", "avail", "timelimit", "nodes", "cpus", "memory", "gres", "features"]
+    rows = [dict(zip(keys, row)) for row in parsed[1:] if len(row) == len(keys)]
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        info("no partitions returned")
+        return 0
+    widths = {key: max(len(key), *(len(str(row.get(key, ""))) for row in rows)) for key in keys}
+    print("  ".join(key.upper().ljust(widths[key]) for key in keys))
+    for row in rows:
+        print("  ".join(str(row.get(key, "")).ljust(widths[key]) for key in keys))
+    return 0
+
+
+def cmd_avail(
+    args: Any, *, ctx: Any, paths: AppPaths, entrypoint: Path, **_kwargs: Any
+) -> int:
+    cluster = ctx.config.resolve_cluster(args.cluster)
+    transport, client = _services(ctx, paths, entrypoint, cluster)
+    transport.bootstrap(cluster)
+    text = client.availability()
+    payload: dict[str, Any] = {}
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 6:
+            continue
+        name, node_state, _node, gres, gres_used, cpus = fields[:6]
+        name = name.rstrip("*")
+        if args.partition and name != args.partition:
+            continue
+        part = payload.setdefault(
+            name,
+            {
+                "nodes": {"idle": 0, "mix": 0, "alloc": 0, "other": 0},
+                "cpus_idle": 0,
+                "cpus_total": 0,
+                "gpus": {},
+            },
+        )
+        normalized = node_state.rstrip("*~#%!$@+^-").lower()
+        if normalized.startswith("idle"):
+            category = "idle"
+        elif normalized.startswith("mix"):
+            category = "mix"
+        elif normalized.startswith(("alloc", "comp")):
+            category = "alloc"
+        else:
+            category = "other"
+        part["nodes"][category] += 1
+        if category == "other":
+            continue
+        try:
+            _allocated, idle, _other, total = (int(value) for value in cpus.split("/"))
+        except (ValueError, TypeError):
+            raise HpcAllocError(f"scheduler returned invalid CPU accounting: {cpus!r}")
+        part["cpus_idle"] += idle
+        part["cpus_total"] += total
+        for source, key in ((gres, "total"), (gres_used, "used")):
+            for gpu_type, count in re.findall(r"gpu:(?:([^:,()\s]+):)?(\d+)", source or ""):
+                label = gpu_type or "gpu"
+                entry = part["gpus"].setdefault(label, {"total": 0, "used": 0})
+                entry[key] += int(count)
+    for part in payload.values():
+        for gpu in part["gpus"].values():
+            gpu["free"] = gpu["total"] - gpu["used"]
+    if args.json:
+        print(json.dumps({"partitions": payload}, indent=2))
+        return 0
+    if not payload:
+        info("no matching partitions")
+        return 0
+    fmt = "{:<14} {:<22} {:<16} {}"
+    print(fmt.format("PARTITION", "NODES idle/mix/alloc/off", "CPUS free/total", "GPUS free/total"))
+    for name, part in sorted(payload.items()):
+        nodes = part["nodes"]
+        gpus = "  ".join(
+            f"{kind} {data['free']}/{data['total']}" for kind, data in sorted(part["gpus"].items())
+        ) or "-"
+        print(
+            fmt.format(
+                name,
+                f"{nodes['idle']}/{nodes['mix']}/{nodes['alloc']}/{nodes['other']}",
+                f"{part['cpus_idle']}/{part['cpus_total']}",
+                gpus,
+            )
+        )
+    return 0
+
+
+def _assessment_payload(job: Any, assessment: Any) -> dict[str, Any]:
+    return {
+        "operation_id": job.operation_id,
+        "selector": canonical_job_selector(job),
+        "jobid": job.job_id,
+        "cluster": job.cluster,
+        "name": job.logical_name,
+        "kind": job.kind.value,
+        "phase": assessment.phase.value,
+        "scheduler_state": assessment.scheduler_state,
+        "evidence_detail": assessment.detail or None,
+        "ever_started": job.ever_started,
+        "current_node": job.current_node,
+        "last_node": job.last_node,
+        "terminal_state": job.terminal_state,
+        "exit_code": job.exit_code,
+        "final_source": job.final_source.value if job.final_source else None,
+        "partition": job.resources.get("partition"),
+        "time": job.resources.get("time"),
+        "gpus": job.resources.get("gpus"),
+        "alias": (
+            allocation_alias(job.cluster, job.logical_name)
+            if job.kind == JobKind.ALLOCATION and assessment.current_node
+            else None
+        ),
+    }
+
+
+def cmd_status(
+    args: Any, *, ctx: Any, paths: AppPaths, entrypoint: Path, **_kwargs: Any
+) -> int:
+    from .errors import AuthRequired, HostKeyChanged, SchedulerUnavailable
+    from .monitor import JobMonitor, persist_assessment
+    from .ssh import AuthMode
+
+    # Correlate the entire pass against one local identity graph.  In
+    # particular, remember jobs that were live at the start even if this pass
+    # finalizes them, so their already-captured remote rows are never emitted a
+    # second time as local-final conflicts.
+    local_at_start = ctx.state.list_jobs(include_final=True)
+    jobs = [job for job in local_at_start if job.phase != JobPhase.FINAL]
+    local_by_identity = {
+        (job.cluster, job.operation_id): job for job in local_at_start
+    }
+    rows: list[dict[str, Any]] = []
+    discovered: list[dict[str, Any]] = []
+    primary = ctx.config.resolve_cluster(None)
+    scans: dict[str, Any] = {}
+    clients: dict[str, Any] = {}
+    # Connectivity, authentication, and scheduler outages on a secondary are
+    # soft availability failures.  A changed host key is an integrity failure
+    # on every cluster and must never be hidden behind successful status JSON.
+    soft_availability_errors = (TransportLost, AuthRequired, SchedulerUnavailable)
+    for cluster in ctx.config.clusters:
+        transport, client = _services(ctx, paths, entrypoint, cluster)
+        clients[cluster] = client
+        auth = AuthMode.INTERACTIVE_BOOTSTRAP if cluster == primary else AuthMode.NONINTERACTIVE
+        try:
+            transport.bootstrap(cluster, auth)
+            scans[cluster] = client.scan(auth=AuthMode.NONINTERACTIVE)
+        except HostKeyChanged:
+            raise
+        except soft_availability_errors as exc:
+            if cluster == primary:
+                raise
+            info(f"note: cluster {cluster!r} unavailable ({exc}); preserving its state")
+            scans[cluster] = None
+
+    for job in jobs:
+        if job.job_id is None:
+            assessment = JobMonitor.tracker(job).assessment
+            payload = _assessment_payload(job, assessment)
+            payload["phase"] = job.phase.value
+            rows.append(payload)
+            continue
+        if scans.get(job.cluster) is None:
+            payload = _assessment_payload(job, JobMonitor.tracker(job).assessment)
+            payload["phase"] = "UNCERTAIN"
+            rows.append(payload)
+            continue
+        client = clients[job.cluster]
+        try:
+            assessment = JobMonitor(client).assess(
+                job, auth=AuthMode.NONINTERACTIVE
+            ).assessment
+        except HostKeyChanged:
+            raise
+        except soft_availability_errors as exc:
+            if job.cluster == primary:
+                raise
+            info(
+                f"note: cluster {job.cluster!r} unavailable during managed observation "
+                f"({exc}); preserving its state"
+            )
+            scans[job.cluster] = None
+            payload = _assessment_payload(job, JobMonitor.tracker(job).assessment)
+            payload["phase"] = "UNCERTAIN"
+            rows.append(payload)
+            continue
+        updated = persist_assessment(ctx.state, job, assessment)
+        rows.append(_assessment_payload(updated, assessment))
+
+    machine = ctx.state.get_machine()
+    owner_id = machine.machine_id if machine else ""
+    remote_groups: dict[tuple[str, str], list[tuple[Any, Any, bool]]] = {}
+    for cluster, scan in scans.items():
+        if scan is None:
+            continue
+        for row in scan.rows:
+            tag = parse_tag(row.comment)
+            if tag is None:
+                continue
+            exact_derived_name = row.name == slurm_job_name(tag.kind, tag.operation_id)
+            remote_groups.setdefault((cluster, tag.operation_id), []).append(
+                (row, tag, exact_derived_name)
+            )
+
+    for identity, group in sorted(remote_groups.items()):
+        cluster, operation_id = identity
+        local = local_by_identity.get(identity)
+        exact_remote_count = sum(
+            1
+            for row, _tag, exact_name in group
+            if exact_name and row.job_id.isascii() and row.job_id.isdigit()
+        )
+        for row, tag, exact_name in sorted(group, key=lambda item: item[0].job_id):
+            scalar_job_id = row.job_id.isascii() and row.job_id.isdigit()
+            complete_local_match = bool(
+                local is not None
+                and exact_name
+                and row.name == local.slurm_job_name
+                and row.comment == local.slurm_comment
+            )
+            if local is not None and complete_local_match:
+                if local.phase != JobPhase.FINAL and local.job_id == row.job_id:
+                    # This row is represented by the managed jobs entry even if
+                    # reconciliation finalized it during the current pass.
+                    continue
+                if local.job_id is None and exact_remote_count == 1:
+                    classification = "unresolved-operation-match"
+                elif local.phase == JobPhase.FINAL and exact_remote_count == 1:
+                    classification = "local-final-conflict"
+                else:
+                    classification = "duplicate-operation"
+            elif local is not None:
+                classification = "operation-identity-conflict"
+            elif not exact_name or not scalar_job_id:
+                classification = "operation-identity-conflict"
+            elif exact_remote_count > 1:
+                classification = "duplicate-operation"
+            else:
+                classification = (
+                    "other-machine" if tag.owner_id != owner_id else "untracked-owned"
+                )
+            node = row.node.strip()
+            if not node or node.lower() in {"(null)", "none", "n/a"}:
+                node = None
+            discovered.append(
+                {
+                    "cluster": cluster,
+                    "jobid": row.job_id,
+                    "operation_id": operation_id,
+                    "selector": f"{cluster}:@{operation_id}",
+                    "job_kind": tag.kind,
+                    "classification": classification,
+                    "state": row.state.strip().upper(),
+                    "node": node,
+                    "partition": row.partition.rstrip("*"),
+                    "time_left": row.time_left,
+                    "owner": tag.host,
+                    "name": tag.logical_name,
+                }
+            )
+
+    operations = [
+        {
+            "operation_id": op.operation_id,
+            "selector": f"{op.cluster}:@{op.target_job_operation_id}",
+            "kind": op.kind.value,
+            "phase": op.phase.value,
+            "cluster": op.cluster,
+            "target": op.logical_name,
+            "jobid": op.job_id,
+            "detail": op.detail,
+        }
+        for op in ctx.state.list_unresolved_operations()
+    ]
+    _sync_ssh_projection(ctx, paths)
+    if args.json:
+        print(
+            json.dumps(
+                {"jobs": rows, "discovered": discovered, "operations": operations},
+                indent=2,
+            )
+        )
+        return 0
+    if not rows and not discovered and not operations:
+        info("no managed or discovered jobs")
+        return 0
+    if rows:
+        fmt = "{:<14} {:<9} {:<20} {:<14} {:<14} {}"
+        print(fmt.format("NAME", "JOB", "PHASE", "CLUSTER", "NODE", "SSH ALIAS"))
+        for row in rows:
+            print(
+                fmt.format(
+                    row["name"],
+                    row["jobid"] or "-",
+                    row["phase"],
+                    row["cluster"],
+                    row["current_node"] or "-",
+                    row["alias"] or "-",
+                )
+            )
+    if discovered:
+        print("\nDISCOVERED V2 JOBS")
+        for row in discovered:
+            print(
+                f"  {row['cluster']}:{row['jobid']} {row['state']} "
+                f"{row['job_kind']}/{row['classification']} "
+                f"operation={row['operation_id']}"
+            )
+    if operations:
+        print("\nUNRESOLVED OPERATIONS")
+        for operation in operations:
+            print(
+                f"  {operation['operation_id']} {operation['kind']} {operation['phase']} "
+                f"({operation['cluster']}:{operation['target']}) — hpc-alloc recover "
+                f"{operation['operation_id']}"
+            )
+    return 0
+
+
+def _submit_job(
+    *,
+    ctx: Any,
+    paths: AppPaths,
+    entrypoint: Path,
+    cluster: str,
+    kind: JobKind,
+    logical_name: str,
+    resources: dict[str, Any],
+    wrap: str,
+    logfile_template: str,
+    dry_run: bool,
+) -> Any:
+    from .slurm import SubmissionSpec
+    from .ssh import AuthMode
+
+    if not NAME_RE.fullmatch(logical_name):
+        raise ConfigInvalid(f"invalid logical name {logical_name!r}")
+    operation_id = uuid.uuid4().hex
+    logfile = logfile_template.format(operation_id=operation_id)
+    host = machine_host()
+    owner_id = (
+        f"dryrun-{operation_id[:12]}"
+        if dry_run
+        else ctx.state.get_or_create_machine_id(host)
+    )
+    spec = SubmissionSpec(
+        operation_id=operation_id,
+        owner_id=owner_id,
+        owner_host=host,
+        kind=kind,
+        logical_name=logical_name,
+        partition=resources["partition"],
+        walltime=resources["time"],
+        cpus=resources["cpus"],
+        mem=resources.get("mem"),
+        gpus=resources.get("gpus"),
+        constraint=resources.get("constraint"),
+        chdir=resources.get("chdir"),
+        wrap=wrap,
+        logfile=logfile,
+        log_directory=REMOTE_LOG_DIR,
+    )
+    if dry_run:
+        print(spec.command())
+        return None
+    transport, client = _services(ctx, paths, entrypoint, cluster)
+    transport.bootstrap(cluster, AuthMode.INTERACTIVE_BOOTSTRAP)
+    # Retry-safe filesystem preparation is deliberately outside the durable
+    # scheduler mutation boundary.  It cannot submit a job, so any failure
+    # here leaves no local intent and no possible remote scheduler side effect.
+    client.prepare_submission(spec, auth=AuthMode.NONINTERACTIVE)
+    ctx.state.reserve_submission(
+        operation_id=operation_id,
+        cluster=cluster,
+        logical_name=logical_name,
+        kind=kind,
+        owner_id=owner_id,
+        slurm_job_name=spec.job_name,
+        slurm_comment=spec.comment,
+        resources=resources,
+    )
+    try:
+        result = client.submit(spec, auth=AuthMode.NONINTERACTIVE)
+    except (AuthRequired, HostKeyChanged) as exc:
+        # These typed SSH failures prove the mutation was never dispatched.
+        ctx.state.fail_submission(operation_id, str(exc))
+        raise
+    except AmbiguousSubmission as exc:
+        ctx.state.mark_submission_ambiguous(operation_id, str(exc))
+        raise AmbiguousSubmission(
+            f"submission {operation_id} may have committed; run `hpc-alloc recover {operation_id}`"
+        ) from exc
+    return ctx.state.acknowledge_submission(operation_id, result.job_id)
+
+
+def _persist_and_render(ctx: Any, paths: AppPaths, job: Any, assessment: Any) -> Any:
+    from .monitor import persist_assessment
+
+    updated = persist_assessment(ctx.state, job, assessment)
+    _sync_ssh_projection(ctx, paths)
+    return updated
+
+
+def cmd_up(
+    args: Any, *, ctx: Any, paths: AppPaths, entrypoint: Path, **_kwargs: Any
+) -> int:
+    from .lifecycle import AssessmentPhase
+    from .monitor import JobMonitor
+    from .ssh import AuthMode
+    cluster = ctx.config.resolve_cluster(args.cluster)
+    if (
+        not NAME_RE.fullmatch(args.name)
+        or args.name.isdigit()
+        or args.name in {"login", "run"}
+    ):
+        raise ConfigInvalid(f"invalid or reserved allocation name {args.name!r}")
+    if args.wait_timeout < 0:
+        raise ConfigInvalid("--wait-timeout must be non-negative")
+    resources = _resource_values(args, ctx.config, cluster)
+    job = _submit_job(
+        ctx=ctx,
+        paths=paths,
+        entrypoint=entrypoint,
+        cluster=cluster,
+        kind=JobKind.ALLOCATION,
+        logical_name=args.name,
+        resources=resources,
+        wrap=_sleeper_command(resources["idle_timeout"]),
+        logfile_template=f"{REMOTE_LOG_DIR}/alloc-{{operation_id}}.log",
+        dry_run=args.dry_run,
+    )
+    if job is None:
+        return 0
+    info(
+        f"submitted {cluster}:{job.job_id} for allocation {cluster}:{args.name} "
+        f"({resources['partition']}, {resources['time']}; {canonical_job_selector(job)})"
+    )
+    if args.no_wait:
+        return 0
+    _transport, client = _services(ctx, paths, entrypoint, cluster)
+    monitor = JobMonitor(client)
+    started = time.monotonic()
+    while True:
+        result = monitor.assess(job, auth=AuthMode.NONINTERACTIVE)
+        assessment = result.assessment
+        job = _persist_and_render(ctx, paths, job, assessment)
+        if assessment.phase == AssessmentPhase.ACTIVE and assessment.current_node:
+            alias = allocation_alias(cluster, args.name)
+            info(
+                f"allocation {cluster}:{args.name} ready on {assessment.current_node} "
+                f"(job {job.job_id}; ssh {alias})"
+            )
+            return 0
+        if assessment.final:
+            raise HpcAllocError(
+                f"job {job.job_id} ended before becoming active: "
+                f"{assessment.terminal_state or assessment.scheduler_state or 'unknown'}"
+            )
+        elapsed = int(time.monotonic() - started)
+        info(
+            f"job {job.job_id}: {assessment.scheduler_state or assessment.phase.value} "
+            f"(waited {elapsed}s)"
+        )
+        if elapsed >= args.wait_timeout:
+            info(f"leaving job queued; inspect it with `hpc-alloc status`")
+            return 0
+        time.sleep(5)
+
+
+def _remote_home(ctx: Any, client: Any, cluster: str) -> str:
+    cached = ctx.state.get_cluster_cache(cluster, "remote_home")
+    if isinstance(cached, str) and cached.startswith("/"):
+        return cached
+    home = client.remote_home()
+    ctx.state.set_cluster_cache(cluster, "remote_home", home)
+    return home
+
+
+def _cancel_record(ctx: Any, client: Any, job: Any) -> Any:
+    from .errors import ProtocolViolation, SchedulerUnavailable
+    from .slurm import CancellationInspectionStatus, CancellationStatus
+
+    if job.ref is None:
+        raise StateConflict("cannot cancel a submission without a confirmed Slurm job ID")
+    operation = ctx.state.begin_cancel(job.operation_id)
+    try:
+        inspection = client.inspect_cancel(job.ref)
+    except HpcAllocError as exc:
+        ctx.state.fail_cancel_operation(operation.operation_id, str(exc))
+        raise
+
+    if inspection.status == CancellationInspectionStatus.ALREADY_FINAL:
+        record = inspection.final_record
+        if record is None:
+            detail = "cancellation inspection omitted its final accounting record"
+            ctx.state.fail_cancel_operation(operation.operation_id, detail)
+            raise ProtocolViolation(detail)
+        ctx.state.resolve_operation(
+            operation.operation_id,
+            final_source=FinalSource.ACCOUNTING,
+            detail=inspection.detail,
+            terminal_state=record.state,
+            exit_code=record.exit_code,
+        )
+        return inspection
+    if inspection.status == CancellationInspectionStatus.CONFIRMED_ABSENT:
+        ctx.state.resolve_cancel_departed(
+            operation.operation_id,
+            detail=inspection.detail or "job absence was confirmed before cancellation",
+        )
+        return inspection
+    if inspection.status == CancellationInspectionStatus.IDENTITY_MISMATCH:
+        ctx.state.fail_cancel_operation(
+            operation.operation_id,
+            inspection.detail or "job identity changed before cancellation",
+        )
+        raise IdentityMismatch(inspection.detail)
+    if inspection.status != CancellationInspectionStatus.READY:
+        detail = f"unsupported cancellation inspection status {inspection.status}"
+        ctx.state.fail_cancel_operation(operation.operation_id, detail)
+        raise ProtocolViolation(detail)
+
+    # Commit the may-have-run state before crossing the mutation boundary.
+    # A crash can now create only a false ambiguity, never a false-safe retry.
+    ctx.state.mark_cancel_dispatching(operation.operation_id)
+    try:
+        outcome = client.execute_cancel(job.ref)
+    except (AuthRequired, HostKeyChanged) as exc:
+        # The adapter preserves these only when guarded cancellation never
+        # crossed the remote dispatch boundary.
+        ctx.state.fail_cancel_operation(operation.operation_id, str(exc))
+        raise
+    except HpcAllocError as exc:
+        ctx.state.mark_cancel_ambiguous(operation.operation_id, str(exc))
+        raise TransportLost(
+            f"cancellation {operation.operation_id} is ambiguous; run "
+            f"`hpc-alloc recover {operation.operation_id}`"
+        ) from exc
+
+    if outcome.status == CancellationStatus.CANCELLED:
+        ctx.state.resolve_cancel_departed(
+            operation.operation_id,
+            detail="cancellation request acknowledged",
+        )
+        return outcome
+    if outcome.status == CancellationStatus.LEFT_QUEUE:
+        ctx.state.resolve_cancel_departed(
+            operation.operation_id,
+            outcome.detail,
+        )
+        return outcome
+    if outcome.status == CancellationStatus.MUTATION_AMBIGUOUS:
+        ctx.state.mark_cancel_ambiguous(operation.operation_id, outcome.detail)
+        raise TransportLost(
+            f"cancellation {operation.operation_id} is ambiguous; run "
+            f"`hpc-alloc recover {operation.operation_id}`"
+        )
+    if outcome.status == CancellationStatus.IDENTITY_MISMATCH:
+        ctx.state.fail_cancel_operation(
+            operation.operation_id,
+            outcome.detail or "job identity changed before guarded cancellation",
+        )
+        raise IdentityMismatch(outcome.detail)
+    if outcome.status == CancellationStatus.GUARD_FAILED:
+        ctx.state.fail_cancel_operation(
+            operation.operation_id,
+            outcome.detail or "cancellation guard rejected the mutation",
+        )
+        raise SchedulerUnavailable(
+            outcome.detail or "cancellation guard could not verify the exact job"
+        )
+
+    # An unknown post-dispatch result can never be downgraded to a safe retry.
+    detail = outcome.detail or f"unrecognized cancellation result {outcome.status}"
+    ctx.state.mark_cancel_ambiguous(operation.operation_id, detail)
+    raise TransportLost(
+        f"cancellation {operation.operation_id} is ambiguous; run "
+        f"`hpc-alloc recover {operation.operation_id}`"
+    )
+
+
+def cmd_run(
+    args: Any, *, ctx: Any, paths: AppPaths, entrypoint: Path, **_kwargs: Any
+) -> int:
+    from .lifecycle import EvidenceTracker
+    from .ssh import AuthMode
+    from .streaming import LogFollower
+
+    command = list(args.command)
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        raise ConfigInvalid("no command given — usage: hpc-alloc run [options] -- CMD ...")
+    cluster = ctx.config.resolve_cluster(args.cluster)
+    resources = _resource_values(args, ctx.config, cluster)
+    if resources.get("chdir") and resources["chdir"].startswith("~"):
+        raw_chdir = resources["chdir"]
+        if not re.fullmatch(r"~(?:/.*)?", raw_chdir):
+            raise ConfigInvalid("~user paths are unsupported; use ~/... or an absolute path")
+    if not args.dry_run:
+        transport, client = _services(ctx, paths, entrypoint, cluster)
+        transport.bootstrap(cluster, AuthMode.INTERACTIVE_BOOTSTRAP)
+        home = _remote_home(ctx, client, cluster)
+        if resources.get("chdir") and resources["chdir"].startswith("~"):
+            resources["chdir"] = home + (resources["chdir"][1:] or "")
+        logfile = f"{home}/{REMOTE_LOG_DIR}/run-{{operation_id}}.log"
+    else:
+        logfile = f"{REMOTE_LOG_DIR}/run-{{operation_id}}.log"
+    wrap = _remote_command(command)
+    job = _submit_job(
+        ctx=ctx,
+        paths=paths,
+        entrypoint=entrypoint,
+        cluster=cluster,
+        kind=JobKind.RUN,
+        logical_name="run",
+        resources=resources,
+        wrap=wrap,
+        logfile_template=logfile,
+        dry_run=args.dry_run,
+    )
+    if job is None:
+        return 0
+    log_path = _job_log_path(job)
+    info(
+        f"submitted run {cluster}:{job.job_id} ({resources['partition']}, {resources['time']}; "
+        f"{canonical_job_selector(job)})"
+    )
+    if args.detach:
+        info(f"follow with `hpc-alloc logs {cluster}:{job.job_id} -f`")
+        return 0
+    follower = LogFollower(
+        client,
+        job.ref,
+        log_path,
+        tracker=EvidenceTracker(
+            ever_started=job.ever_started,
+            current_node=job.current_node,
+            last_node=job.last_node,
+        ),
+        info=info,
+    )
+    try:
+        outcome = follower.follow()
+    except BrokenPipeError:
+        info(f"output pipe closed — cancelling foreground job {cluster}:{job.job_id}")
+        try:
+            _cancel_record(ctx, client, job)
+        except HpcAllocError as exc:
+            info(f"could not confirm cancellation: {exc}")
+        return 141
+    except KeyboardInterrupt:
+        info(f"cancelling foreground job {cluster}:{job.job_id}")
+        try:
+            _cancel_record(ctx, client, job)
+        except HpcAllocError as exc:
+            info(f"could not confirm cancellation: {exc}")
+        raise
+    updated = _persist_and_render(ctx, paths, job, outcome.assessment)
+    state = (outcome.assessment.terminal_state or "").split()[0].rstrip("+")
+    if outcome.assessment.exit_code and ":" in outcome.assessment.exit_code:
+        code = int(outcome.assessment.exit_code.split(":", 1)[0])
+    else:
+        code = 0 if state == "COMPLETED" else 1
+    if not state:
+        raise HpcAllocError(
+            f"job {updated.job_id} left the queue without a final state; run `hpc-alloc why "
+            f"{cluster}:{updated.job_id}`"
+        )
+    if state != "COMPLETED" and code == 0:
+        code = 1
+    info(f"job {updated.job_id} finished: {state} (exit {code})")
+    return code
+
+
+def _resolve_managed_job(
+    ctx: Any,
+    target: str,
+    *,
+    explicit_cluster: str | None,
+    kind: JobKind | None = None,
+    include_final: bool = False,
+) -> Any:
+    selector = parse_selector(target, explicit_cluster)
+    if selector.cluster:
+        ctx.config.resolve_cluster(selector.cluster)
+    jobs = ctx.state.list_jobs(include_final=include_final)
+    if kind is not None:
+        jobs = [job for job in jobs if job.kind == kind]
+    return unique_job(jobs, selector)
+
+
+def cmd_cancel(
+    args: Any, *, ctx: Any, paths: AppPaths, entrypoint: Path, **_kwargs: Any
+) -> int:
+    selector = parse_selector(args.target, args.cluster)
+    if selector.kind not in {SelectorKind.JOB_ID, SelectorKind.OPERATION_ID}:
+        raise IdentityMismatch("cancel requires a job ID or @operation selector")
+    job = _resolve_managed_job(
+        ctx,
+        args.target,
+        explicit_cluster=args.cluster,
+    )
+    transport, client = _services(ctx, paths, entrypoint, job.cluster)
+    transport.bootstrap(job.cluster)
+    outcome = _cancel_record(ctx, client, job)
+    _sync_ssh_projection(ctx, paths)
+    info(f"{outcome.status.value.lower().replace('_', ' ')}: {job.cluster}:{job.job_id}")
+    return 0
+
+
+def _default_allocation(ctx: Any, explicit_cluster: str | None = None) -> Any:
+    jobs = [
+        job
+        for job in ctx.state.list_jobs(include_final=False)
+        if job.kind == JobKind.ALLOCATION
+        and (explicit_cluster is None or job.cluster == explicit_cluster)
+    ]
+    if not jobs:
+        raise IdentityMismatch("no active managed allocations")
+    if len(jobs) == 1:
+        return jobs[0]
+    dev = [job for job in jobs if job.logical_name == "dev"]
+    if len(dev) == 1:
+        return dev[0]
+    raise IdentityMismatch("multiple allocations exist; use cluster:name")
+
+
+def cmd_down(
+    args: Any, *, ctx: Any, paths: AppPaths, entrypoint: Path, **_kwargs: Any
+) -> int:
+    if args.all and args.target:
+        raise ConfigInvalid("down accepts either a target or --all, not both")
+    if args.all:
+        jobs = [
+            job
+            for job in ctx.state.list_jobs(include_final=False)
+            if job.kind == JobKind.ALLOCATION
+            and (args.cluster is None or job.cluster == args.cluster)
+        ]
+    elif args.target:
+        jobs = [
+            _resolve_managed_job(
+                ctx,
+                args.target,
+                explicit_cluster=args.cluster,
+                kind=JobKind.ALLOCATION,
+            )
+        ]
+    else:
+        jobs = [_default_allocation(ctx, args.cluster)]
+    if not jobs:
+        info("no matching active allocations")
+        return 0
+    failed = 0
+    for job in jobs:
+        try:
+            transport, client = _services(ctx, paths, entrypoint, job.cluster)
+            transport.bootstrap(job.cluster)
+            outcome = _cancel_record(ctx, client, job)
+            info(
+                f"{outcome.status.value.lower().replace('_', ' ')} allocation "
+                f"{job.cluster}:{job.logical_name} ({job.job_id})"
+            )
+        except (AuthRequired, HostKeyChanged) as exc:
+            info(f"could not release {job.cluster}:{job.logical_name}: {exc}")
+            # Security/authentication failures are not best-effort scheduler
+            # errors.  Stop before touching another allocation, but project
+            # any state changes made for earlier jobs first.
+            try:
+                _sync_ssh_projection(ctx, paths)
+            except HpcAllocError as sync_exc:
+                # Projection is derived state.  Report a projection failure,
+                # but do not replace the security/authentication failure that
+                # stopped the cancellation loop.
+                info(f"could not update managed SSH config: {sync_exc}")
+            raise
+        except HpcAllocError as exc:
+            failed += 1
+            info(f"could not release {job.cluster}:{job.logical_name}: {exc}")
+            if not args.all:
+                raise
+    _sync_ssh_projection(ctx, paths)
+    return 1 if failed else 0
+
+
+def _job_log_path(job: Any) -> str:
+    prefix = "run" if job.kind == JobKind.RUN else "alloc"
+    return f"{REMOTE_LOG_DIR}/{prefix}-{job.operation_id}.log"
+
+
+def _local_no_id_diagnosis(job: Any) -> str | None:
+    """Describe a durable local final verdict that has no remote job ID."""
+
+    if job.phase is not JobPhase.FINAL or job.ref is not None:
+        return None
+    if job.final_source is FinalSource.SUBMIT_FAILED:
+        return "submission failed before a Slurm job ID was acknowledged"
+    if job.final_source is FinalSource.ABANDONED:
+        return (
+            "submission was explicitly abandoned without an acknowledged Slurm job ID; "
+            "an untracked remote orphan may remain"
+        )
+    return None
+
+
+def cmd_logs(
+    args: Any, *, ctx: Any, paths: AppPaths, entrypoint: Path, **_kwargs: Any
+) -> int:
+    from .errors import SchedulerUnavailable
+    from .monitor import JobMonitor
+    from .ssh import AuthMode
+    from .streaming import LogFollower
+
+    if args.lines < 0:
+        raise ConfigInvalid("--lines must be non-negative")
+    job = _resolve_managed_job(
+        ctx,
+        args.target,
+        explicit_cluster=args.cluster,
+        include_final=True,
+    )
+    if job.ref is None:
+        local_diagnosis = _local_no_id_diagnosis(job)
+        if local_diagnosis is not None:
+            raise StateConflict(
+                f"{local_diagnosis} for operation {job.operation_id}; "
+                "no managed log is available"
+            )
+        raise StateConflict(
+            f"submission {job.operation_id} is unresolved; run `hpc-alloc recover {job.operation_id}`"
+        )
+    transport, client = _services(ctx, paths, entrypoint, job.cluster)
+    # Establish Duo once before entering the strictly noninteractive follower.
+    transport.bootstrap(job.cluster, AuthMode.INTERACTIVE_BOOTSTRAP)
+    log_path = _job_log_path(job)
+    if not args.follow:
+        assessment = None
+        try:
+            assessment = JobMonitor(client).assess(job, auth=AuthMode.NONINTERACTIVE).assessment
+            job = _persist_and_render(ctx, paths, job, assessment)
+        except SchedulerUnavailable:
+            if not job.ever_started:
+                raise
+            info("scheduler unavailable; reading the already-known log without a lifecycle guard")
+        if assessment is not None and not assessment.log_eligible and not assessment.final:
+            raise HpcAllocError(
+                f"job {job.cluster}:{job.job_id} has not started; use logs -f to wait safely"
+            )
+        sys.stdout.buffer.write(client.tail_log(log_path, args.lines))
+        sys.stdout.buffer.flush()
+        return 0
+    follower = LogFollower(
+        client,
+        job.ref,
+        log_path,
+        tracker=JobMonitor.tracker(job),
+        info=info,
+    )
+    try:
+        outcome = follower.follow()
+    except BrokenPipeError:
+        info(
+            f"output pipe closed — detached; job {job.cluster}:{job.job_id} continues "
+            f"(reattach: hpc-alloc logs {job.cluster}:{job.job_id} -f)"
+        )
+        return 141
+    except KeyboardInterrupt:
+        info(
+            f"detached; job {job.cluster}:{job.job_id} continues "
+            f"(reattach: hpc-alloc logs {job.cluster}:{job.job_id} -f)"
+        )
+        raise
+    _persist_and_render(ctx, paths, job, outcome.assessment)
+    if outcome.assessment.terminal_state:
+        info(f"job {job.job_id} ended: {outcome.assessment.terminal_state}")
+    return 0
+
+
+def cmd_why(
+    args: Any, *, ctx: Any, paths: AppPaths, entrypoint: Path, **_kwargs: Any
+) -> int:
+    from .lifecycle import AssessmentPhase
+    from .monitor import JobMonitor
+    from .ssh import AuthMode
+
+    if args.target:
+        job = _resolve_managed_job(
+            ctx,
+            args.target,
+            explicit_cluster=args.cluster,
+            include_final=True,
+        )
+    else:
+        job = _default_allocation(ctx, args.cluster)
+    if job.ref is None:
+        local_diagnosis = _local_no_id_diagnosis(job)
+        if local_diagnosis is not None:
+            assessment = JobMonitor.tracker(job).assessment
+            result = _assessment_payload(job, assessment)
+            result["status"] = assessment.phase.value
+            result["diagnosis"] = local_diagnosis
+            result["detail"] = []
+        else:
+            assessment = JobMonitor.tracker(job).assessment
+            result = _assessment_payload(job, assessment)
+            # SUBMITTING is a durable local phase, whereas the lifecycle
+            # tracker treats it as queue-like while awaiting a Slurm ID.
+            result["phase"] = job.phase.value
+            result["status"] = job.phase.value
+            result["diagnosis"] = (
+                "submission has no acknowledged Slurm job ID; "
+                f"run hpc-alloc recover {job.operation_id}"
+            )
+            result["detail"] = []
+    else:
+        transport, client = _services(ctx, paths, entrypoint, job.cluster)
+        transport.bootstrap(job.cluster, AuthMode.INTERACTIVE_BOOTSTRAP)
+        assessment = JobMonitor(client).assess(job, auth=AuthMode.NONINTERACTIVE).assessment
+        job = _persist_and_render(ctx, paths, job, assessment)
+        result = _assessment_payload(job, assessment)
+        result["status"] = assessment.phase.value
+        detail: list[str] = []
+        state = assessment.scheduler_state or ""
+        if assessment.phase == AssessmentPhase.QUEUED:
+            if state == "PENDING":
+                # The lifecycle assessment already contains the reason from
+                # the identity-checked observation.  A second raw observation
+                # would open a race in which a recycled numeric ID escapes the
+                # monitor's evidence handling.
+                reason = assessment.detail or "unknown"
+                if reason.startswith(("QOSMax", "QOSGrp", "AssocGrp", "MaxTRESPer", "QOSUsage")):
+                    diagnosis = f"per-user/group resource cap ({reason})"
+                elif "ReqNodeNotAvail" in reason or "Reserv" in reason:
+                    diagnosis = "nodes are reserved, commonly for maintenance; a shorter walltime may fit"
+                    detail.extend(client.reservations().strip().splitlines()[:5])
+                else:
+                    diagnosis = f"queue contention ({reason})"
+                    estimate = client.estimated_start(job.job_id)
+                    if estimate and estimate != "N/A":
+                        detail.append(f"estimated start: {estimate}")
+                    detail.extend(client.priority(job.job_id).strip().splitlines()[:3])
+            else:
+                diagnosis = f"queued ({state or assessment.phase.value})"
+        elif assessment.phase == AssessmentPhase.ACTIVE:
+            diagnosis = f"running on {assessment.current_node}"
+        elif assessment.phase in {AssessmentPhase.STARTED_INACTIVE, AssessmentPhase.REQUEUEING}:
+            diagnosis = f"{state or assessment.phase.value}; previously started and may run again"
+        elif assessment.final:
+            # Accounting and local final verdicts are already durable.  Only
+            # a queue-confirmed final can benefit from exact accounting
+            # enrichment; querying by a recycled numeric ID must not replace
+            # or invalidate stronger persisted history.
+            record = None
+            if job.final_source is FinalSource.CONFIRMED_QUEUE:
+                record = client.final(
+                    job.ref,
+                    attempts=(0, 2, 2),
+                    auth=AuthMode.NONINTERACTIVE,
+                    extra_fields=("Elapsed", "Timelimit"),
+                )
+            final_state = record.state if record else assessment.terminal_state
+            diagnosis = (
+                f"final state {final_state}"
+                if final_state
+                else assessment.detail or "final state unknown"
+            )
+            if record:
+                result["exit_code"] = record.exit_code
+                if record.extra:
+                    result["elapsed"] = record.extra[0]
+                    result["timelimit"] = record.extra[1]
+            if assessment.log_eligible:
+                try:
+                    tail = client.tail_log(_job_log_path(job), 15).decode(errors="replace").splitlines()
+                    detail += ["--- log tail ---", *tail[-15:]]
+                except (AuthRequired, HostKeyChanged):
+                    raise
+                except HpcAllocError:
+                    pass
+        else:
+            diagnosis = assessment.detail or "scheduler evidence is uncertain"
+        result["diagnosis"] = diagnosis
+        result["detail"] = detail
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return 0
+    info(
+        f"{result.get('cluster')}:{result.get('jobid') or result.get('operation_id')}: "
+        f"{result['status']} — {result['diagnosis']}"
+    )
+    for line in result.get("detail", []):
+        print(f"  {line}")
+    return 0
+
+
+def _active_allocation(
+    ctx: Any,
+    paths: AppPaths,
+    entrypoint: Path,
+    target: str | None,
+    explicit_cluster: str | None,
+) -> tuple[Any, Any]:
+    from .lifecycle import AssessmentPhase
+    from .monitor import JobMonitor
+
+    job = (
+        _resolve_managed_job(
+            ctx,
+            target,
+            explicit_cluster=explicit_cluster,
+            kind=JobKind.ALLOCATION,
+        )
+        if target
+        else _default_allocation(ctx, explicit_cluster)
+    )
+    if job.ref is None:
+        raise StateConflict(f"allocation submission {job.operation_id} is unresolved")
+    transport, client = _services(ctx, paths, entrypoint, job.cluster)
+    transport.bootstrap(job.cluster)
+    assessment = JobMonitor(client).assess(job).assessment
+    job = _persist_and_render(ctx, paths, job, assessment)
+    if assessment.phase != AssessmentPhase.ACTIVE or not assessment.current_node:
+        raise HpcAllocError(
+            f"allocation {job.cluster}:{job.logical_name} is {assessment.phase.value}; "
+            "run hpc-alloc status"
+        )
+    return job, transport
+
+
+def cmd_ssh(
+    args: Any, *, ctx: Any, paths: AppPaths, entrypoint: Path, **_kwargs: Any
+) -> int:
+    tokens = list(args.args)
+    target: str | None = None
+    if tokens and tokens[0] == "--":
+        tokens = tokens[1:]
+    elif tokens:
+        target = tokens.pop(0)
+        if tokens and tokens[0] == "--":
+            tokens = tokens[1:]
+    job, transport = _active_allocation(ctx, paths, entrypoint, target, args.cluster)
+    alias = allocation_alias(job.cluster, job.logical_name)
+    transport.require_node(alias)
+    from .ssh import ssh_argv
+
+    argv = ssh_argv(
+        alias,
+        _remote_command(tokens) if tokens else None,
+        batch=bool(tokens),
+    )
+    try:
+        os.execvp(argv[0], argv)
+    except OSError as exc:
+        raise LocalToolUnavailable(f"cannot execute ssh: {exc}") from exc
+
+
+def cmd_sync(
+    args: Any, *, ctx: Any, paths: AppPaths, entrypoint: Path, **_kwargs: Any
+) -> int:
+    job, transport = _active_allocation(ctx, paths, entrypoint, args.target, args.cluster)
+    alias = allocation_alias(job.cluster, job.logical_name)
+    transport.require_node(alias)
+    source, destination = args.src, args.dst
+    if args.pull:
+        source = f"{alias}:{source}"
+    else:
+        destination = f"{alias}:{destination}"
+    command = ["rsync", "-az", "-e", "ssh"]
+    if args.delete:
+        command.append("--delete")
+    command += ["--", source, destination]
+    info(shlex.join(command))
+    try:
+        return subprocess.run(command).returncode
+    except OSError as exc:
+        raise LocalToolUnavailable(f"cannot execute rsync: {exc}") from exc
+
+
+def _recover_submission(ctx: Any, client: Any, operation: Any, job: Any) -> bool:
+    from .ssh import AuthMode
+
+    scan = client.scan(auth=AuthMode.NONINTERACTIVE)
+    candidates = [
+        row
+        for row in scan.rows
+        if row.comment == job.slurm_comment and row.name == job.slurm_job_name
+    ]
+    unsupported = [row.job_id for row in candidates if not (row.job_id.isascii() and row.job_id.isdigit())]
+    if unsupported:
+        raise AmbiguousSubmission(
+            f"operation {operation.operation_id} matches unsupported non-scalar live jobs: "
+            + ", ".join(unsupported)
+        )
+    matches = [row.job_id for row in candidates]
+    if len(matches) > 1:
+        raise AmbiguousSubmission(
+            f"operation {operation.operation_id} matches multiple live jobs: {', '.join(matches)}"
+        )
+    if len(matches) == 1:
+        ctx.state.acknowledge_submission(operation.operation_id, matches[0])
+        info(f"adopted {operation.cluster}:{matches[0]} for operation {operation.operation_id}")
+        return True
+    finder = getattr(client, "find_accounting_by_name", None)
+    record = finder(job.slurm_job_name, auth=AuthMode.NONINTERACTIVE) if finder else None
+    if record is not None:
+        from .models import JobRef
+
+        recovered_ref = JobRef(
+            cluster=operation.cluster,
+            job_id=record.job_id,
+            owner_id=job.owner_id,
+            operation_id=operation.operation_id,
+            slurm_job_name=job.slurm_job_name,
+            slurm_comment=job.slurm_comment,
+        )
+        client.verify_accounting_identity(recovered_ref, record.job_name, record.comment)
+        adopted = ctx.state.acknowledge_submission(operation.operation_id, record.job_id)
+        if record.final:
+            ctx.state.update_job(
+                adopted.operation_id,
+                phase=JobPhase.FINAL,
+                ever_started=record.state_code not in {"CANCELLED"},
+                terminal_state=record.state,
+                exit_code=record.exit_code,
+                final_source=FinalSource.ACCOUNTING,
+            )
+        info(f"recovered accounting job {operation.cluster}:{record.job_id}")
+        return True
+    return False
+
+
+def _recover_cancel(ctx: Any, client: Any | None, operation: Any, job: Any) -> bool:
+    """Reconcile a cancellation using local phase and read-only evidence only."""
+
+    from .errors import ProtocolViolation
+    from .monitor import JobMonitor
+    from .ssh import AuthMode
+
+    if operation.phase is OperationPhase.CANCEL_PENDING:
+        # mark_cancel_dispatching is committed before execute_cancel.  A
+        # surviving CANCEL_PENDING row therefore proves no mutation crossed
+        # this process boundary and can be closed without contacting Slurm.
+        ctx.state.fail_cancel_operation(
+            operation.operation_id,
+            "recovery closed an undispatched cancellation; no remote mutation was issued",
+        )
+        info(f"closed undispatched cancellation {operation.operation_id}")
+        return True
+    if operation.phase is not OperationPhase.AMBIGUOUS:
+        raise StateConflict(
+            f"cancellation {operation.operation_id} is not recoverable from {operation.phase.value}"
+        )
+    if job.ref is None:
+        return False
+    if client is None:
+        raise StateConflict("ambiguous cancellation recovery requires a read-only scheduler client")
+
+    # JobMonitor performs only exact queue/accounting reads.  Its confirmation
+    # rule requires either authoritative final accounting or two conclusive
+    # observations before producing a final verdict.
+    assessment = JobMonitor(client).assess(
+        job,
+        auth=AuthMode.NONINTERACTIVE,
+        confirm=True,
+    ).assessment
+    if not assessment.final:
+        observed = assessment.scheduler_state or assessment.phase.value
+        ctx.state.mark_cancel_ambiguous(
+            operation.operation_id,
+            f"read-only recovery remains inconclusive ({observed})",
+        )
+        return False
+    if assessment.final_source is None:
+        raise ProtocolViolation("final cancellation recovery evidence lacks provenance")
+    ctx.state.resolve_operation(
+        operation.operation_id,
+        final_source=assessment.final_source,
+        detail="read-only cancellation recovery confirmed the job is final",
+        terminal_state=assessment.terminal_state,
+        exit_code=assessment.exit_code,
+    )
+    info(f"recovered final cancellation {operation.cluster}:{operation.job_id}")
+    return True
+
+
+def cmd_recover(
+    args: Any, *, ctx: Any, paths: AppPaths, entrypoint: Path, **_kwargs: Any
+) -> int:
+    operations = ctx.state.list_unresolved_operations()
+    if args.operation_id:
+        operations = [op for op in operations if op.operation_id == args.operation_id]
+        if not operations:
+            raise RecordNotFound(f"unresolved operation {args.operation_id!r} does not exist")
+    if args.cluster:
+        ctx.config.resolve_cluster(args.cluster)
+        operations = [op for op in operations if op.cluster == args.cluster]
+    if not operations:
+        info("no unresolved operations")
+        return 0
+    if args.abandon:
+        if args.operation_id is None or len(operations) != 1:
+            raise StateConflict("--abandon requires one explicit operation ID")
+        operation = operations[0]
+        if not args.yes:
+            if not sys.stdin.isatty():
+                raise StateConflict("--abandon requires --yes without a terminal")
+            answer = input(
+                f"Abandon {operation.operation_id}? A remote orphan may remain [y/N]: "
+            ).strip().lower()
+            if answer not in {"y", "yes"}:
+                info("not abandoned")
+                return 1
+        ctx.state.abandon_operation(
+            operation.operation_id,
+            "explicitly abandoned; remote side effect was not changed",
+        )
+        info(f"abandoned local operation {operation.operation_id}")
+        return 0
+    unresolved = 0
+    for operation in operations:
+        job = ctx.state.get_job(operation.target_job_operation_id)
+        if (
+            operation.kind == OperationKind.CANCEL
+            and operation.phase is OperationPhase.CANCEL_PENDING
+        ):
+            resolved = _recover_cancel(ctx, None, operation, job)
+        else:
+            transport, client = _services(ctx, paths, entrypoint, operation.cluster)
+            transport.bootstrap(operation.cluster)
+            if operation.kind == OperationKind.SUBMIT:
+                resolved = _recover_submission(ctx, client, operation, job)
+            else:
+                resolved = _recover_cancel(ctx, client, operation, job)
+        if not resolved:
+            unresolved += 1
+            info(
+                f"operation {operation.operation_id} remains unresolved; "
+                "no conclusive remote outcome found"
+            )
+    _sync_ssh_projection(ctx, paths)
+    return 1 if unresolved else 0
+
+
+HANDLERS: dict[str, Callable[..., int]] = {
+    "setup": cmd_setup,
+    "config": cmd_config,
+    "connect": cmd_connect,
+    "up": cmd_up,
+    "run": cmd_run,
+    "status": cmd_status,
+    "why": cmd_why,
+    "logs": cmd_logs,
+    "cancel": cmd_cancel,
+    "down": cmd_down,
+    "ssh": cmd_ssh,
+    "sync": cmd_sync,
+    "avail": cmd_avail,
+    "partitions": cmd_partitions,
+    "recover": cmd_recover,
+}
+
+
+def dispatch(args: Any, *, entrypoint: Path) -> int:
+    paths = AppPaths.for_home()
+    handler = HANDLERS[args.command_name]
+    if args.command_name == "setup":
+        return handler(args, paths=paths, entrypoint=entrypoint)
+    ctx = _load_context(args, paths)
+    return handler(args, ctx=ctx, paths=paths, entrypoint=entrypoint)

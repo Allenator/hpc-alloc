@@ -1,83 +1,271 @@
 ---
 name: hpc-alloc
-description: Allocate and use Yale YCRC compute nodes (Bouchet) for development — request a node with specific CPUs/GPUs/memory/time on any partition (not just devel), SSH into it, sync code, run commands remotely, run GPU jobs, and release it. Use when the user asks to allocate/get a cluster or GPU node, run or test something on the cluster, sync code to the cluster, or check/release cluster allocations.
+description: Allocate and use Yale YCRC compute nodes for development, submit CPU/GPU batch commands, synchronize files, diagnose jobs, reconcile ambiguous mutations, and safely release exact v2-owned jobs. Use when a user asks to inspect, allocate, use, recover, or release YCRC cluster resources.
 ---
 
-# hpc-alloc — YCRC compute nodes for development
+# hpc-alloc v2
 
-`hpc-alloc` allocates a Bouchet compute node by submitting a sleeper batch job (`sbatch --wrap 'sleep infinity'`) — this works on **every** partition, unlike `salloc`, which public clusters only allow on `devel`/`gpu_devel`. Once the job starts, the CLI writes an SSH alias (e.g. `bouchet-dev`) that ProxyJumps through the login node to the compute node. Both connections are multiplexed: Duo MFA is prompted at most once per ~4h, and repeated `hpc-alloc ssh <name> -- CMD` calls are near-instant (no per-command handshake), so prefer many small commands over one giant script.
+Use `hpc-alloc` to manage YCRC Slurm work from the user's laptop. `up`
+submits a sleeper batch job and exposes its compute node through a managed SSH
+alias; `run` submits a finite command and optionally streams its log.
 
-**Exit code 3 means the connection to the cluster was lost and re-auth needs the human's second factor**: do not blind-retry. Either tell the user to run `hpc-alloc connect` in their terminal, or — after telling them to expect a Duo push on their phone — run `hpc-alloc connect --push` yourself and let them approve it. Never send pushes repeatedly without the user's awareness (push fatigue). Jobs and allocations survive connection drops; state is never lost to a network blip. A Slurm/scheduler failure over a healthy connection is exit 1 (the message says so) — `connect` cannot fix it; report it and retry later instead of entering the reconnect protocol.
+This skill describes v2 only. It requires Python 3.11+ and has no compatibility
+with v1 config, `state.json`, job names, ownership comments, or JSON aliases.
+Never infer ownership from a name, numeric job ID, prefix, or hostname.
 
-## Prerequisites
+## Connection and failure protocol
 
-- Yale VPN connected (the user must do this; you cannot).
-- One-time `hpc-alloc setup --netid NETID` done, with the SSH key uploaded at https://sshkeys.ycrc.yale.edu/. If a command fails with "not configured yet", walk the user through setup.
+An active Yale VPN connection is required. The user must establish the VPN.
+One-time setup is:
+
+```bash
+hpc-alloc setup --netid NETID
+```
+
+The user uploads the printed key at <https://sshkeys.ycrc.yale.edu/> and then
+runs `hpc-alloc connect` in a terminal.
+
+Exit 3 means the SSH/VPN path requires human attention. Do not blind-retry.
+Ask the user to run `hpc-alloc connect`, or first tell them to expect a Duo
+push and invoke:
+
+```bash
+hpc-alloc connect --push
+```
+
+Send at most one expected push. A Slurm/scheduler or protocol error over a
+healthy connection exits 1; `connect` cannot fix it. Report that distinction.
+Jobs remain on the cluster during client-side transport failures.
+
+## Start with structured status
+
+Before allocating or acting on an existing job, run:
+
+```bash
+hpc-alloc status --json
+```
+
+Stdout is JSON; progress and unavailable-secondary notes are on stderr. The
+top-level object has exactly these arrays:
+
+- `jobs`: locally managed jobs reconciled during this pass. A job finalized
+  during the pass appears here once with `phase: "FINAL"`; it is not repeated
+  as discovered. Important fields include canonical `selector`,
+  `operation_id`, `jobid`, `cluster`, `name`, `kind`, lifecycle and terminal
+  fields, resources, and `alias`.
+- `discovered`: validated v2 queue rows not consumed as the normal bound row
+  for a live managed job.
+  `job_kind` is `allocation` or `run`; `classification` is one of
+  `untracked-owned`, `other-machine`, `unresolved-operation-match`,
+  `duplicate-operation`, `local-final-conflict`, or
+  `operation-identity-conflict`. Each row also has its canonical `selector`.
+  Treat every discovered row as evidence, not permission to cancel.
+- `operations`: unresolved submit/cancel journal records. Important fields are
+  `operation_id`, target-job `selector`, `kind`, `phase`, `cluster`, `target`,
+  `jobid`, and `detail`.
+
+Do not expect v1 fields such as `allocs`, heuristic `orphan`, or `recent`.
+
+Lifecycle phases distinguish queued, active, previously started but inactive,
+requeueing, final candidates, final jobs, and uncertain evidence. A queue
+absence alone does not mean a job died. If a secondary cluster is unavailable,
+its local jobs remain `UNCERTAIN`; never reap them based on that absence.
+Final evidence is monotonic: missing or weaker observations cannot erase a
+persisted terminal state or exit code, while exact accounting may enrich a
+queue-confirmed final record.
+
+A present `COMPLETING` row is started-but-inactive and log-eligible, not final
+evidence. Numeric job IDs may be recycled: reconcile the old job through its
+exact operation identity, show the replacement separately, and never rebind or
+mutate by numeric ID alone. `@operation` remains the canonical historical
+selector.
 
 ## Commands
 
-| Command | Purpose |
+| Command | Use |
 |---|---|
-| `hpc-alloc status --json` | Allocations + a `runs` list of every untracked hpc-alloc job, each with `kind`: `run` (batch job, ends on its own), `recent` (just submitted — probably another window; leave alone), `other-machine` (owned by the user's other computer, `owner` names it — leave alone), or `orphan` (a sleeper this machine lost track of — holds resources until cancelled). **Always run this first.** Progress notices go to stderr; stdout is pure JSON. |
-| `hpc-alloc config --json` | Effective defaults: the user's config.toml merged over built-ins, with provenance. No cluster contact. |
-| `hpc-alloc avail [--json] [-p PART]` | Free capacity digest: idle CPUs and free GPUs by type per partition. **Run before requesting GPUs.** |
-| `hpc-alloc up [--name N] [-p PART] [-t TIME] [-c CPUS] [--mem M] [-G GPUS] [--idle-timeout MIN]` | Allocate a dev node; blocks until it starts (`--no-wait` for busy partitions). |
-| `hpc-alloc run [resources] [--chdir DIR] [--detach] -- CMD...` | Run CMD as a batch job. Foreground streams output and mirrors the exit code (non-COMPLETED ends are nonzero); Ctrl-C cancels the job. One arg after `--` = shell string; several = exact argv. **Preferred for GPU work.** |
-| `hpc-alloc logs JOBID\|NAME [-f]` | Show (or follow, `-f`) a job's log — reattach to detached/interrupted runs. Ctrl-C/stop detaches and **never cancels** the job. |
-| `hpc-alloc why [NAME\|JOBID] [--json]` | Diagnose a job: why pending (contention vs. quota cap vs. maintenance), how it's doing, or why it died (walltime/OOM/cancelled). **Use whenever a job is stuck or gone.** |
-| `hpc-alloc ssh [name] -- CMD...` | Run a command on an allocated node (non-interactive, safe for you to call). Interactive shell (no CMD) is for the user only. |
-| `hpc-alloc sync NAME SRC DST [--pull] [--delete]` | rsync local→node (or node→local with `--pull`). |
-| `hpc-alloc cancel JOBID` | Cancel an hpc-alloc job by id (refuses jobs it didn't create). |
-| `hpc-alloc down [name\|--all]` | Cancel allocation(s) and remove SSH aliases. |
-| `hpc-alloc partitions [--json]` | Partition list with limits, GPU GRES names, and `-C` feature tags. |
-| `hpc-alloc connect [--reset] [--push]` | (Re)establish + health-check all connections. `--push` authenticates via Duo push — agent-runnable: tell the user to approve on their phone. Without `--push`, user-run only (terminal Duo prompt). |
+| `hpc-alloc config --json` | Validate authoritative config and inspect effective defaults without cluster access. |
+| `hpc-alloc status --json` | Reconcile all configured clusters and inspect local jobs, classified v2-tagged rows, and unresolved operations. Run first. |
+| `hpc-alloc avail [--cluster C] [-p PART] [--json]` | Inspect idle CPUs and free GPUs before requesting scarce resources. |
+| `hpc-alloc partitions [--cluster C] [--json]` | Inspect live partitions, limits, GRES, and features. |
+| `hpc-alloc up [--name N] [resources]` | Create a persistent development allocation. It waits for a node unless `--no-wait` is given. |
+| `hpc-alloc run [resources] [--chdir DIR] [--detach] -- CMD...` | Run a finite batch command. Foreground mode follows output and mirrors the job result. Prefer this for GPU execution. |
+| `hpc-alloc logs TARGET [-n N] [-f]` | Read or follow a managed job log. TARGET may be a name, job ID, or `@operation`. Following never implicitly cancels. |
+| `hpc-alloc why [TARGET] [--json]` | Diagnose pending, active, uncertain, or final lifecycle evidence by convenience or durable selector. |
+| `hpc-alloc ssh [NAME\|@OPERATION] -- CMD...` | Run a command on an active allocation. Omitting CMD opens an interactive user shell. |
+| `hpc-alloc sync NAME\|@OPERATION SRC DST [--pull] [--delete]` | Transfer files through the allocation alias with rsync. |
+| `hpc-alloc cancel JOBID\|@OPERATION` | Cancel an exact managed allocation or run after live identity verification. |
+| `hpc-alloc down [NAME\|@OPERATION\|--all]` | Cancel exact managed allocation jobs. |
+| `hpc-alloc recover [OPERATION_ID]` | Reconcile ambiguous remote mutation replies using exact queue/accounting identity. |
+| `hpc-alloc connect [--reset] [--push]` | Establish or heal SSH masters. |
 
-For rare queries with no subcommand, run raw Slurm commands over the login alias: `ssh bouchet-login -- 'sinfo ...'`.
+Shared resource flags are `--cluster`, `-p/--partition`, `-t/--time`,
+`-c/--cpus`, `--mem`, `-G/--gpus`, and `-C/--constraint`. Pass only values the
+task requires; let authoritative config supply the rest. Use `--dry-run` to
+inspect an `up` or `run` submission without connecting or changing state.
 
-## Defaults discipline
+## Durable job selectors
 
-The user's `~/.config/hpc-alloc/config.toml` may change any default (cluster, partition, time, cpus, mem, idle-timeout), so this document never tells you what a default *is* — only what the built-in fallback would be.
+The operation ID is the durable identity. Slurm can recycle numeric job IDs,
+and logical names can repeat. Prefer the canonical form for reattachment,
+history, and automation:
 
-1. **Pass only the flags the task actually requires** (e.g. `-G h200:1` for GPU work, `--mem` for a memory-hungry job); leave the rest unset so the user's configured preferences apply. Don't copy fully-flagged examples verbatim.
-2. **Need to know an effective value before acting** (e.g. to tell the user what will happen)? Run `hpc-alloc config --json`.
-3. **Trust the echo over any prediction**: `up` and `run` print the actual partition, walltime, and idle-timeout used at submission — that output is the ground truth for what happened.
+```text
+@operation_id
+cluster:@operation_id
+```
 
-Cluster-side facts in this skill — partition time limits, the ~30-min idle-GPU warning policy, the scratch purge, exit-code meanings, job-name prefixes — are invariants that no config changes.
+The CLI also accepts convenience forms:
 
-## GPU etiquette (important)
+```text
+cluster:name
+cluster:jobid
+```
 
-YCRC monitors GPU jobs and **cancels ones whose GPUs sit idle** (warning email at ~30 min; repeat offenses risk account suspension). Never try to defeat this with fake GPU load. Instead:
+Examples: `bouchet:@08a3a68f1ad04ac595836695e0e9cc95`, `bouchet:dev`, and
+`bouchet:123456`. Name and numeric selectors prefer one current non-final job
+over retained history. If ambiguity remains, the error lists canonical
+operation selectors. A qualifier and `--cluster` must agree.
 
-- **Two-tier pattern (default for GPU work):** keep the persistent dev allocation on a CPU partition (`hpc-alloc up -p day`) for editing/builds, and execute GPU work with `hpc-alloc run -G h200:1 -- ...` so GPUs are held only while computing.
-- Check `hpc-alloc avail` first; if the GPU type you want shows 0 free, prefer `run` (it queues) over holding a node, or pick another type/partition.
-- Direct GPU allocations (`up -G ...`) self-release after a period of GPU idleness (built-in default 30 min, matching YCRC's warning threshold; the user's config may change it). `--idle-timeout MIN` overrides per-allocation; `0` disables — only with the user's explicit OK. Warn the user when `status` shows a GPU allocation with low `gpu_util`.
-- For quick interactive GPU debugging, `-p gpu_devel` is the intended partition (6h, 2 GPUs).
+`status` polls all configured clusters. Other read commands act on the selected
+cluster or target job; `down --all` may span clusters and can be restricted by
+`--cluster`.
 
-## Choosing resources (Bouchet)
+## Durable mutation recovery
 
-- CPU work: `day` (max 1 day; the built-in default partition) or `week` (max 7 days, 96 CPUs/user).
-- GPU work: `-G TYPE:N` alone picks the configured GPU partition (built-in: `gpu`). Verified GRES names: `h200`, `b200`, `rtx_5000_ada` (on `gpu`), `rtx_pro_6000_blackwell` (on `gpu_rtx6000`), `l40s` (scavenge only). E.g. `-p gpu_h200 -G h200:1`. GPU partitions max 2 days (QoS-enforced; `sinfo` shows "infinite").
-- Big memory: `-p bigmem --mem 512G` (max 1 day). Memory defaults to 5120MB per CPU — set `--mem` explicitly for memory-hungry work.
-- Verify GPU GRES names and `-C` feature tags with `hpc-alloc partitions`; shorter `-t` improves queue position (backfill), and for `run` over-requesting time costs only queue position, never held resources.
-- Request modestly (a dev node, not a production run): more resources = longer queue wait.
+State is a SQLite WAL database at `~/.config/hpc-alloc/state.db`. Do not edit
+it, query it to bypass the CLI, delete its `-wal`/`-shm` files, or copy only one
+live sidecar. The journal persists a mutation before the remote call and
+records the acknowledgement afterward. If SSH fails after a submit or cancel
+may have committed, v2 marks the operation ambiguous and does not guess that a
+retry is safe.
+
+When `status` reports an unresolved operation, run the printed command:
+
+```bash
+hpc-alloc recover OPERATION_ID
+```
+
+Recovery requires the exact operation-derived v2 Slurm name. A live queue row
+must also match the complete persisted comment. Bouchet accounting may omit
+`Comment`; only an empty accounting comment may be accepted with the exact
+name. Any nonempty accounting comment must match byte-for-byte, and any name or
+nonempty-comment mismatch fails closed. If recovery cannot prove the outcome,
+leave the operation unresolved and report it; do not repeat the original
+mutation.
+
+Cancellation recovery is observation-only. It checks the exact live queue row
+and final accounting, never repeats `scancel`, and leaves the cancellation
+pending when those reads cannot prove the outcome. A later explicit cancel is
+a separate user-authorized mutation, not part of `recover`. `CANCEL_PENDING`
+means no cancellation call was dispatched; `AMBIGUOUS` is committed before the
+one guarded call and blocks another attempt until the operation is explicitly
+abandoned.
+
+Before cancelling an already-absent job, require two successful exact queue
+absences or exact final accounting. Submission preparation contains no batch
+mutation; after the one batch call is dispatched, every reply except rc0 plus
+one trusted scalar job ID is ambiguous and must be recovered without retry.
+
+`hpc-alloc recover OPERATION_ID --abandon` discards only the local journal
+intent and can leave a remote orphan. Use it only after explicit user approval
+and after the remote outcome has been independently checked. `--yes` skips its
+confirmation prompt but does not make abandonment safer.
+
+`SUBMIT_FAILED` and `ABANDONED` are local final verdicts, not unresolved
+operations, even though they may have no Slurm job ID. `why @operation` reports
+them without cluster access. `logs @operation` exits 1 locally because no
+managed remote log is confirmed and must not suggest `recover`. Only a genuinely
+unresolved `SUBMITTING` record gets recovery guidance.
+
+V2 identities have these forms:
+
+```text
+hpcalloc-v2-<alloc|run>-<32-hex-operation-id>
+hpc-alloc:v2:<owner-id>:<operation-id>:<host-label>:<kind>:<logical-name-or->
+```
+
+Live observations and cancellation guards require the exact managed job name
+and complete comment before `scancel`. The empty-comment exception applies
+only to terminal accounting and accounting recovery, never to a live mutation.
+The safe host label is display metadata; `owner-id` is the authoritative
+machine identity.
+Never call `scancel` directly and never attempt to adopt or cancel legacy,
+malformed, foreign-machine, or merely similar live jobs.
+
+## Stream and signal policy
+
+- Foreground `run` returns the batch command's exit code. Any final Slurm state
+  other than `COMPLETED` is nonzero.
+- Ctrl-C during foreground `run` cancels its exact job; the CLI returns 130.
+- A closed stdout pipe during foreground `run` initiates cancellation and
+  returns 141. If cancellation itself is ambiguous, report the recovery ID.
+- Ctrl-C or a closed pipe during `logs -f` only detaches. The job continues;
+  Ctrl-C returns 130 and BrokenPipe returns 141.
+- A clean `logs -f` returns 0 regardless of the job's final state.
+
+Do not interpret a pipe closure as ordinary success. Do not replace `logs -f`
+with foreground `run` when the desired policy is detach-on-client-exit.
+
+## Resource discipline
+
+Read effective values when needed:
+
+```bash
+hpc-alloc config --json
+```
+
+Precedence is CLI flag, selected `[cluster.NAME]`, `[defaults]`, then built-in
+fallback. The strict v2 config requires `[identity].netid` and an explicit
+`host` in every `[cluster.NAME]` table.
+
+For GPU work:
+
+1. Run `hpc-alloc avail --json` and, if necessary, `partitions --json` to get
+   current capacity and exact GRES names.
+2. Prefer `hpc-alloc run -G TYPE:N -- ...`; it holds GPUs only while the
+   command runs.
+3. Use a CPU `up` allocation for editing/building and submit GPU execution with
+   `run` when practical.
+4. A persistent `up -G ...` allocation has an idle watchdog. Do not disable it
+   with `--idle-timeout 0` without the user's explicit approval, and never
+   create fake GPU load to evade cluster policy.
+
+Set `--mem` explicitly for memory-heavy work. Shorter realistic walltimes can
+improve backfill opportunities, and larger requests usually queue longer and
+consume more fair share. Use `why` rather than guessing why a job is pending.
 
 ## Typical workflow
 
-1. `hpc-alloc status --json` — reuse a live allocation if its resources fit; don't stack duplicates. Warn the user about anything `expiring_soon`.
-2. Dev seat: `hpc-alloc up --name dev`, adding flags only for needs beyond the user's defaults (e.g. `-t 8:00:00` for a long session, `-c 8` for parallel builds). If PENDING for long, run `hpc-alloc why dev`, then consider `--no-wait` or a different partition.
-3. Push code: `hpc-alloc sync dev ./project '~/project'` (incremental; re-run after edits).
-4. Build/test on the dev node: `hpc-alloc ssh dev -- 'cd ~/project && make test'`. Load software with `module load ...` (e.g. `module load miniconda`) inside the command — nodes start with a bare environment.
-5. GPU execution: check `hpc-alloc avail`, then `hpc-alloc run -p gpu_h200 -G h200:1 -c 8 --mem 64G --chdir '~/project' -- python train.py`. For long jobs use `--detach` (or a backgrounded foreground run) and follow with `hpc-alloc logs <jobid> -f`; the job survives client death either way.
-6. Pull results: `hpc-alloc sync dev '~/project/results' ./results --pull`.
-7. When the user is done for the day: ask before `hpc-alloc down` — idle allocations waste fairshare, but the user may want to keep the node.
+1. `hpc-alloc status --json`; recover unresolved operations and reuse a
+   suitable active allocation.
+2. `hpc-alloc config --json` and `avail --json` if resource selection matters.
+3. Create a development seat with `hpc-alloc up --name dev`, adding only the
+   required resource flags.
+4. Push code with `hpc-alloc sync bouchet:dev ./project '~/project'`.
+5. Build/test with
+   `hpc-alloc ssh bouchet:dev -- 'cd ~/project && make test'`. Load modules in
+   the remote command because compute nodes start with a minimal environment.
+6. Submit GPU work with `run`; use `--detach` for long work and follow by its
+   reported `cluster:@operation` selector.
+7. Pull results with `sync --pull`.
+8. Ask before `down` or cancellation unless releasing work was already part of
+   the user's instruction.
 
-## Rules
+## Safety rules
 
-- Never run computation on the login node; everything heavy goes through `hpc-alloc ssh`/`run`.
-- Never call `scancel` directly — use `hpc-alloc cancel JOBID` / `hpc-alloc down NAME`, which refuse jobs hpc-alloc didn't create.
-- Walltime is a hard deadline and cannot be extended — sync results out before it hits (`status` flags `expiring_soon`).
-- Cluster `scratch` storage purges files after 60 days; keep anything important in `project` or home.
-- On exit code 3: stop; either ask the user to run `hpc-alloc connect`, or announce and run `hpc-alloc connect --push` (they approve on their phone), then resume. On a stuck or dead job: `hpc-alloc why` first, then act on its diagnosis.
-- A `runs` entry with `"orphan": true` is a sleeper this machine created but lost track of (jobs are ownership-tagged via their comment with a persisted per-machine id). Report it and run `hpc-alloc cancel <jobid>` only with the user's explicit confirmation; never touch `kind: recent` or `kind: other-machine` entries.
-- `hpc-alloc run` mirrors the job's exit code (any non-COMPLETED end is nonzero); `hpc-alloc logs -f` is a pure watcher and exits 0 after a clean stream regardless of the job's outcome.
-- Multi-cluster: config may define several `[cluster.X]` entries, but only Bouchet is live-validated (multi-cluster paths are tested offline only). Secondary-cluster failures degrade softly with a note naming the remedy: `unreachable — skipping it` (network), `needs re-auth — run hpc-alloc connect --cluster <x>` (run it after announcing, or relay it), or a `HOST KEY VERIFICATION FAILED` warning (stop and tell the user — possible interception). Its allocations show as `UNKNOWN`; report the note rather than treating it as an error.
+- Never run heavy computation on the login node.
+- Never directly edit `~/.config/hpc-alloc/state.db` or its WAL sidecars.
+- Never directly call `scancel`; use `cancel` or `down` for exact verification
+  and durable journaling.
+- Never retry an ambiguous submit/cancel. Use `recover`, which observes and
+  reconciles evidence without replaying an ambiguous cancellation.
+- Never claim a job ended from a transport failure, one absent queue sample, or
+  an unavailable secondary cluster.
+- Never cancel a `discovered` entry or an `other-machine` job merely
+  because it has a v2-looking tag. Report it and obtain explicit direction.
+- Treat host-key changes as a hard stop until the user verifies the new key
+  through a trusted YCRC channel. This applies equally to primary and secondary
+  clusters; compute keys and control masters are namespaced by cluster.
+- Walltime is a hard deadline and cannot be extended. Synchronize important
+  outputs before it expires.
