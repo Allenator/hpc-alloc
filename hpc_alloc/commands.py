@@ -908,11 +908,26 @@ def cmd_up(
 
 
 def _remote_home(ctx: Any, client: Any, cluster: str) -> str:
+    netid = ctx.config.identity.netid
+    host = ctx.config.clusters[cluster].host
     cached = ctx.state.get_cluster_cache(cluster, "remote_home")
-    if isinstance(cached, str) and cached.startswith("/"):
-        return cached
+    if (
+        isinstance(cached, dict)
+        and set(cached) == {"path", "netid", "host"}
+        and isinstance(cached["path"], str)
+        and cached["path"].startswith("/")
+        and "\x00" not in cached["path"]
+        and "\n" not in cached["path"]
+        and cached["netid"] == netid
+        and cached["host"] == host
+    ):
+        return cached["path"]
     home = client.remote_home()
-    ctx.state.set_cluster_cache(cluster, "remote_home", home)
+    ctx.state.set_cluster_cache(
+        cluster,
+        "remote_home",
+        {"path": home, "netid": netid, "host": host},
+    )
     return home
 
 
@@ -1557,14 +1572,16 @@ def _recover_submission(ctx: Any, client: Any, operation: Any, job: Any) -> bool
         client.verify_accounting_identity(recovered_ref, record.job_name, record.comment)
         adopted = ctx.state.acknowledge_submission(operation.operation_id, record.job_id)
         if record.final:
-            ctx.state.update_job(
-                adopted.operation_id,
-                phase=JobPhase.FINAL,
-                ever_started=record.state_code not in {"CANCELLED"},
-                terminal_state=record.state,
-                exit_code=record.exit_code,
-                final_source=FinalSource.ACCOUNTING,
-            )
+            # Recovery must not maintain a second scheduler-state taxonomy.
+            # Feed authoritative accounting through the same lifecycle engine
+            # used by normal monitoring so start history and log eligibility
+            # stay identical for states such as BOOT_FAIL and REVOKED.
+            from .lifecycle import EvidenceEvent
+            from .monitor import JobMonitor, persist_assessment
+
+            tracker = JobMonitor.tracker(adopted)
+            assessment = tracker.accept(EvidenceEvent.final(record))
+            persist_assessment(ctx.state, adopted, assessment)
         info(f"recovered accounting job {operation.cluster}:{record.job_id}")
         return True
     return False

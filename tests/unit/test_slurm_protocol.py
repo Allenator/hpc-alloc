@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from hpc_alloc.commands import _recover_submission
 from hpc_alloc.errors import IdentityMismatch, ProtocolViolation, SchedulerUnavailable
-from hpc_alloc.models import JobKind, JobRef
+from hpc_alloc.models import JobKind, JobPhase, JobRecord, JobRef
 from hpc_alloc.ownership import format_tag, slurm_job_name
 from hpc_alloc.slurm import (
     AccountingRecord,
@@ -302,6 +302,57 @@ class SlurmProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ProtocolViolation, "no trustworthy exact record"):
             client.accounting("123")
 
+    def test_accounting_requests_full_identity_widths_before_extra_fields(self) -> None:
+        operation_id = "a" * 32
+        job_name = slurm_job_name("allocation", operation_id)
+        comment = format_tag(
+            "o" * 63,
+            operation_id,
+            "h" * 63,
+            "allocation",
+            "n" * 63,
+        )
+        self.assertEqual(len(job_name), 50)
+        self.assertEqual(len(comment), 248)
+        ref = JobRef(
+            cluster="grace",
+            job_id="123",
+            owner_id="o" * 63,
+            operation_id=operation_id,
+            slurm_job_name=job_name,
+            slurm_comment=comment,
+        )
+        client, transport = self.client(
+            [framed(f"123|COMPLETED|0:0|{job_name}|{comment}|1:02|node01\n")]
+        )
+
+        record = client.accounting(ref, extra_fields=("Elapsed", "NodeList"))
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.job_name, job_name)
+        self.assertEqual(record.comment, comment)
+        self.assertEqual(record.extra, ("1:02", "node01"))
+        self.assertIn(
+            "-o JobIDRaw,State,ExitCode,JobName%255,Comment%255,Elapsed,NodeList",
+            transport.calls[0][1],
+        )
+
+    def test_accounting_rejects_a_truncated_identity(self) -> None:
+        ref = self.managed_ref()
+        truncated_comment = ref.slurm_comment[:-1] + "+"
+        client, _transport = self.client(
+            [
+                framed(
+                    f"{ref.job_id}|COMPLETED|0:0|{ref.slurm_job_name}|"
+                    f"{truncated_comment}\n"
+                )
+            ]
+        )
+
+        with self.assertRaises(IdentityMismatch):
+            client.accounting(ref)
+
     def test_accounting_accepts_only_exact_derived_name_when_comment_is_omitted(self) -> None:
         ref = self.managed_ref()
         payload = f"{ref.job_id}|COMPLETED|0:0|{ref.slurm_job_name}|\n"
@@ -444,10 +495,21 @@ class SlurmProtocolTests(unittest.TestCase):
 
             def acknowledge_submission(self, operation_id: str, job_id: str):
                 self.acknowledged = (operation_id, job_id)
-                return SimpleNamespace(operation_id=operation_id)
+                return JobRecord(
+                    operation_id=operation_id,
+                    cluster=ref.cluster,
+                    logical_name="run",
+                    kind=JobKind.RUN,
+                    owner_id=ref.owner_id,
+                    slurm_job_name=ref.slurm_job_name,
+                    slurm_comment=ref.slurm_comment,
+                    phase=JobPhase.QUEUED,
+                    job_id=job_id,
+                )
 
-            def update_job(self, _operation_id: str, **_changes: object) -> None:
+            def update_job(self, _operation_id: str, **_changes: object) -> JobRecord:
                 self.updated = True
+                return self.acknowledge_submission(ref.operation_id, ref.job_id)
 
         class Client:
             def __init__(self) -> None:
@@ -493,12 +555,20 @@ class SlurmProtocolTests(unittest.TestCase):
         assert record is not None
         self.assertEqual(record.job_id, "123")
         self.assertIn("sacct -X", transport.calls[0][1])
+        self.assertIn(
+            "-o JobIDRaw,State,ExitCode,JobName%255,Comment%255",
+            transport.calls[0][1],
+        )
         self.assertEqual(transport.calls[0][2]["retry"], RetryPolicy.SAFE_READ)
 
         duplicate = one + f"124|FAILED|1:0|{name}|tag\n"
         client, _transport = self.client([framed(duplicate)])
         with self.assertRaisesRegex(ProtocolViolation, "multiple records"):
             client.find_accounting_by_name(name)
+
+        truncated = f"123|COMPLETED|0:0|{name[:-1]}+|tag\n"
+        client, _transport = self.client([framed(truncated)])
+        self.assertIsNone(client.find_accounting_by_name(name))
 
     def test_submission_spec_owns_quoting_and_identity_metadata(self) -> None:
         spec = SubmissionSpec(

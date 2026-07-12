@@ -16,6 +16,7 @@ from hpc_alloc.errors import ConfigInvalid, StateConflict, StateInvalid, Transpo
 from hpc_alloc.models import FinalSource, JobKind, JobPhase, OperationPhase
 from hpc_alloc.ownership import format_tag, slurm_job_name
 from hpc_alloc.paths import AppPaths
+from hpc_alloc.selectors import parse_selector
 from hpc_alloc.state import SCHEMA_VERSION, StateRepository
 
 
@@ -275,6 +276,79 @@ class RuntimeContextTests(unittest.TestCase):
         self.assertEqual(context.cluster_name, "alpha")
         self.assertEqual(context.cluster.host, "alpha.example.edu")
         self.assertTrue(self.paths.state_db.exists())
+
+    def test_qualified_job_selectors_defer_cluster_resolution_to_the_handler(self) -> None:
+        self.paths.config_file.write_text(VALID_CONFIG.replace('cluster = "alpha"\n', ""))
+
+        selectors = {
+            "why": "beta:dev",
+            "logs": f"beta:@{SUBMIT_ID}",
+            "cancel": "beta:123",
+            "down": "beta:dev",
+            "ssh": "beta:dev",
+            "sync": "beta:dev",
+        }
+        for command, target in selectors.items():
+            with self.subTest(command=command, target=target):
+                context = RuntimeContext.load(command=command, paths=self.paths)
+                self.assertIsNone(context.cluster_name)
+                self.assertIsNone(context.cluster)
+                selector = parse_selector(target)
+                self.assertEqual(context.config.resolve_cluster(selector.cluster), "beta")
+
+        recovery = RuntimeContext.load(command="recover", paths=self.paths)
+        self.assertIsNone(recovery.cluster_name)
+        self.assertIsNone(recovery.cluster)
+
+        self.assertTrue(self.paths.state_db.exists())
+
+    def test_explicit_cluster_resolves_for_job_scoped_context(self) -> None:
+        self.paths.config_file.write_text(VALID_CONFIG.replace('cluster = "alpha"\n', ""))
+
+        context = RuntimeContext.load(
+            command="logs",
+            explicit_cluster="beta",
+            paths=self.paths,
+        )
+
+        self.assertEqual(context.cluster_name, "beta")
+        self.assertEqual(context.cluster.host, "10.0.0.2")
+
+        with self.assertRaisesRegex(ConfigInvalid, "not configured"):
+            RuntimeContext.load(
+                command="down",
+                explicit_cluster="missing",
+                paths=self.paths,
+            )
+
+    def test_single_cluster_commands_still_require_an_implicit_choice(self) -> None:
+        self.paths.config_file.write_text(VALID_CONFIG.replace('cluster = "alpha"\n', ""))
+
+        for command in ("connect", "up", "run", "avail", "partitions"):
+            with self.subTest(command=command):
+                with self.assertRaisesRegex(ConfigInvalid, "multiple clusters"):
+                    RuntimeContext.load(command=command, paths=self.paths)
+
+    def test_status_defers_its_required_primary_cluster_to_the_handler(self) -> None:
+        self.paths.config_file.write_text(VALID_CONFIG.replace('cluster = "alpha"\n', ""))
+
+        context = RuntimeContext.load(command="status", paths=self.paths)
+
+        self.assertIsNone(context.primary_cluster)
+        self.assertTrue(self.paths.state_db.exists())
+
+    def test_dry_run_preserves_cluster_resolution_without_initializing_state(self) -> None:
+        self.paths.config_file.write_text(VALID_CONFIG.replace('cluster = "alpha"\n', ""))
+
+        context = RuntimeContext.load(
+            command="dry-run",
+            explicit_cluster="beta",
+            paths=self.paths,
+        )
+
+        self.assertEqual(context.cluster_name, "beta")
+        self.assertEqual(context.cluster.host, "10.0.0.2")
+        self.assertFalse(self.paths.state_db.exists())
 
     def test_recovery_command_exposes_config_error_without_creating_state(self) -> None:
         self.paths.config_file.write_text("invalid = [")

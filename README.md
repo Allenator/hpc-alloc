@@ -153,9 +153,12 @@ global default. Invocation precedence is:
 CLI flag > selected [cluster.NAME] value > [defaults] value > built-in fallback
 ```
 
-If several clusters are configured, set `[defaults].cluster` or select one
-with `--cluster`. There is no fallback host convention in the config parser:
-each cluster table must declare its host explicitly.
+If several clusters are configured, commands that must choose a cluster
+implicitly require `[defaults].cluster` (notably `status`) or `--cluster` where
+that flag is supported. A cluster-qualified job selector supplies its own
+cluster, while unfiltered `recover` and `down --all` may span clusters without
+a default. There is no fallback host convention in the config parser: each
+cluster table must declare its host explicitly.
 
 ## Durable job selectors
 
@@ -217,10 +220,11 @@ hpc-alloc recover OPERATION_ID
 ```
 
 Recovery requires the exact operation-derived v2 job name. A live queue match
-must also contain the complete expected comment. Bouchet accounting preserves
-the full job name but may omit `Comment`; an empty accounting comment is
-accepted only with that exact name. Any nonempty accounting comment must match
-the persisted comment byte-for-byte, so mismatches fail closed. If there is
+must also contain the complete expected comment. Accounting reads explicitly
+request full-width identity columns; Bouchet accounting may still omit
+`Comment`, so an empty accounting comment is accepted only with the exact job
+name. Any nonempty accounting comment must match the persisted comment
+byte-for-byte, so truncated or mismatched identities fail closed. If there is
 still no conclusive match, the operation remains unresolved.
 
 Submission directory preparation is a separate idempotent step. Once the one

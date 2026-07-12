@@ -227,6 +227,110 @@ class CommandSshPolicyTests(unittest.TestCase):
                 self.assertEqual(transport.bootstrap.call_count, 2)
                 project.assert_called_once_with(context, self.paths)
 
+    def test_cmd_down_all_routes_each_allocation_to_its_own_cluster(self) -> None:
+        jobs = [
+            SimpleNamespace(
+                cluster=cluster,
+                kind=JobKind.ALLOCATION,
+                logical_name=name,
+                job_id=job_id,
+            )
+            for cluster, name, job_id in (
+                ("grace", "dev", "101"),
+                ("bouchet", "gpu", "202"),
+            )
+        ]
+        context = SimpleNamespace(
+            state=SimpleNamespace(list_jobs=Mock(return_value=jobs))
+        )
+        transports = {
+            cluster: SimpleNamespace(bootstrap=Mock())
+            for cluster in ("grace", "bouchet")
+        }
+
+        def services(
+            _ctx: object,
+            _paths: object,
+            _entrypoint: object,
+            cluster: str,
+        ) -> tuple[object, object]:
+            return transports[cluster], SimpleNamespace(cluster=cluster)
+
+        with (
+            patch("hpc_alloc.commands._services", side_effect=services) as service_factory,
+            patch(
+                "hpc_alloc.commands._cancel_record",
+                return_value=SimpleNamespace(
+                    status=SimpleNamespace(value="CANCELLED")
+                ),
+            ) as cancel,
+            patch("hpc_alloc.commands._sync_ssh_projection") as project,
+        ):
+            result = cmd_down(
+                SimpleNamespace(all=True, target=None, cluster=None),
+                ctx=context,
+                paths=self.paths,
+                entrypoint=self.entrypoint,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            [call.args[3] for call in service_factory.call_args_list],
+            ["grace", "bouchet"],
+        )
+        transports["grace"].bootstrap.assert_called_once_with("grace")
+        transports["bouchet"].bootstrap.assert_called_once_with("bouchet")
+        self.assertEqual([call.args[2] for call in cancel.call_args_list], jobs)
+        project.assert_called_once_with(context, self.paths)
+
+    def test_cmd_down_all_explicit_cluster_restricts_the_job_set(self) -> None:
+        jobs = [
+            SimpleNamespace(
+                cluster=cluster,
+                kind=JobKind.ALLOCATION,
+                logical_name=name,
+                job_id=job_id,
+            )
+            for cluster, name, job_id in (
+                ("grace", "dev", "101"),
+                ("bouchet", "gpu", "202"),
+            )
+        ]
+        context = SimpleNamespace(
+            state=SimpleNamespace(list_jobs=Mock(return_value=jobs))
+        )
+        transport = SimpleNamespace(bootstrap=Mock())
+
+        with (
+            patch(
+                "hpc_alloc.commands._services",
+                return_value=(transport, SimpleNamespace()),
+            ) as service_factory,
+            patch(
+                "hpc_alloc.commands._cancel_record",
+                return_value=SimpleNamespace(
+                    status=SimpleNamespace(value="CANCELLED")
+                ),
+            ) as cancel,
+            patch("hpc_alloc.commands._sync_ssh_projection"),
+        ):
+            result = cmd_down(
+                SimpleNamespace(all=True, target=None, cluster="grace"),
+                ctx=context,
+                paths=self.paths,
+                entrypoint=self.entrypoint,
+            )
+
+        self.assertEqual(result, 0)
+        service_factory.assert_called_once_with(
+            context,
+            self.paths,
+            self.entrypoint,
+            "grace",
+        )
+        transport.bootstrap.assert_called_once_with("grace")
+        cancel.assert_called_once_with(context, service_factory.return_value[1], jobs[0])
+
 
 if __name__ == "__main__":
     unittest.main()

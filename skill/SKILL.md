@@ -127,9 +127,11 @@ Examples: `bouchet:@08a3a68f1ad04ac595836695e0e9cc95`, `bouchet:dev`, and
 over retained history. If ambiguity remains, the error lists canonical
 operation selectors. A qualifier and `--cluster` must agree.
 
-`status` polls all configured clusters. Other read commands act on the selected
-cluster or target job; `down --all` may span clusters and can be restricted by
-`--cluster`.
+`status` polls all configured clusters and needs a configured primary when
+several exist. Other read commands act on the cluster supplied by their parsed
+selector or explicit flag; a qualified selector does not require a default.
+Unfiltered recovery and `down --all` may span clusters, and `--cluster`
+restricts them.
 
 ## Durable mutation recovery
 
@@ -147,9 +149,10 @@ hpc-alloc recover OPERATION_ID
 ```
 
 Recovery requires the exact operation-derived v2 Slurm name. A live queue row
-must also match the complete persisted comment. Bouchet accounting may omit
-`Comment`; only an empty accounting comment may be accepted with the exact
-name. Any nonempty accounting comment must match byte-for-byte, and any name or
+must also match the complete persisted comment. Accounting reads request
+full-width identity columns. Bouchet accounting may omit `Comment`; only an
+empty accounting comment may be accepted with the exact name. Any nonempty
+accounting comment must match byte-for-byte, and any truncated name or
 nonempty-comment mismatch fails closed. If recovery cannot prove the outcome,
 leave the operation unresolved and report it; do not repeat the original
 mutation.

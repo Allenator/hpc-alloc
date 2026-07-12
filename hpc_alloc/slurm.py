@@ -50,6 +50,13 @@ FINAL_STATES = frozenset(
 )
 
 _SQUEUE_INVALID_SINGLETON = "slurm_load_jobs error: Invalid job id specified"
+_SACCT_BASE_FIELDS = (
+    "JobIDRaw",
+    "State",
+    "ExitCode",
+    "JobName%255",
+    "Comment%255",
+)
 MAX_LOG_CHUNK_BYTES = 1024 * 1024
 _MAX_QUEUE_PAYLOAD_BYTES = 32 * 1024 * 1024
 _MAX_QUEUE_FIELD_BYTES = 64 * 1024
@@ -633,7 +640,7 @@ class SlurmClient:
         allowed_extra = {"Elapsed", "Timelimit", "Reason", "Partition", "NodeList"}
         if any(field not in allowed_extra for field in extra_fields):
             raise ProtocolViolation("unsupported sacct field requested")
-        fields = ("JobIDRaw", "State", "ExitCode", "JobName", "Comment", *extra_fields)
+        fields = (*_SACCT_BASE_FIELDS, *extra_fields)
         command = f"sacct -j {job_id} -X -n -P -o {shlex.quote(','.join(fields))}"
         framed = self._framed(command, retry=RetryPolicy.SAFE_READ, auth=auth)
         payload = self._require_success(framed, "sacct").decode("utf-8", errors="replace")
@@ -756,7 +763,7 @@ class SlurmClient:
             or len(job_name) > 255
         ):
             raise ProtocolViolation(f"invalid accounting job name {job_name!r}")
-        fields = ("JobIDRaw", "State", "ExitCode", "JobName", "Comment")
+        fields = _SACCT_BASE_FIELDS
         command = (
             "sacct -X -n -P -S now-30days "
             f"--name {shlex.quote(job_name)} -o {shlex.quote(','.join(fields))}"

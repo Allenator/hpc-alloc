@@ -12,6 +12,9 @@ from .state import StateRepository
 
 
 RECOVERY_COMMANDS = frozenset({"help", "config", "setup"})
+IMPLICIT_CLUSTER_COMMANDS = frozenset(
+    {"connect", "up", "run", "avail", "partitions"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,7 +83,7 @@ class RuntimeContext:
         state.initialize()
         cluster_name: str | None = None
         cluster: ClusterConfig | None = None
-        if command not in {"help", "config", "status", "recover"} or explicit_cluster is not None:
+        if explicit_cluster is not None or command in IMPLICIT_CLUSTER_COMMANDS:
             cluster_name = config.resolve_cluster(explicit_cluster)
             cluster = config.clusters[cluster_name]
         return cls(

@@ -22,7 +22,8 @@ from hpc_alloc.errors import (
     StateConflict,
     TransportLost,
 )
-from hpc_alloc.models import JobKind, JobPhase, OperationPhase
+from hpc_alloc.models import FinalSource, JobKind, JobPhase, OperationPhase
+from hpc_alloc.monitor import JobMonitor
 from hpc_alloc.paths import AppPaths
 from hpc_alloc.ownership import format_tag, slurm_job_name
 from hpc_alloc.slurm import (
@@ -927,6 +928,91 @@ class CommandMutationTests(unittest.TestCase):
             OperationPhase.ACKNOWLEDGED,
         )
         script.assert_complete()
+
+    def test_submission_recovery_uses_lifecycle_start_evidence_for_final_accounting(self) -> None:
+        cases = (
+            ("BOOT_FAIL", False),
+            ("CANCELLED", False),
+            ("DEADLINE", False),
+            ("REVOKED", False),
+            ("COMPLETED", True),
+            ("FAILED", True),
+        )
+        owner = self.repository.get_or_create_machine_id("laptop")
+        for index, (state, proves_started) in enumerate(cases, start=1):
+            with self.subTest(state=state):
+                operation_id = f"{index:032x}"
+                logical_name = f"recovered{index}"
+                job_name = slurm_job_name("allocation", operation_id)
+                comment = format_tag(
+                    owner,
+                    operation_id,
+                    "laptop",
+                    "allocation",
+                    logical_name,
+                )
+                self.repository.reserve_submission(
+                    operation_id=operation_id,
+                    cluster="grace",
+                    logical_name=logical_name,
+                    kind=JobKind.ALLOCATION,
+                    owner_id=owner,
+                    slurm_job_name=job_name,
+                    slurm_comment=comment,
+                    resources=self.resources,
+                )
+                self.repository.mark_submission_ambiguous(operation_id, "reply lost")
+                operation = self.repository.get_operation(operation_id)
+                job = self.repository.get_job(operation_id)
+                record = AccountingRecord(
+                    job_id=str(12000 + index),
+                    state=state,
+                    exit_code="0:0" if state == "COMPLETED" else "1:0",
+                    job_name=job_name,
+                    comment=comment,
+                )
+                script = StrictScript(
+                    [
+                        ExpectedCall(
+                            "scan",
+                            result=RawQueueScan(()),
+                            kwargs={"auth": AuthMode.NONINTERACTIVE},
+                        ),
+                        ExpectedCall(
+                            "find_accounting_by_name",
+                            result=record,
+                            args=(job_name,),
+                            kwargs={"auth": AuthMode.NONINTERACTIVE},
+                        ),
+                        ExpectedCall("verify_accounting_identity"),
+                    ]
+                )
+
+                with patch("hpc_alloc.commands.info"):
+                    self.assertTrue(
+                        _recover_submission(
+                            self.context,
+                            StrictProxy(script),
+                            operation,
+                            job,
+                        )
+                    )
+
+                recovered = self.repository.get_job(operation_id)
+                self.assertEqual(recovered.phase, JobPhase.FINAL)
+                self.assertEqual(recovered.final_source, FinalSource.ACCOUNTING)
+                self.assertEqual(recovered.terminal_state, state)
+                self.assertEqual(recovered.exit_code, record.exit_code)
+                self.assertEqual(recovered.ever_started, proves_started)
+                self.assertEqual(
+                    JobMonitor.tracker(recovered).assessment.log_eligible,
+                    proves_started,
+                )
+                self.assertEqual(
+                    self.repository.get_operation(operation_id).phase,
+                    OperationPhase.ACKNOWLEDGED,
+                )
+                script.assert_complete()
 
 
 if __name__ == "__main__":
