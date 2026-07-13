@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import os
 import sqlite3
+import stat
 import tempfile
 import threading
 import unittest
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from hpc_alloc.errors import (
     JobIdReused,
@@ -380,6 +384,151 @@ class StateRepositoryTests(unittest.TestCase):
         directory_path.mkdir()
         with self.assertRaisesRegex(StateInvalid, "not a regular file"):
             StateRepository(directory_path).initialize()
+
+    def test_hardlinked_state_database_is_rejected_without_mutating_peer(self) -> None:
+        peer = Path(self.directory.name) / "database-peer"
+        peer.write_bytes(b"untrusted database bytes")
+        peer.chmod(0o640)
+        path = Path(self.directory.name) / "hardlinked.db"
+        os.link(peer, path)
+        before = (peer.read_bytes(), peer.stat().st_mode, peer.stat().st_ino)
+
+        with patch("hpc_alloc.state.sqlite3.connect") as connect:
+            with self.assertRaisesRegex(StateInvalid, "exactly one hard link"):
+                StateRepository(path).initialize()
+
+        connect.assert_not_called()
+        self.assertEqual(
+            (peer.read_bytes(), peer.stat().st_mode, peer.stat().st_ino),
+            before,
+        )
+
+    def test_foreign_owned_state_database_is_rejected_before_mode_repair(self) -> None:
+        path = Path(self.directory.name) / "foreign.db"
+        path.write_bytes(b"untrusted database bytes")
+        path.chmod(0o640)
+        before = (path.read_bytes(), path.stat().st_mode, path.stat().st_ino)
+        effective_uid = os.geteuid()
+
+        with (
+            patch("hpc_alloc.state.os.geteuid", return_value=effective_uid + 1),
+            patch("hpc_alloc.state.sqlite3.connect") as connect,
+        ):
+            with self.assertRaisesRegex(StateInvalid, "owned by the current user"):
+                StateRepository(path).initialize()
+
+        connect.assert_not_called()
+        self.assertEqual(
+            (path.read_bytes(), path.stat().st_mode, path.stat().st_ino),
+            before,
+        )
+
+    def test_hardlinked_sqlite_sidecars_are_rejected_without_mutating_peer(self) -> None:
+        for suffix in ("-wal", "-shm", "-journal"):
+            with self.subTest(suffix=suffix):
+                path = Path(self.directory.name) / f"hardlinked{suffix}.db"
+                StateRepository(path).initialize()
+                sidecar = Path(f"{path}{suffix}")
+                self.assertFalse(sidecar.exists())
+                peer = Path(self.directory.name) / f"sidecar-peer{suffix}"
+                peer.write_bytes(b"untrusted sidecar bytes")
+                peer.chmod(0o640)
+                os.link(peer, sidecar)
+                before = (peer.read_bytes(), peer.stat().st_mode, peer.stat().st_ino)
+
+                with patch("hpc_alloc.state.sqlite3.connect") as connect:
+                    with self.assertRaisesRegex(StateInvalid, "exactly one hard link"):
+                        StateRepository(path).initialize()
+
+                connect.assert_not_called()
+                self.assertEqual(
+                    (peer.read_bytes(), peer.stat().st_mode, peer.stat().st_ino),
+                    before,
+                )
+
+    def test_foreign_owned_sqlite_sidecars_are_rejected_before_mode_repair(self) -> None:
+        real_fstat = os.fstat
+        for suffix in ("-wal", "-shm", "-journal"):
+            with self.subTest(suffix=suffix):
+                path = Path(self.directory.name) / f"foreign{suffix}.db"
+                StateRepository(path).initialize()
+                sidecar = Path(f"{path}{suffix}")
+                self.assertFalse(sidecar.exists())
+                sidecar.write_bytes(b"untrusted sidecar bytes")
+                sidecar.chmod(0o640)
+                sidecar_metadata = sidecar.stat()
+                identity = (sidecar_metadata.st_dev, sidecar_metadata.st_ino)
+                before = (
+                    sidecar.read_bytes(),
+                    sidecar_metadata.st_mode,
+                    sidecar_metadata.st_ino,
+                )
+
+                def foreign_sidecar(descriptor: int) -> object:
+                    metadata = real_fstat(descriptor)
+                    if (metadata.st_dev, metadata.st_ino) != identity:
+                        return metadata
+                    return SimpleNamespace(
+                        st_mode=metadata.st_mode,
+                        st_uid=metadata.st_uid + 1,
+                        st_nlink=metadata.st_nlink,
+                    )
+
+                with (
+                    patch("hpc_alloc.state.os.fstat", side_effect=foreign_sidecar),
+                    patch("hpc_alloc.state.sqlite3.connect") as connect,
+                ):
+                    with self.assertRaisesRegex(StateInvalid, "owned by the current user"):
+                        StateRepository(path).initialize()
+
+                connect.assert_not_called()
+                self.assertEqual(
+                    (sidecar.read_bytes(), sidecar.stat().st_mode, sidecar.stat().st_ino),
+                    before,
+                )
+
+    def test_state_database_mode_is_repaired_before_sqlite_connects(self) -> None:
+        path = Path(self.directory.name) / "repair-mode.db"
+        path.write_bytes(b"")
+        path.chmod(0o400)
+        real_connect = sqlite3.connect
+        observed_modes: list[int] = []
+
+        def checked_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+            observed_modes.append(stat.S_IMODE(path.stat().st_mode))
+            return real_connect(*args, **kwargs)
+
+        with patch("hpc_alloc.state.sqlite3.connect", side_effect=checked_connect):
+            StateRepository(path).initialize()
+
+        self.assertEqual(observed_modes, [0o600])
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_sqlite_sidecar_modes_are_repaired_before_connect(self) -> None:
+        for suffix in ("-wal", "-shm", "-journal"):
+            with self.subTest(suffix=suffix):
+                path = Path(self.directory.name) / f"repair-sidecar{suffix}.db"
+                StateRepository(path).initialize()
+                sidecar = Path(f"{path}{suffix}")
+                sidecar.write_bytes(b"safe sidecar")
+                sidecar.chmod(0o400)
+                observed_modes: list[int] = []
+
+                def checked_connect(*_args: object, **_kwargs: object) -> None:
+                    observed_modes.append(stat.S_IMODE(sidecar.stat().st_mode))
+                    raise sqlite3.OperationalError("stop after mode check")
+
+                with (
+                    patch(
+                        "hpc_alloc.state.sqlite3.connect",
+                        side_effect=checked_connect,
+                    ),
+                    self.assertRaisesRegex(StateInvalid, "cannot open state database"),
+                ):
+                    StateRepository(path).initialize()
+
+                self.assertEqual(observed_modes, [0o600])
+                self.assertEqual(stat.S_IMODE(sidecar.stat().st_mode), 0o600)
 
     def test_corrupt_nested_json_is_reported_as_state_corruption(self) -> None:
         self.reserve()

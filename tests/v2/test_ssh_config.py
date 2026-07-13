@@ -9,6 +9,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from hpc_alloc.config import Config
 from hpc_alloc.errors import ConfigInvalid
@@ -756,6 +757,97 @@ class SshConfigTests(unittest.TestCase):
                     lock_path=lock,
                     known_hosts=root / "known_hosts",
                 )
+
+    def test_projection_rejects_a_hardlinked_lock_before_reading_or_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.toml"
+            config_path.write_text(
+                '[identity]\nnetid = "ab1234"\n[cluster.grace]\n'
+                'host = "grace.example.edu"\n'
+            )
+            peer = root / "lock-peer"
+            peer.write_bytes(b"lock peer bytes")
+            peer.chmod(0o640)
+            lock = root / ".ssh_config.lock"
+            os.link(peer, lock)
+            managed = root / "ssh_config"
+            managed.write_text("existing projection\n")
+            peer_before = (peer.read_bytes(), peer.stat().st_mode, peer.stat().st_ino)
+            managed_before = (
+                managed.read_bytes(),
+                managed.stat().st_mode,
+                managed.stat().st_ino,
+            )
+            list_jobs = Mock(return_value=[])
+            repository = SimpleNamespace(list_jobs=list_jobs)
+
+            with self.assertRaisesRegex(ConfigInvalid, "exactly one hard link"):
+                sync_managed_config(
+                    config_path=config_path,
+                    repository=repository,
+                    managed_path=managed,
+                    lock_path=lock,
+                    known_hosts=root / "known_hosts",
+                )
+
+            list_jobs.assert_not_called()
+            self.assertEqual(
+                (peer.read_bytes(), peer.stat().st_mode, peer.stat().st_ino),
+                peer_before,
+            )
+            self.assertEqual(
+                (managed.read_bytes(), managed.stat().st_mode, managed.stat().st_ino),
+                managed_before,
+            )
+
+    def test_projection_rejects_a_foreign_lock_before_reading_or_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.toml"
+            config_path.write_text(
+                '[identity]\nnetid = "ab1234"\n[cluster.grace]\n'
+                'host = "grace.example.edu"\n'
+            )
+            lock = root / ".ssh_config.lock"
+            lock.write_bytes(b"foreign lock bytes")
+            lock.chmod(0o640)
+            managed = root / "ssh_config"
+            managed.write_text("existing projection\n")
+            lock_before = (lock.read_bytes(), lock.stat().st_mode, lock.stat().st_ino)
+            managed_before = (
+                managed.read_bytes(),
+                managed.stat().st_mode,
+                managed.stat().st_ino,
+            )
+            list_jobs = Mock(return_value=[])
+            repository = SimpleNamespace(list_jobs=list_jobs)
+            effective_uid = os.geteuid()
+
+            with (
+                patch(
+                    "hpc_alloc.locking.os.geteuid",
+                    return_value=effective_uid + 1,
+                ),
+                self.assertRaisesRegex(ConfigInvalid, "owned by the current user"),
+            ):
+                sync_managed_config(
+                    config_path=config_path,
+                    repository=repository,
+                    managed_path=managed,
+                    lock_path=lock,
+                    known_hosts=root / "known_hosts",
+                )
+
+            list_jobs.assert_not_called()
+            self.assertEqual(
+                (lock.read_bytes(), lock.stat().st_mode, lock.stat().st_ino),
+                lock_before,
+            )
+            self.assertEqual(
+                (managed.read_bytes(), managed.stat().st_mode, managed.stat().st_ino),
+                managed_before,
+            )
 
     def test_projection_lock_prevents_a_stale_writer_from_winning(self) -> None:
         snapshot_taken = threading.Event()

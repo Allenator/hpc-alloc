@@ -10,7 +10,7 @@ from hpc_alloc.errors import (
     TransportLost,
 )
 from hpc_alloc.lifecycle import AssessmentPhase, EvidenceTracker
-from hpc_alloc.models import FinalSource, JobRef
+from hpc_alloc.models import EvidenceProvenance, FinalSource, JobRef
 from hpc_alloc.slurm import (
     MAX_LOG_CHUNK_BYTES,
     AccountingRecord,
@@ -251,6 +251,233 @@ class StreamingTests(unittest.TestCase):
         self.assertTrue(result.assessment.log_eligible)
         self.assertEqual(script.count("log_size"), 1)
         self.assertEqual(script.count("read_log_chunk"), 0)
+        script.assert_complete()
+
+    def test_publication_brackets_accounting_before_log_access(self) -> None:
+        accounting = AccountingRecord(
+            job_id=self.ref.job_id,
+            state="COMPLETED",
+            exit_code="0:0",
+            job_name=self.ref.slurm_job_name,
+            comment=self.ref.slurm_comment,
+        )
+        script = StrictScript(
+            [
+                ExpectedCall("observe", result=None, args=(self.ref,)),
+                ExpectedCall(
+                    "final",
+                    result=accounting,
+                    args=(self.ref,),
+                    kwargs={"attempts": (0,)},
+                ),
+                ExpectedCall(
+                    "log_size",
+                    result=LogSizeResult(LogSizeStatus.MISSING),
+                    args=(LOG_PATH,),
+                ),
+            ]
+        )
+        publications: list[tuple[AssessmentPhase, list[str]]] = []
+
+        def publish(assessment):
+            publications.append(
+                (
+                    assessment.phase,
+                    [name for name, _args, _kwargs in script.ledger],
+                )
+            )
+            return assessment, None
+
+        result = self.follower(script).poll_once(publish_assessment=publish)
+
+        self.assertTrue(result.assessment.final)
+        self.assertEqual(
+            publications,
+            [
+                (AssessmentPhase.TERMINAL_CANDIDATE, ["observe"]),
+                (AssessmentPhase.FINAL, ["observe", "final"]),
+            ],
+        )
+        script.assert_complete()
+
+    def test_reconciled_live_authority_rebases_before_policy_and_sleep(self) -> None:
+        stale_tracker = EvidenceTracker(
+            ever_started=True,
+            last_node="node01",
+            phase=AssessmentPhase.TERMINAL_CANDIDATE,
+            terminal_state="FAILED",
+            evidence_provenance=EvidenceProvenance.QUEUE_TERMINAL,
+        )
+        replacement = EvidenceTracker(
+            ever_started=True,
+            last_node="node02",
+            phase=AssessmentPhase.REQUEUEING,
+        )
+        script = StrictScript(
+            [
+                ExpectedCall("observe", result=None, args=(self.ref,)),
+                ExpectedCall(
+                    "log_size",
+                    result=LogSizeResult.available(37),
+                    args=(LOG_PATH,),
+                ),
+            ]
+        )
+        stopped = RuntimeError("stop after the reconciled live poll")
+        follower: LogFollower
+
+        def sleep(_delay: float) -> None:
+            self.assertIs(follower.tracker, replacement)
+            self.assertEqual(follower.offset, 37)
+            self.assertEqual(follower.total_bytes_written, 37)
+            raise stopped
+
+        follower = LogFollower(
+            StrictProxy(script),  # type: ignore[arg-type]
+            self.ref,
+            LOG_PATH,
+            tracker=stale_tracker,
+            output=io.BytesIO(),
+            sleeper=sleep,
+        )
+        follower.offset = 37
+        follower.total_bytes_written = 37
+        publications: list[AssessmentPhase] = []
+
+        def publish(assessment):
+            publications.append(assessment.phase)
+            self.assertTrue(assessment.final)
+            return replacement.assessment, replacement
+
+        with self.assertRaises(RuntimeError) as raised:
+            follower.follow(publish_assessment=publish)
+
+        self.assertIs(raised.exception, stopped)
+        self.assertEqual(publications, [AssessmentPhase.FINAL])
+        self.assertEqual(script.count("final"), 0)
+        self.assertEqual(script.count("log_size"), 1)
+        self.assertEqual(follower.offset, 37)
+        self.assertEqual(follower.total_bytes_written, 37)
+        script.assert_complete()
+
+    def test_log_size_failure_follows_successful_active_publication(self) -> None:
+        failure = SchedulerUnavailable("log filesystem probe failed")
+        script = StrictScript(
+            [
+                ExpectedCall(
+                    "observe",
+                    result=row("RUNNING", node="node01"),
+                    args=(self.ref,),
+                ),
+                ExpectedCall("log_size", result=failure, args=(LOG_PATH,)),
+            ]
+        )
+        published: list[AssessmentPhase] = []
+
+        def publish(assessment):
+            published.append(assessment.phase)
+            self.assertEqual(script.count("log_size"), 0)
+            return assessment, None
+
+        follower = self.follower(script)
+        with self.assertRaises(SchedulerUnavailable) as raised:
+            follower.poll_once(publish_assessment=publish)
+
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(published, [AssessmentPhase.ACTIVE])
+        self.assertEqual(follower.tracker.assessment.phase, AssessmentPhase.UNCERTAIN)
+        script.assert_complete()
+
+    def test_broken_output_pipe_occurs_after_successful_publication(self) -> None:
+        failure = BrokenPipeError("downstream closed")
+        published: list[AssessmentPhase] = []
+
+        class BrokenOutput(io.BytesIO):
+            def write(inner_self, data: bytes) -> int:
+                self.assertEqual(published, [AssessmentPhase.ACTIVE])
+                raise failure
+
+        script = StrictScript(
+            [
+                ExpectedCall(
+                    "observe",
+                    result=row("RUNNING", node="node01"),
+                    args=(self.ref,),
+                ),
+                ExpectedCall(
+                    "log_size",
+                    result=LogSizeResult.available(1),
+                    args=(LOG_PATH,),
+                ),
+                ExpectedCall(
+                    "read_log_chunk",
+                    result=b"x",
+                    args=(LOG_PATH, 0),
+                    kwargs={"limit": 1},
+                ),
+            ]
+        )
+
+        def publish(assessment):
+            published.append(assessment.phase)
+            return assessment, None
+
+        follower = self.follower(script, output=BrokenOutput())
+        with self.assertRaises(BrokenPipeError) as raised:
+            follower.poll_once(publish_assessment=publish)
+
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(follower.offset, 0)
+        self.assertEqual(follower.total_bytes_written, 0)
+        script.assert_complete()
+
+    def test_interrupt_at_sleep_occurs_after_successful_publication(self) -> None:
+        interrupt = KeyboardInterrupt()
+        published: list[tuple[AssessmentPhase, str | None, str | None]] = []
+        script = StrictScript(
+            [
+                ExpectedCall(
+                    "observe",
+                    result=row("RUNNING", node="node02"),
+                    args=(self.ref,),
+                ),
+                ExpectedCall(
+                    "log_size",
+                    result=LogSizeResult(LogSizeStatus.MISSING),
+                    args=(LOG_PATH,),
+                ),
+            ]
+        )
+
+        def publish(assessment):
+            published.append(
+                (assessment.phase, assessment.current_node, assessment.last_node)
+            )
+            return assessment, None
+
+        def sleep(_delay: float) -> None:
+            self.assertEqual(
+                published,
+                [(AssessmentPhase.ACTIVE, "node02", "node02")],
+            )
+            raise interrupt
+
+        follower = LogFollower(
+            StrictProxy(script),  # type: ignore[arg-type]
+            self.ref,
+            LOG_PATH,
+            tracker=EvidenceTracker(
+                ever_started=True,
+                last_node="node01",
+                phase=AssessmentPhase.REQUEUEING,
+            ),
+            output=io.BytesIO(),
+            sleeper=sleep,
+        )
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            follower.follow(publish_assessment=publish)
+
+        self.assertIs(raised.exception, interrupt)
         script.assert_complete()
 
     def test_cold_attach_to_completed_accounting_streams_existing_log(self) -> None:

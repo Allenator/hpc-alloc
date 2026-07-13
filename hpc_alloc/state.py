@@ -8,6 +8,7 @@ concurrency.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -92,6 +93,7 @@ _SCHEMA_COLUMNS = {
     "cluster_cache": {"cluster", "cache_key", "value_json", "updated_at", "expires_at"},
 }
 _NODE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,252}\Z")
+_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 _UNSET = object()
 _LOCAL_FINAL_SOURCES = frozenset({FinalSource.SUBMIT_FAILED, FinalSource.ABANDONED})
 _FINAL_AUTHORITY = {
@@ -135,17 +137,111 @@ class StateRepository:
         return _timestamp(self._clock())
 
     def _prepare_path(self) -> None:
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         try:
+            self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             self.path.parent.chmod(0o700)
         except OSError as exc:
             raise StateInvalid(f"cannot secure state directory: {exc}", path=self.path) from exc
-        if self.path.is_symlink():
-            raise StateInvalid("state database must not be a symbolic link", path=self.path)
-        if self.path.exists() and not stat.S_ISREG(self.path.stat().st_mode):
-            raise StateInvalid("state database is not a regular file", path=self.path)
 
-    def _connect_raw(self) -> sqlite3.Connection:
+    def _open_sqlite_owned_path(self, path: Path, *, create: bool) -> int | None:
+        """Open and validate one SQLite-owned inode without following a link."""
+
+        description = "state database" if path == self.path else "SQLite sidecar"
+        # Validation and fchmod require only an owned descriptor.  Opening
+        # read-only lets a safe 0400 inode be repaired to 0600 before SQLite
+        # attempts its read-write connection.
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        if create:
+            flags |= os.O_CREAT
+        try:
+            descriptor = os.open(path, flags, 0o600)
+        except FileNotFoundError as exc:
+            if not create:
+                return None
+            raise StateInvalid(
+                f"cannot open {description}: {exc}", path=path
+            ) from exc
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise StateInvalid(
+                    f"{description} must not be a symbolic link", path=path
+                ) from exc
+            if exc.errno == errno.EISDIR:
+                raise StateInvalid(
+                    f"{description} is not a regular file", path=path
+                ) from exc
+            raise StateInvalid(f"cannot open {description}: {exc}", path=path) from exc
+
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise StateInvalid(
+                    f"{description} is not a regular file", path=path
+                )
+            if metadata.st_uid != os.geteuid():
+                raise StateInvalid(
+                    f"{description} is not owned by the current user", path=path
+                )
+            if metadata.st_nlink != 1:
+                raise StateInvalid(
+                    f"{description} must have exactly one hard link", path=path
+                )
+            return descriptor
+        except StateInvalid:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise
+        except OSError as exc:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise StateInvalid(
+                f"cannot inspect {description}: {exc}", path=path
+            ) from exc
+
+    @contextmanager
+    def _secure_sqlite_owned_paths(self) -> Iterator[None]:
+        """Validate every existing SQLite inode before repairing any mode."""
+
+        descriptors: list[tuple[Path, int]] = []
+        try:
+            main_descriptor = self._open_sqlite_owned_path(self.path, create=True)
+            assert main_descriptor is not None
+            descriptors.append((self.path, main_descriptor))
+            for suffix in _SQLITE_SIDECAR_SUFFIXES:
+                sidecar = Path(f"{self.path}{suffix}")
+                descriptor = self._open_sqlite_owned_path(sidecar, create=False)
+                if descriptor is not None:
+                    descriptors.append((sidecar, descriptor))
+
+            for path, descriptor in descriptors:
+                try:
+                    os.fchmod(descriptor, 0o600)
+                except OSError as exc:
+                    raise StateInvalid(
+                        f"cannot secure SQLite-owned file: {exc}", path=path
+                    ) from exc
+            yield
+        finally:
+            for _path, descriptor in reversed(descriptors):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    def _connect_raw(self, *, paths_secured: bool = False) -> sqlite3.Connection:
+        if not paths_secured:
+            # Initialization keeps these descriptors open through schema and
+            # journal setup.  Later short-lived reads and transactions still
+            # revalidate every SQLite-owned pathname before each connection.
+            with self._secure_sqlite_owned_paths():
+                return self._connect_raw(paths_secured=True)
+
         connection: sqlite3.Connection | None = None
         try:
             connection = sqlite3.connect(
@@ -168,61 +264,58 @@ class StateRepository:
         self._prepare_path()
         previous_umask = os.umask(0o077)
         try:
-            connection = self._connect_raw()
-            try:
-                tables = {
-                    row[0]
-                    for row in connection.execute(
-                        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-                    )
-                }
-                if "metadata" in tables:
-                    try:
-                        rows = connection.execute("SELECT schema_version FROM metadata").fetchall()
-                    except sqlite3.Error as exc:
-                        raise StateInvalid("state schema metadata is corrupt", path=self.path) from exc
-                    if len(rows) != 1 or rows[0][0] != SCHEMA_VERSION:
-                        version = "missing" if not rows else rows[0][0]
-                        raise StateInvalid(
-                            f"unsupported state schema {version!r}; expected {SCHEMA_VERSION}",
-                            path=self.path,
-                        )
-                if tables and tables != _SCHEMA_TABLES:
-                    missing = sorted(_SCHEMA_TABLES - tables)
-                    extra = sorted(tables - _SCHEMA_TABLES)
-                    detail = []
-                    if missing:
-                        detail.append(f"missing {', '.join(missing)}")
-                    if extra:
-                        detail.append(f"unexpected {', '.join(extra)}")
-                    raise StateInvalid(
-                        "database is not an hpc-alloc state database with an intact schema"
-                        + (f" ({'; '.join(detail)})" if detail else ""),
-                        path=self.path,
-                    )
-                connection.execute("PRAGMA journal_mode = WAL")
-                self._create_schema(connection)
-                for table, expected_columns in _SCHEMA_COLUMNS.items():
-                    actual_columns = {
-                        row[1]
+            with self._secure_sqlite_owned_paths():
+                connection = self._connect_raw(paths_secured=True)
+                try:
+                    tables = {
+                        row[0]
                         for row in connection.execute(
-                            f"PRAGMA table_info({table})"
-                        ).fetchall()
+                            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                        )
                     }
-                    if actual_columns != expected_columns:
+                    if "metadata" in tables:
+                        try:
+                            rows = connection.execute("SELECT schema_version FROM metadata").fetchall()
+                        except sqlite3.Error as exc:
+                            raise StateInvalid("state schema metadata is corrupt", path=self.path) from exc
+                        if len(rows) != 1 or rows[0][0] != SCHEMA_VERSION:
+                            version = "missing" if not rows else rows[0][0]
+                            raise StateInvalid(
+                                f"unsupported state schema {version!r}; expected {SCHEMA_VERSION}",
+                                path=self.path,
+                            )
+                    if tables and tables != _SCHEMA_TABLES:
+                        missing = sorted(_SCHEMA_TABLES - tables)
+                        extra = sorted(tables - _SCHEMA_TABLES)
+                        detail = []
+                        if missing:
+                            detail.append(f"missing {', '.join(missing)}")
+                        if extra:
+                            detail.append(f"unexpected {', '.join(extra)}")
                         raise StateInvalid(
-                            f"state table {table!r} has an unsupported schema",
+                            "database is not an hpc-alloc state database with an intact schema"
+                            + (f" ({'; '.join(detail)})" if detail else ""),
                             path=self.path,
                         )
-                check = connection.execute("PRAGMA quick_check(1)").fetchone()
-                if check is None or check[0] != "ok":
-                    raise StateInvalid("state database integrity check failed", path=self.path)
-            finally:
-                connection.close()
-            try:
-                self.path.chmod(0o600)
-            except OSError as exc:
-                raise StateInvalid(f"cannot secure state database: {exc}", path=self.path) from exc
+                    connection.execute("PRAGMA journal_mode = WAL")
+                    self._create_schema(connection)
+                    for table, expected_columns in _SCHEMA_COLUMNS.items():
+                        actual_columns = {
+                            row[1]
+                            for row in connection.execute(
+                                f"PRAGMA table_info({table})"
+                            ).fetchall()
+                        }
+                        if actual_columns != expected_columns:
+                            raise StateInvalid(
+                                f"state table {table!r} has an unsupported schema",
+                                path=self.path,
+                            )
+                    check = connection.execute("PRAGMA quick_check(1)").fetchone()
+                    if check is None or check[0] != "ok":
+                        raise StateInvalid("state database integrity check failed", path=self.path)
+                finally:
+                    connection.close()
             self._initialized = True
             return self
         except sqlite3.Error as exc:

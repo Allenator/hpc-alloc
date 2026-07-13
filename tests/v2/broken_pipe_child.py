@@ -22,7 +22,7 @@ class PipeFollower:
     def __init__(self, *_args: object, **_kwargs: object) -> None:
         pass
 
-    def follow(self) -> object:
+    def follow(self, *, publish_assessment: object | None = None) -> object:
         chunk = b"broken-pipe-regression\n" * 1024
         while True:
             sys.stdout.buffer.write(chunk)

@@ -909,10 +909,10 @@ def _reconcile_status(
                     # This row is represented by the managed jobs entry even if
                     # reconciliation finalized it during the current pass.
                     continue
-                if local.job_id is None and exact_remote_count == 1:
-                    classification = "unresolved-operation-match"
-                elif local.phase == JobPhase.FINAL and exact_remote_count == 1:
+                if local.phase == JobPhase.FINAL and exact_remote_count == 1:
                     classification = "local-final-conflict"
+                elif local.job_id is None and exact_remote_count == 1:
+                    classification = "unresolved-operation-match"
                 else:
                     classification = "duplicate-operation"
             elif local is not None:
@@ -1155,11 +1155,29 @@ def _submit_job(
             raise
 
 
-def _persist_and_render(ctx: Any, paths: AppPaths, job: Any, assessment: Any) -> Any:
+def _persist_and_render(
+    ctx: Any,
+    paths: AppPaths,
+    job: Any,
+    assessment: Any,
+    *,
+    force_projection: bool = False,
+    skip_unchanged_projection: bool = False,
+) -> Any:
     from .monitor import persist_assessment
 
     updated = persist_assessment(ctx.state, job, assessment)
-    _sync_ssh_projection(ctx, paths)
+    # StateRepository normalizes and CAS-checks every candidate before
+    # returning the original durable values for a semantic no-op.  Stream
+    # checkpoints may suppress that redundant projection rewrite, while the
+    # CAS still detects a concurrently advanced lifecycle revision.  Other
+    # command paths retain their repair-on-success behavior by default.
+    if (
+        force_projection
+        or not skip_unchanged_projection
+        or updated != job
+    ):
+        _sync_ssh_projection(ctx, paths)
     return updated
 
 
@@ -1172,6 +1190,8 @@ def _persist_reconciled_assessment(
     assessment: Any,
     monotonic_evidence: Any | None = None,
     synchronize_projection: bool = True,
+    skip_unchanged_projection: bool = False,
+    checkpoint_reconciliation_observations: bool = False,
 ) -> tuple[Any, Any, Any | None]:
     """Persist lifecycle evidence, replacing stale policy after revision races.
 
@@ -1181,7 +1201,7 @@ def _persist_reconciled_assessment(
     durable authority and the follower's monotonic start/last-node evidence.
     """
 
-    from .monitor import JobMonitor, persist_assessment
+    from .monitor import JobMonitor, accept_observation, persist_assessment
     from .ssh import AuthMode
 
     source = job
@@ -1191,28 +1211,84 @@ def _persist_reconciled_assessment(
     monotonic_started = bool(evidence.ever_started)
     monotonic_last_node = evidence.last_node
     while True:
+        if candidate.uncertain:
+            # Operational uncertainty is process-local.  Any successful queue
+            # evidence preceding this boundary was already checkpointed by
+            # the follower's publication hook.  Non-stream commands retain
+            # their normal projection repair, and a streaming CAS race must
+            # repair the projection potentially missed by its competing
+            # writer, but no uncertainty is written to the lifecycle row.
+            if synchronize_projection and (
+                fresh_tracker is not None or not skip_unchanged_projection
+            ):
+                if paths is None:
+                    raise ValueError(
+                        "paths are required when synchronizing the SSH projection"
+                    )
+                _sync_ssh_projection(ctx, paths)
+            return source, candidate, fresh_tracker
         try:
             if synchronize_projection:
                 if paths is None:
                     raise ValueError(
                         "paths are required when synchronizing the SSH projection"
                     )
-                updated = _persist_and_render(ctx, paths, source, candidate)
+                updated = _persist_and_render(
+                    ctx,
+                    paths,
+                    source,
+                    candidate,
+                    # A competing writer may have committed lifecycle state
+                    # and then failed its derived projection.  Once a CAS
+                    # race has supplied fresh authority, repair that
+                    # projection even when the retry is a semantic DB no-op.
+                    force_projection=fresh_tracker is not None,
+                    skip_unchanged_projection=skip_unchanged_projection,
+                )
             else:
                 updated = persist_assessment(ctx.state, source, candidate)
         except LifecycleRevisionConflict:
             durable = ctx.state.get_job(job.operation_id)
+            if (
+                checkpoint_reconciliation_observations
+                and durable.phase is JobPhase.FINAL
+                and durable.final_source
+                in {FinalSource.SUBMIT_FAILED, FinalSource.ABANDONED}
+            ):
+                # Explicit local finality cannot be rewritten through the
+                # scheduler-evidence API.  It is already durable authority;
+                # only its possibly missed derived projection needs repair.
+                authoritative_tracker = JobMonitor.tracker(durable)
+                if synchronize_projection:
+                    if paths is None:
+                        raise ValueError(
+                            "paths are required when synchronizing the SSH projection"
+                        )
+                    _sync_ssh_projection(ctx, paths)
+                return durable, authoritative_tracker.assessment, authoritative_tracker
             seeded = replace(
                 durable,
                 ever_started=(durable.ever_started or monotonic_started),
                 last_node=(durable.last_node or monotonic_last_node),
             )
             fresh_tracker = JobMonitor.tracker(seeded)
-            candidate = JobMonitor(client).assess(
-                seeded,
-                auth=AuthMode.NONINTERACTIVE,
-                tracker=fresh_tracker,
-            ).assessment
+            if checkpoint_reconciliation_observations:
+                if seeded.phase is JobPhase.FINAL or seeded.ref is None:
+                    candidate = fresh_tracker.assessment
+                else:
+                    _row, candidate = accept_observation(
+                        fresh_tracker,
+                        lambda: client.observe(
+                            seeded.ref,
+                            auth=AuthMode.NONINTERACTIVE,
+                        ),
+                    )
+            else:
+                candidate = JobMonitor(client).assess(
+                    seeded,
+                    auth=AuthMode.NONINTERACTIVE,
+                    tracker=fresh_tracker,
+                ).assessment
             monotonic_started = monotonic_started or candidate.ever_started
             if candidate.last_node:
                 monotonic_last_node = candidate.last_node
@@ -1236,37 +1312,31 @@ def _follow_with_reconciliation(
     job: Any,
     follower: Any,
 ) -> tuple[Any, Any]:
-    """Follow and persist until one reconciled final assessment is durable."""
+    """Publish each successful observation before following it as policy."""
 
     source = job
-    while True:
-        outcome = follower.follow()
+
+    def publish(assessment: Any) -> tuple[Any, Any | None]:
+        nonlocal source
         updated, assessment, fresh_tracker = _persist_reconciled_assessment(
             ctx=ctx,
             paths=paths,
             client=client,
             job=source,
-            assessment=outcome.assessment,
-            monotonic_evidence=outcome.assessment,
+            assessment=assessment,
+            monotonic_evidence=assessment,
+            skip_unchanged_projection=True,
+            checkpoint_reconciliation_observations=True,
         )
-        if assessment.final:
-            if fresh_tracker is not None:
-                # The stale terminal path drained before its CAS failed.  A
-                # requeue may have appended or restarted the log while the
-                # fresh scheduler assessment was collected, so drain once
-                # more from the preserved offset under durable authority.
-                follower.rebase(fresh_tracker)
-                follower.drain()
-            return updated, assessment
-        # Only a lifecycle revision race can turn follow()'s terminal result
-        # back into a live assessment.  Continue on the same follower so its
-        # byte offset and counters remain attached to the stream.
-        if fresh_tracker is None:
-            from .monitor import JobMonitor
-
-            fresh_tracker = JobMonitor.tracker(updated)
-        follower.rebase(fresh_tracker)
         source = updated
+        return assessment, fresh_tracker
+
+    # LogFollower invokes ``publish`` immediately after successful scheduler
+    # evidence and adopts any replacement tracker before notes, log access,
+    # draining, or sleeping.  Consequently a stale final CAS can reconcile
+    # back to live without one byte of stale-policy drain.
+    outcome = follower.follow(publish_assessment=publish)
+    return source, outcome.assessment
 
 
 def cmd_up(

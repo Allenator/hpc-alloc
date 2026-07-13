@@ -12,9 +12,15 @@ from .errors import (
     ProtocolViolation,
 )
 from .lifecycle import AssessmentPhase, EvidenceEvent, EvidenceTracker, JobAssessment
-from .models import JobRef
+from .models import FinalSource, JobRef
 from .monitor import accept_observation, break_lifecycle_evidence
 from .slurm import MAX_LOG_CHUNK_BYTES, LogSizeStatus, QueueRow, SlurmClient
+
+
+AssessmentPublisher = Callable[
+    [JobAssessment],
+    tuple[JobAssessment, EvidenceTracker | None],
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +96,20 @@ class LogFollower:
     def _observe(self) -> tuple[QueueRow | None, JobAssessment]:
         return accept_observation(self.tracker, lambda: self.client.observe(self.ref))
 
+    def _publish_assessment(
+        self,
+        assessment: JobAssessment,
+        publish: AssessmentPublisher | None,
+    ) -> JobAssessment:
+        """Return reconciled authority and adopt any replacement evidence."""
+
+        if publish is None:
+            return assessment
+        authoritative, replacement = publish(assessment)
+        if replacement is not None:
+            self.rebase(replacement)
+        return authoritative
+
     def _write(self, chunk: bytes) -> int:
         if not chunk:
             return 0
@@ -101,15 +121,16 @@ class LogFollower:
         self.total_bytes_written += len(chunk)
         return len(chunk)
 
-    def _state_note(self, row: QueueRow | None, assessment: JobAssessment) -> None:
-        if row is None or assessment.phase == AssessmentPhase.ACTIVE:
+    def _state_note(self, assessment: JobAssessment) -> None:
+        state = assessment.scheduler_state
+        if not state or assessment.phase == AssessmentPhase.ACTIVE:
             return
         now = self._clock()
         if now - self._last_note < self.note_interval:
             return
-        message = f"job {self.job_id}: {row.state}"
-        if row.state == "PENDING" and row.reason:
-            message += f" (reason: {row.reason})"
+        message = f"job {self.job_id}: {state}"
+        if state == "PENDING" and assessment.detail:
+            message += f" (reason: {assessment.detail})"
         self.info(message)
         self._last_note = now
 
@@ -140,16 +161,26 @@ class LogFollower:
                 break
         return total
 
-    def poll_once(self) -> PollResult:
+    def poll_once(
+        self,
+        *,
+        publish_assessment: AssessmentPublisher | None = None,
+    ) -> PollResult:
         """Observe once and stream currently available bytes.
 
         If scheduler observation fails, this method performs no log operation.
         Missing or unreadable size is a tagged condition and never changes the
-        byte offset or fabricates truncation.
+        byte offset or fabricates truncation.  A successful observation is
+        published before any diagnostic or log operation, so callers may make
+        durable evidence authoritative for all subsequent policy.
         """
 
-        row, assessment = self._observe()
-        if assessment.phase in (AssessmentPhase.TERMINAL_CANDIDATE, AssessmentPhase.FINAL):
+        _row, observed = self._observe()
+        assessment = self._publish_assessment(observed, publish_assessment)
+        if assessment.phase is AssessmentPhase.TERMINAL_CANDIDATE or (
+            assessment.phase is AssessmentPhase.FINAL
+            and assessment.final_source is FinalSource.CONFIRMED_QUEUE
+        ):
             attempts = (
                 self.final_attempts if assessment.phase == AssessmentPhase.FINAL else (0,)
             )
@@ -159,8 +190,12 @@ class LogFollower:
                 break_lifecycle_evidence(self.tracker, exc)
                 raise
             if record is not None:
-                assessment = self.tracker.accept(EvidenceEvent.final(record))
-        self._state_note(row, assessment)
+                enriched = self.tracker.accept(EvidenceEvent.final(record))
+                assessment = self._publish_assessment(
+                    enriched,
+                    publish_assessment,
+                )
+        self._state_note(assessment)
         if not assessment.log_eligible:
             return PollResult(assessment)
 
@@ -209,7 +244,12 @@ class LogFollower:
         except HpcAllocError:
             return 0
 
-    def follow(self, *, drain: bool = True) -> FollowOutcome:
+    def follow(
+        self,
+        *,
+        drain: bool = True,
+        publish_assessment: AssessmentPublisher | None = None,
+    ) -> FollowOutcome:
         """Poll until final evidence and return context for command-level policy."""
 
         seeded = self.tracker.assessment
@@ -225,15 +265,14 @@ class LogFollower:
             )
 
         while True:
-            result = self.poll_once()
+            result = self.poll_once(publish_assessment=publish_assessment)
             assessment = result.assessment
             if assessment.final:
                 if drain:
                     self.drain()
-                final = self.tracker.assessment
                 return FollowOutcome(
-                    assessment=final,
-                    observed_terminal_state=final.terminal_state,
+                    assessment=assessment,
+                    observed_terminal_state=assessment.terminal_state,
                     final_log_offset=self.offset,
                     bytes_written=self.total_bytes_written,
                 )
@@ -241,4 +280,4 @@ class LogFollower:
             self._sleep(delay)
 
 
-__all__ = ["FollowOutcome", "LogFollower", "PollResult"]
+__all__ = ["AssessmentPublisher", "FollowOutcome", "LogFollower", "PollResult"]

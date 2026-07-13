@@ -1,25 +1,46 @@
 from __future__ import annotations
 
+import io
+import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from hpc_alloc.commands import _follow_with_reconciliation, _persist_reconciled_assessment, cmd_run
-from hpc_alloc.errors import LifecycleRevisionConflict, StateConflict, TransportLost
+from hpc_alloc.commands import (
+    _follow_with_reconciliation,
+    _persist_reconciled_assessment,
+    cmd_run,
+)
+from hpc_alloc.config import Config
+from hpc_alloc.errors import (
+    LifecycleRevisionConflict,
+    SchedulerUnavailable,
+    StateConflict,
+    TransportLost,
+)
 from hpc_alloc.lifecycle import EvidenceEvent, EvidenceTracker
-from hpc_alloc.models import FinalSource, JobKind, JobPhase, JobRecord
+from hpc_alloc.models import (
+    EvidenceProvenance,
+    FinalSource,
+    JobKind,
+    JobPhase,
+    JobRecord,
+)
+from hpc_alloc.monitor import JobMonitor
+from hpc_alloc.ownership import format_tag, slurm_job_name
 from hpc_alloc.paths import AppPaths
 from hpc_alloc.slurm import AccountingRecord, QueueRow
-from hpc_alloc.streaming import FollowOutcome
+from hpc_alloc.state import StateRepository
+from hpc_alloc.streaming import FollowOutcome, LogFollower
 
 
 class BrokenFollower:
     def __init__(self, *_args: object, **_kwargs: object) -> None:
         pass
 
-    def follow(self) -> object:
+    def follow(self, *, publish_assessment: object | None = None) -> object:
         raise BrokenPipeError
 
 
@@ -27,7 +48,7 @@ class InterruptedFollower:
     def __init__(self, *_args: object, **_kwargs: object) -> None:
         pass
 
-    def follow(self) -> object:
+    def follow(self, *, publish_assessment: object | None = None) -> object:
         raise KeyboardInterrupt
 
 
@@ -181,6 +202,426 @@ class LifecycleFollowerReconciliationTests(unittest.TestCase):
             )
         )
 
+    def test_running_checkpoint_and_projection_precede_log_size_failure(self) -> None:
+        source = replace(
+            self.job(phase=JobPhase.QUEUED, updated_at="v1"),
+            logical_name="dev",
+            kind=JobKind.ALLOCATION,
+        )
+        active = replace(
+            source,
+            phase=JobPhase.ACTIVE,
+            updated_at="v2",
+            ever_started=True,
+            current_node="node01",
+            last_node="node01",
+            observation_epoch=1,
+        )
+        failure = SchedulerUnavailable("log size failed after RUNNING")
+        events: list[str] = []
+
+        class Client:
+            def observe(inner_self, ref: object) -> QueueRow:
+                events.append("observe")
+                if ref != source.ref:
+                    raise AssertionError("unexpected job identity")
+                return QueueRow(
+                    job_id="12345",
+                    state="RUNNING",
+                    node="node01",
+                    reason="",
+                    time_left="1:00:00",
+                    partition="day",
+                    name=source.slurm_job_name,
+                    submitted_at="2026-07-10T12:00:00",
+                    comment=source.slurm_comment,
+                )
+
+            def log_size(inner_self, path: str):
+                events.append("log-size")
+                if path != ".hpc-alloc/allocation.log":
+                    raise AssertionError("unexpected log path")
+                raise failure
+
+        def update_job(operation_id: str, **changes: object) -> JobRecord:
+            events.append("persist")
+            self.assertEqual(operation_id, self.operation_id)
+            self.assertEqual(changes["expected_updated_at"], "v1")
+            self.assertEqual(changes["phase"], JobPhase.ACTIVE)
+            self.assertIs(changes["ever_started"], True)
+            self.assertEqual(changes["current_node"], "node01")
+            self.assertEqual(changes["last_node"], "node01")
+            return active
+
+        state = SimpleNamespace(update_job=Mock(side_effect=update_job))
+        follower = LogFollower(
+            Client(),  # type: ignore[arg-type]
+            source.ref,  # type: ignore[arg-type]
+            ".hpc-alloc/allocation.log",
+            tracker=JobMonitor.tracker(source),
+            output=io.BytesIO(),
+        )
+
+        def project(_ctx: object, _paths: object) -> bool:
+            events.append("project")
+            return True
+
+        with (
+            patch("hpc_alloc.commands._sync_ssh_projection", side_effect=project) as sync,
+            self.assertRaises(SchedulerUnavailable) as raised,
+        ):
+            _follow_with_reconciliation(
+                ctx=SimpleNamespace(state=state),
+                paths=AppPaths.for_home(Path("/tmp/hpc-alloc-reconcile")),
+                client=follower.client,
+                job=source,
+                follower=follower,
+            )
+
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(events, ["observe", "persist", "project", "log-size"])
+        sync.assert_called_once()
+        self.assertEqual(follower.tracker.assessment.phase.value, "UNCERTAIN")
+
+    def test_running_checkpoint_repairs_real_compute_alias_before_log_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = AppPaths.for_home(Path(directory))
+            repository = StateRepository(
+                paths.state_db,
+                machine_id_factory=lambda: "deadbeef1234",
+            ).initialize()
+            owner = repository.get_or_create_machine_id("laptop")
+            job_name = slurm_job_name("allocation", self.operation_id)
+            comment = format_tag(
+                owner,
+                self.operation_id,
+                "laptop",
+                "allocation",
+                "dev",
+            )
+            repository.reserve_submission(
+                operation_id=self.operation_id,
+                cluster="grace",
+                logical_name="dev",
+                kind=JobKind.ALLOCATION,
+                owner_id=owner,
+                slurm_job_name=job_name,
+                slurm_comment=comment,
+                resources={"partition": "day", "time": "1:00:00", "cpus": 2},
+            )
+            source = repository.acknowledge_submission(self.operation_id, "12345")
+            paths.config_dir.mkdir(parents=True, exist_ok=True)
+            paths.config_file.write_text(
+                """\
+[identity]
+netid = "ab1234"
+[defaults]
+cluster = "grace"
+[cluster.grace]
+host = "grace.example.edu"
+"""
+            )
+            context = SimpleNamespace(
+                state=repository,
+                config=Config.load(paths.config_file),
+            )
+            failure = SchedulerUnavailable("identical log size failure")
+
+            class Client:
+                def observe(inner_self, ref: object) -> QueueRow:
+                    if ref != source.ref:
+                        raise AssertionError("unexpected job identity")
+                    return QueueRow(
+                        job_id="12345",
+                        state="RUNNING",
+                        node="node01",
+                        reason="",
+                        time_left="1:00:00",
+                        partition="day",
+                        name=job_name,
+                        submitted_at="2026-07-10T12:00:00",
+                        comment=comment,
+                    )
+
+                def log_size(inner_self, _path: str):
+                    raise failure
+
+            client = Client()
+            follower = LogFollower(
+                client,  # type: ignore[arg-type]
+                source.ref,  # type: ignore[arg-type]
+                ".hpc-alloc/allocation.log",
+                tracker=JobMonitor.tracker(source),
+                output=io.BytesIO(),
+            )
+
+            with self.assertRaises(SchedulerUnavailable) as raised:
+                _follow_with_reconciliation(
+                    ctx=context,
+                    paths=paths,
+                    client=client,
+                    job=source,
+                    follower=follower,
+                )
+
+            self.assertIs(raised.exception, failure)
+            durable = repository.get_job(self.operation_id)
+            self.assertEqual(durable.phase, JobPhase.ACTIVE)
+            self.assertTrue(durable.ever_started)
+            self.assertEqual(durable.current_node, "node01")
+            self.assertEqual(durable.last_node, "node01")
+            projection = paths.managed_ssh_config.read_text()
+            self.assertIn("Host hpc-grace.dev", projection)
+            self.assertIn("    HostName node01", projection)
+
+    def test_revision_retry_checkpoints_terminal_row_before_accounting_error(self) -> None:
+        source = self.job(phase=JobPhase.QUEUED, updated_at="v1")
+        durable = replace(source, updated_at="v2")
+        candidate = replace(
+            durable,
+            phase=JobPhase.TERMINAL_CANDIDATE,
+            updated_at="v3",
+            ever_started=True,
+            last_node="node02",
+            terminal_state="COMPLETED",
+            evidence_provenance=EvidenceProvenance.QUEUE_TERMINAL,
+        )
+        failure = SchedulerUnavailable("accounting failed after fresh queue row")
+        events: list[str] = []
+
+        class Client:
+            def observe(self, *_args: object, **_kwargs: object) -> QueueRow:
+                events.append("observe")
+                return QueueRow(
+                    job_id="12345",
+                    state="COMPLETED",
+                    node="node02",
+                    reason="",
+                    time_left="0:00",
+                    partition="day",
+                    name=source.slurm_job_name,
+                    submitted_at="2026-07-10T12:00:00",
+                    comment=source.slurm_comment,
+                )
+
+            def final(self, *_args: object, **_kwargs: object) -> None:
+                events.append("accounting")
+                raise failure
+
+        writes = 0
+
+        def persist(
+            _ctx: object,
+            _paths: object,
+            _job: JobRecord,
+            assessment: object,
+            *,
+            force_projection: bool,
+            skip_unchanged_projection: bool,
+        ) -> JobRecord:
+            nonlocal writes
+            writes += 1
+            events.append("persist")
+            self.assertEqual(
+                assessment.phase,
+                JobMonitor.tracker(candidate).assessment.phase,
+            )
+            self.assertTrue(skip_unchanged_projection)
+            self.assertEqual(force_projection, writes > 1)
+            if writes == 1:
+                raise LifecycleRevisionConflict("stale")
+            return candidate
+
+        client = Client()
+        follower = LogFollower(
+            client,  # type: ignore[arg-type]
+            source.ref,  # type: ignore[arg-type]
+            ".hpc-alloc/allocation.log",
+            tracker=JobMonitor.tracker(source),
+            output=io.BytesIO(),
+        )
+
+        with (
+            patch("hpc_alloc.commands._persist_and_render", side_effect=persist),
+            self.assertRaises(SchedulerUnavailable) as raised,
+        ):
+            _follow_with_reconciliation(
+                ctx=SimpleNamespace(
+                    state=SimpleNamespace(get_job=Mock(return_value=durable))
+                ),
+                paths=AppPaths.for_home(Path("/tmp/hpc-alloc-reconcile")),
+                client=client,
+                job=source,
+                follower=follower,
+            )
+
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(
+            events,
+            ["observe", "persist", "observe", "persist", "accounting"],
+        )
+        self.assertEqual(writes, 2)
+
+    def test_repeated_semantic_noop_checkpoints_do_not_resync_projection(self) -> None:
+        source = self.job(
+            phase=JobPhase.ACTIVE,
+            updated_at="v1",
+            ever_started=True,
+            current_node="node01",
+            last_node="node01",
+        )
+        assessment = JobMonitor.tracker(source).assessment
+        update = Mock(return_value=source)
+        ctx = SimpleNamespace(state=SimpleNamespace(update_job=update))
+        paths = AppPaths.for_home(Path("/tmp/hpc-alloc-reconcile"))
+
+        with patch("hpc_alloc.commands._sync_ssh_projection") as project:
+            first, _assessment, _tracker = _persist_reconciled_assessment(
+                ctx=ctx,
+                paths=paths,
+                client=object(),
+                job=source,
+                assessment=assessment,
+                skip_unchanged_projection=True,
+            )
+            second, _assessment, _tracker = _persist_reconciled_assessment(
+                ctx=ctx,
+                paths=paths,
+                client=object(),
+                job=first,
+                assessment=assessment,
+                skip_unchanged_projection=True,
+            )
+
+        self.assertEqual(first, source)
+        self.assertEqual(second, source)
+        self.assertEqual(update.call_count, 2)
+        project.assert_not_called()
+
+    def test_uncertainty_is_not_persisted_but_default_projection_is_repaired(self) -> None:
+        source = self.job(
+            phase=JobPhase.ACTIVE,
+            updated_at="v1",
+            ever_started=True,
+            current_node="node01",
+            last_node="node01",
+        )
+        tracker = JobMonitor.tracker(source)
+        uncertain = tracker.accept(EvidenceEvent.scheduler_error("slurm unavailable"))
+        update = Mock()
+
+        with patch("hpc_alloc.commands._sync_ssh_projection") as project:
+            updated, assessment, replacement = _persist_reconciled_assessment(
+                ctx=SimpleNamespace(state=SimpleNamespace(update_job=update)),
+                paths=AppPaths.for_home(Path("/tmp/hpc-alloc-reconcile")),
+                client=object(),
+                job=source,
+                assessment=uncertain,
+            )
+
+        self.assertIs(updated, source)
+        self.assertIs(assessment, uncertain)
+        self.assertIsNone(replacement)
+        update.assert_not_called()
+        project.assert_called_once()
+
+    def test_revision_retry_repairs_projection_even_when_state_is_unchanged(self) -> None:
+        source = self.job(phase=JobPhase.QUEUED, updated_at="v1")
+        durable = self.job(
+            phase=JobPhase.ACTIVE,
+            updated_at="v2",
+            ever_started=True,
+            current_node="node02",
+            last_node="node02",
+        )
+
+        class Client:
+            def observe(self, *_args: object, **_kwargs: object) -> QueueRow:
+                return QueueRow(
+                    job_id="12345",
+                    state="RUNNING",
+                    node="node02",
+                    reason="",
+                    time_left="1:00:00",
+                    partition="day",
+                    name=source.slurm_job_name,
+                    submitted_at="2026-07-10T12:00:00",
+                    comment=source.slurm_comment,
+                )
+
+        update = Mock(
+            side_effect=(LifecycleRevisionConflict("stale"), durable)
+        )
+        state = SimpleNamespace(
+            update_job=update,
+            get_job=Mock(return_value=durable),
+        )
+
+        with patch("hpc_alloc.commands._sync_ssh_projection") as project:
+            updated, assessment, tracker = _persist_reconciled_assessment(
+                ctx=SimpleNamespace(state=state),
+                paths=AppPaths.for_home(Path("/tmp/hpc-alloc-reconcile")),
+                client=Client(),
+                job=source,
+                assessment=JobMonitor.tracker(source).assessment,
+                skip_unchanged_projection=True,
+            )
+
+        self.assertIs(updated, durable)
+        self.assertEqual(assessment.current_node, "node02")
+        self.assertIsNotNone(tracker)
+        self.assertEqual(update.call_count, 2)
+        project.assert_called_once()
+
+    def test_revision_retry_repairs_projection_before_returning_uncertainty(self) -> None:
+        source = self.job(phase=JobPhase.QUEUED, updated_at="v1")
+        durable = self.job(
+            phase=JobPhase.ACTIVE,
+            updated_at="v2",
+            ever_started=True,
+            current_node="node02",
+            last_node="node02",
+        )
+
+        class Client:
+            def observe(self, *_args: object, **_kwargs: object) -> QueueRow:
+                return QueueRow(
+                    job_id="12345",
+                    state="NEW_UNKNOWN_STATE",
+                    node=None,
+                    reason="",
+                    time_left="1:00:00",
+                    partition="day",
+                    name=source.slurm_job_name,
+                    submitted_at="2026-07-10T12:00:00",
+                    comment=source.slurm_comment,
+                )
+
+        with (
+            patch(
+                "hpc_alloc.commands._persist_and_render",
+                side_effect=LifecycleRevisionConflict("stale"),
+            ) as persist,
+            patch("hpc_alloc.commands._sync_ssh_projection") as project,
+        ):
+            updated, assessment, tracker = _persist_reconciled_assessment(
+                ctx=SimpleNamespace(
+                    state=SimpleNamespace(get_job=Mock(return_value=durable))
+                ),
+                paths=AppPaths.for_home(Path("/tmp/hpc-alloc-reconcile")),
+                client=Client(),
+                job=source,
+                assessment=self.accounting_assessment("FAILED", "1:0"),
+                skip_unchanged_projection=True,
+                checkpoint_reconciliation_observations=True,
+            )
+
+        self.assertEqual(updated, durable)
+        self.assertTrue(assessment.uncertain)
+        self.assertIsNotNone(tracker)
+        persist.assert_called_once()
+        project.assert_called_once()
+
     def test_stale_terminal_reloads_live_state_rebases_and_preserves_stream_progress(self) -> None:
         source = self.job(phase=JobPhase.QUEUED, updated_at="v1")
         durable = self.job(
@@ -228,12 +669,24 @@ class LifecycleFollowerReconciliationTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.offset = 37
                 self.total_bytes_written = 37
-                self.outcomes = [stale_final, authoritative_final]
                 self.rebases: list[object] = []
                 self.drains = 0
 
-            def follow(self) -> FollowOutcome:
-                assessment = self.outcomes.pop(0)
+            def follow(self, *, publish_assessment) -> FollowOutcome:
+                assessment, replacement = publish_assessment(stale_final)
+                if replacement is not None:
+                    self.rebase(replacement)
+                if assessment.final:
+                    raise AssertionError("stale final authority was not replaced")
+                if assessment.phase.value != JobPhase.REQUEUEING.value:
+                    raise AssertionError("expected reconciled requeue authority")
+                if self.drains:
+                    raise AssertionError("stale final was drained before reconciliation")
+                self.assert_progress()
+
+                assessment, replacement = publish_assessment(authoritative_final)
+                if replacement is not None:
+                    self.rebase(replacement)
                 return FollowOutcome(assessment, assessment.terminal_state, 37, 37)
 
             def rebase(self, tracker: object) -> None:
@@ -253,10 +706,21 @@ class LifecycleFollowerReconciliationTests(unittest.TestCase):
         follower = Follower()
         state = SimpleNamespace(get_job=Mock(return_value=durable))
         persisted = 0
+        forced_projections: list[bool] = []
 
-        def persist(_ctx: object, _paths: object, job: JobRecord, assessment: object):
+        def persist(
+            _ctx: object,
+            _paths: object,
+            job: JobRecord,
+            assessment: object,
+            *,
+            force_projection: bool,
+            skip_unchanged_projection: bool,
+        ):
             nonlocal persisted
             persisted += 1
+            forced_projections.append(force_projection)
+            self.assertTrue(skip_unchanged_projection)
             if persisted == 1:
                 raise LifecycleRevisionConflict("stale")
             if persisted == 2:
@@ -280,6 +744,7 @@ class LifecycleFollowerReconciliationTests(unittest.TestCase):
         self.assertEqual(client.observations, 1)
         self.assertEqual(len(follower.rebases), 1)
         self.assertEqual(follower.drains, 0)
+        self.assertEqual(forced_projections, [False, True, False])
         follower.assert_progress()
 
     def test_non_revision_state_conflict_is_not_retried(self) -> None:
@@ -345,9 +810,20 @@ class LifecycleFollowerReconciliationTests(unittest.TestCase):
             get_job=Mock(side_effect=(first_durable, second_durable))
         )
         phases: list[object] = []
+        forced_projections: list[bool] = []
 
-        def persist(_ctx: object, _paths: object, _job: JobRecord, assessment: object):
+        def persist(
+            _ctx: object,
+            _paths: object,
+            _job: JobRecord,
+            assessment: object,
+            *,
+            force_projection: bool,
+            skip_unchanged_projection: bool,
+        ):
             phases.append(assessment.phase)
+            forced_projections.append(force_projection)
+            self.assertFalse(skip_unchanged_projection)
             if len(phases) < 3:
                 raise LifecycleRevisionConflict("stale")
             return stored
@@ -367,11 +843,12 @@ class LifecycleFollowerReconciliationTests(unittest.TestCase):
             [phase.value for phase in phases],
             [JobPhase.FINAL.value, JobPhase.ACTIVE.value, JobPhase.ACTIVE.value],
         )
+        self.assertEqual(forced_projections, [False, True, True])
         self.assertEqual(client.observations, 2)
         self.assertEqual(assessment.current_node, "node04")
         self.assertIsNotNone(tracker)
 
-    def test_fresh_final_after_revision_race_rebases_and_drains_again(self) -> None:
+    def test_fresh_final_after_revision_race_rebases_before_drain(self) -> None:
         source = self.job(phase=JobPhase.QUEUED, updated_at="v1")
         durable = self.job(
             phase=JobPhase.ACTIVE,
@@ -424,9 +901,19 @@ class LifecycleFollowerReconciliationTests(unittest.TestCase):
                 self.rebases = 0
                 self.drains = 0
 
-            def follow(self) -> FollowOutcome:
+            def follow(self, *, publish_assessment) -> FollowOutcome:
                 self.follow_calls += 1
-                return FollowOutcome(stale, stale.terminal_state, 23, 23)
+                assessment, replacement = publish_assessment(stale)
+                if replacement is not None:
+                    self.rebase(replacement)
+                if assessment.final:
+                    self.drain()
+                return FollowOutcome(
+                    assessment,
+                    assessment.terminal_state,
+                    self.offset,
+                    self.total_bytes_written,
+                )
 
             def rebase(self, _tracker: object) -> None:
                 self.rebases += 1
@@ -441,10 +928,21 @@ class LifecycleFollowerReconciliationTests(unittest.TestCase):
                     raise AssertionError("stream progress was reset")
 
         writes = 0
+        forced_projections: list[bool] = []
 
-        def persist(_ctx: object, _paths: object, _job: JobRecord, _assessment: object):
+        def persist(
+            _ctx: object,
+            _paths: object,
+            _job: JobRecord,
+            _assessment: object,
+            *,
+            force_projection: bool,
+            skip_unchanged_projection: bool,
+        ):
             nonlocal writes
             writes += 1
+            forced_projections.append(force_projection)
+            self.assertTrue(skip_unchanged_projection)
             if writes == 1:
                 raise LifecycleRevisionConflict("stale")
             return stored
@@ -466,6 +964,7 @@ class LifecycleFollowerReconciliationTests(unittest.TestCase):
         self.assertEqual(follower.follow_calls, 1)
         self.assertEqual(follower.rebases, 1)
         self.assertEqual(follower.drains, 1)
+        self.assertEqual(forced_projections, [False, True])
         follower.assert_progress()
 
 

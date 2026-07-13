@@ -13,7 +13,7 @@ from hpc_alloc.commands import cmd_status
 from hpc_alloc.config import Config
 from hpc_alloc.errors import ConfigInvalid, HostKeyChanged, JobIdReused, TransportLost
 from hpc_alloc.monitor import JobMonitor
-from hpc_alloc.models import FinalSource, JobKind, JobPhase
+from hpc_alloc.models import FinalSource, JobKind, JobPhase, OperationPhase
 from hpc_alloc.ownership import format_tag, slurm_job_name
 from hpc_alloc.paths import AppPaths
 from hpc_alloc.slurm import AccountingRecord, QueueRow, RawQueueRow, RawQueueScan
@@ -429,6 +429,62 @@ host = "secondary.example.edu"
         self.assertEqual(discovered["job_kind"], JobKind.ALLOCATION.value)
         self.assertEqual(discovered["classification"], "duplicate-operation")
         self.assertNotIn("kind", discovered)
+        client.assert_complete()
+
+    def test_abandoned_no_id_singleton_is_local_final_conflict(self) -> None:
+        paths, context, state, owner = self.make_context()
+        self.reserve(state, owner, OPERATION_ID)
+        state.mark_submission_ambiguous(OPERATION_ID, "sbatch reply lost")
+        operation = state.abandon_operation(
+            OPERATION_ID, "operator abandoned local recovery"
+        )
+        remote = self.raw_row(OPERATION_ID, owner, "12345")
+        client = StatusClient((remote,))
+
+        payload = self.run_status(paths, context, client)
+
+        durable = state.get_job(OPERATION_ID)
+        self.assertEqual(operation.phase, OperationPhase.ABANDONED)
+        self.assertEqual(durable.phase, JobPhase.FINAL)
+        self.assertIsNone(durable.job_id)
+        self.assertEqual(durable.final_source, FinalSource.ABANDONED)
+        self.assertEqual(payload["jobs"], [])
+        self.assertEqual(payload["operations"], [])
+        self.assertEqual(len(payload["discovered"]), 1)
+        discovered = payload["discovered"][0]
+        self.assertEqual(discovered["jobid"], "12345")
+        self.assertEqual(discovered["selector"], f"grace:@{OPERATION_ID}")
+        self.assertEqual(discovered["classification"], "local-final-conflict")
+        client.assert_complete()
+
+    def test_unresolved_no_id_singleton_remains_operation_match(self) -> None:
+        paths, context, state, owner = self.make_context()
+        self.reserve(state, owner, OPERATION_ID)
+        state.mark_submission_ambiguous(OPERATION_ID, "sbatch reply lost")
+        remote = self.raw_row(OPERATION_ID, owner, "12345")
+        client = StatusClient((remote,))
+
+        payload = self.run_status(paths, context, client)
+
+        self.assertEqual(len(payload["jobs"]), 1)
+        managed = payload["jobs"][0]
+        self.assertEqual(managed["operation_id"], OPERATION_ID)
+        self.assertEqual(managed["selector"], f"grace:@{OPERATION_ID}")
+        self.assertIsNone(managed["jobid"])
+        self.assertEqual(managed["phase"], JobPhase.SUBMITTING.value)
+        self.assertEqual(len(payload["operations"]), 1)
+        operation = payload["operations"][0]
+        self.assertEqual(operation["operation_id"], OPERATION_ID)
+        self.assertEqual(operation["selector"], f"grace:@{OPERATION_ID}")
+        self.assertEqual(operation["phase"], OperationPhase.AMBIGUOUS.value)
+        self.assertIsNone(operation["jobid"])
+        self.assertEqual(len(payload["discovered"]), 1)
+        discovered = payload["discovered"][0]
+        self.assertEqual(discovered["jobid"], "12345")
+        self.assertEqual(discovered["selector"], f"grace:@{OPERATION_ID}")
+        self.assertEqual(
+            discovered["classification"], "unresolved-operation-match"
+        )
         client.assert_complete()
 
     def test_reused_numeric_id_for_different_operation_is_not_local_final_conflict(self) -> None:

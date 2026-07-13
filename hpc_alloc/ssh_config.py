@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import os
 import re
@@ -13,6 +12,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from .errors import ConfigInvalid
+from .locking import configuration_scope_lock
 from .models import JobKind
 
 
@@ -381,24 +381,7 @@ def sync_managed_config(
     lock on that file ineffective across concurrent writers.
     """
 
-    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    try:
-        lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        lock_path.parent.chmod(0o700)
-        fd = os.open(lock_path, flags, 0o600)
-    except OSError as exc:
-        raise ConfigInvalid(f"cannot open managed SSH-config lock {lock_path}: {exc}") from exc
-    try:
-        try:
-            metadata = os.fstat(fd)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise ConfigInvalid(f"managed SSH-config lock is not a regular file: {lock_path}")
-            os.fchmod(fd, 0o600)
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        except OSError as exc:
-            raise ConfigInvalid(f"cannot lock managed SSH config {lock_path}: {exc}") from exc
-
+    with configuration_scope_lock(lock_path, exclusive=True):
         # Both authoritative inputs are loaded only after acquiring the lock.
         # A process that waited behind a newer writer therefore cannot publish
         # the stale config or job snapshot it started with.
@@ -416,12 +399,6 @@ def sync_managed_config(
         if retirement is not None and before_replace is not None:
             before_replace(retirement)
         return atomic_write_600(managed_path, replacement)
-    finally:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        os.close(fd)
 
 
 def resolve_user_ssh_config(path: Path) -> Path:
