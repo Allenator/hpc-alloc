@@ -197,7 +197,12 @@ class CommandSshPolicyTests(unittest.TestCase):
 
                 def sync(_ctx: object, _paths: object) -> bool:
                     events.append("sync")
-                    return True
+                    # False means the projection was already current, not that
+                    # synchronization failed.
+                    return False
+
+                def report(message: str) -> None:
+                    events.append(f"report:{message}")
 
                 with (
                     patch(
@@ -209,6 +214,7 @@ class CommandSshPolicyTests(unittest.TestCase):
                         "hpc_alloc.commands._sync_ssh_projection",
                         side_effect=sync,
                     ) as project,
+                    patch("hpc_alloc.commands.info", side_effect=report),
                 ):
                     with self.assertRaises(type(failure)) as raised:
                         cmd_down(
@@ -221,7 +227,100 @@ class CommandSshPolicyTests(unittest.TestCase):
                 self.assertIs(raised.exception, failure)
                 self.assertEqual(
                     events,
-                    ["cancel:released", "cancel:blocked", "sync"],
+                    [
+                        "cancel:released",
+                        "cancel:blocked",
+                        f"report:could not release grace:blocked: {failure}",
+                        "sync",
+                        "report:cancelled allocation grace:released (101)",
+                    ],
+                )
+                self.assertEqual(services.call_count, 2)
+                self.assertEqual(transport.bootstrap.call_count, 2)
+                project.assert_called_once_with(context, self.paths)
+
+    def test_cmd_down_all_does_not_report_prior_success_when_access_unwind_projection_fails(
+        self,
+    ) -> None:
+        for failure in (
+            HostKeyChanged("SSH host-key verification failed for hpc-grace"),
+            AuthRequired("SSH authentication failed for hpc-grace"),
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                jobs = [
+                    SimpleNamespace(
+                        cluster="grace",
+                        kind=JobKind.ALLOCATION,
+                        logical_name=name,
+                        job_id=job_id,
+                    )
+                    for name, job_id in (
+                        ("released", "101"),
+                        ("blocked", "102"),
+                        ("untouched", "103"),
+                    )
+                ]
+                context = SimpleNamespace(
+                    state=SimpleNamespace(list_jobs=Mock(return_value=jobs))
+                )
+                transport = SimpleNamespace(bootstrap=Mock())
+                client = object()
+                projection_failure = ConfigInvalid("managed SSH projection failed")
+                events: list[str] = []
+
+                def cancel(_ctx: object, _client: object, job: object) -> object:
+                    name = str(getattr(job, "logical_name"))
+                    events.append(f"cancel:{name}")
+                    if name == "released":
+                        return SimpleNamespace(
+                            status=SimpleNamespace(value="CANCELLED")
+                        )
+                    if name == "blocked":
+                        raise failure
+                    raise AssertionError("later allocation must not be attempted")
+
+                def sync(_ctx: object, _paths: object) -> bool:
+                    events.append("sync")
+                    raise projection_failure
+
+                def report(message: str) -> None:
+                    events.append(f"report:{message}")
+
+                with (
+                    patch(
+                        "hpc_alloc.commands._services",
+                        return_value=(transport, client),
+                    ) as services,
+                    patch("hpc_alloc.commands._cancel_record", side_effect=cancel),
+                    patch(
+                        "hpc_alloc.commands._sync_ssh_projection",
+                        side_effect=sync,
+                    ) as project,
+                    patch("hpc_alloc.commands.info", side_effect=report),
+                ):
+                    with self.assertRaises(type(failure)) as raised:
+                        cmd_down(
+                            SimpleNamespace(all=True, target=None, cluster=None),
+                            ctx=context,
+                            paths=self.paths,
+                            entrypoint=self.entrypoint,
+                        )
+
+                self.assertIs(raised.exception, failure)
+                self.assertEqual(
+                    events,
+                    [
+                        "cancel:released",
+                        "cancel:blocked",
+                        f"report:could not release grace:blocked: {failure}",
+                        "sync",
+                        "report:warning: could not synchronize managed SSH config "
+                        "while recovering from another error "
+                        f"({projection_failure})",
+                    ],
+                )
+                self.assertFalse(
+                    any("cancelled allocation" in event for event in events)
                 )
                 self.assertEqual(services.call_count, 2)
                 self.assertEqual(transport.bootstrap.call_count, 2)

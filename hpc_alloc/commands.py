@@ -18,7 +18,7 @@ import tempfile
 import time
 import uuid
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -45,6 +45,7 @@ from .models import (
     OperationPhase,
 )
 from .ownership import normalize_host_label, parse_tag, slurm_job_name
+from .output import neutralize_stdout
 from .paths import AppPaths
 from .selectors import SelectorKind, canonical_job_selector, parse_selector, unique_job
 from .ssh_config import (
@@ -88,8 +89,15 @@ def _sync_ssh_projection(ctx: Any, paths: AppPaths) -> bool:
     )
 
 
+@dataclass
+class _SshProjectionResult:
+    synchronized: bool = False
+
+
 @contextmanager
-def _ssh_projection_scope(ctx: Any, paths: AppPaths) -> Iterator[None]:
+def _ssh_projection_scope(
+    ctx: Any, paths: AppPaths
+) -> Iterator[_SshProjectionResult]:
     """Synchronize derived SSH aliases after success or while unwinding.
 
     A projection error is authoritative on the successful path.  During
@@ -97,11 +105,13 @@ def _ssh_projection_scope(ctx: Any, paths: AppPaths) -> Iterator[None]:
     it without replacing the exception that interrupted reconciliation.
     """
 
+    result = _SshProjectionResult()
     try:
-        yield
+        yield result
     except BaseException:
         try:
             _sync_ssh_projection(ctx, paths)
+            result.synchronized = True
         except BaseException as projection_error:
             try:
                 info(
@@ -113,6 +123,7 @@ def _ssh_projection_scope(ctx: Any, paths: AppPaths) -> Iterator[None]:
         raise
     else:
         _sync_ssh_projection(ctx, paths)
+        result.synchronized = True
 
 
 def _submission_recovery_guidance(
@@ -738,7 +749,7 @@ def _reconcile_status(
     *, ctx: Any, paths: AppPaths, entrypoint: Path
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     from .errors import AuthRequired, HostKeyChanged, SchedulerUnavailable
-    from .monitor import JobMonitor, persist_assessment
+    from .monitor import JobMonitor
     from .ssh import AuthMode
 
     # Correlate the entire pass against one local identity graph.  In
@@ -791,6 +802,15 @@ def _reconcile_status(
             assessment = JobMonitor(client).assess(
                 job, auth=AuthMode.NONINTERACTIVE
             ).assessment
+            updated, assessment, _tracker = _persist_reconciled_assessment(
+                ctx=ctx,
+                paths=paths,
+                client=client,
+                job=job,
+                assessment=assessment,
+                monotonic_evidence=assessment,
+                synchronize_projection=False,
+            )
         except HostKeyChanged:
             raise
         except soft_availability_errors as exc:
@@ -801,11 +821,13 @@ def _reconcile_status(
                 f"({exc}); preserving its state"
             )
             scans[job.cluster] = None
-            payload = _assessment_payload(job, JobMonitor.tracker(job).assessment)
+            durable = ctx.state.get_job(job.operation_id)
+            payload = _assessment_payload(
+                durable, JobMonitor.tracker(durable).assessment
+            )
             payload["phase"] = "UNCERTAIN"
             rows.append(payload)
             continue
-        updated = persist_assessment(ctx.state, job, assessment)
         rows.append(_assessment_payload(updated, assessment))
 
     machine = ctx.state.get_machine()
@@ -1084,11 +1106,12 @@ def _persist_and_render(ctx: Any, paths: AppPaths, job: Any, assessment: Any) ->
 def _persist_reconciled_assessment(
     *,
     ctx: Any,
-    paths: AppPaths,
+    paths: AppPaths | None,
     client: Any,
     job: Any,
     assessment: Any,
     monotonic_evidence: Any | None = None,
+    synchronize_projection: bool = True,
 ) -> tuple[Any, Any, Any | None]:
     """Persist lifecycle evidence, replacing stale policy after revision races.
 
@@ -1098,7 +1121,7 @@ def _persist_reconciled_assessment(
     durable authority and the follower's monotonic start/last-node evidence.
     """
 
-    from .monitor import JobMonitor
+    from .monitor import JobMonitor, persist_assessment
     from .ssh import AuthMode
 
     source = job
@@ -1109,7 +1132,14 @@ def _persist_reconciled_assessment(
     monotonic_last_node = evidence.last_node
     while True:
         try:
-            updated = _persist_and_render(ctx, paths, source, candidate)
+            if synchronize_projection:
+                if paths is None:
+                    raise ValueError(
+                        "paths are required when synchronizing the SSH projection"
+                    )
+                updated = _persist_and_render(ctx, paths, source, candidate)
+            else:
+                updated = persist_assessment(ctx.state, source, candidate)
         except LifecycleRevisionConflict:
             durable = ctx.state.get_job(job.operation_id)
             seeded = replace(
@@ -1221,7 +1251,14 @@ def cmd_up(
     while True:
         result = monitor.assess(job, auth=AuthMode.NONINTERACTIVE)
         assessment = result.assessment
-        job = _persist_and_render(ctx, paths, job, assessment)
+        job, assessment, _tracker = _persist_reconciled_assessment(
+            ctx=ctx,
+            paths=paths,
+            client=client,
+            job=job,
+            assessment=assessment,
+            monotonic_evidence=assessment,
+        )
         if assessment.phase == AssessmentPhase.ACTIVE and assessment.current_node:
             alias = allocation_alias(cluster, args.name)
             info(
@@ -1508,6 +1545,7 @@ def cmd_run(
             follower=follower,
         )
     except BrokenPipeError:
+        neutralize_stdout()
         info(f"output pipe closed — cancelling foreground job {cluster}:{job.job_id}")
         try:
             _cancel_record(ctx, client, job)
@@ -1618,27 +1656,34 @@ def cmd_down(
         return 0
     failed = 0
     successes: list[str] = []
-    with _ssh_projection_scope(ctx, paths):
-        for job in jobs:
-            try:
-                transport, client = _services(ctx, paths, entrypoint, job.cluster)
-                transport.bootstrap(job.cluster)
-                outcome = _cancel_record(ctx, client, job)
-                successes.append(
-                    f"{outcome.status.value.lower().replace('_', ' ')} allocation "
-                    f"{job.cluster}:{job.logical_name} ({job.job_id})"
-                )
-            except (AuthRequired, HostKeyChanged) as exc:
-                info(f"could not release {job.cluster}:{job.logical_name}: {exc}")
-                # Security/authentication failures are not best-effort
-                # scheduler errors.  Stop before touching another allocation;
-                # the projection scope repairs state changed by earlier jobs.
-                raise
-            except HpcAllocError as exc:
-                failed += 1
-                info(f"could not release {job.cluster}:{job.logical_name}: {exc}")
-                if not args.all:
+    projection = _SshProjectionResult()
+    try:
+        with _ssh_projection_scope(ctx, paths) as projection:
+            for job in jobs:
+                try:
+                    transport, client = _services(ctx, paths, entrypoint, job.cluster)
+                    transport.bootstrap(job.cluster)
+                    outcome = _cancel_record(ctx, client, job)
+                    successes.append(
+                        f"{outcome.status.value.lower().replace('_', ' ')} allocation "
+                        f"{job.cluster}:{job.logical_name} ({job.job_id})"
+                    )
+                except (AuthRequired, HostKeyChanged) as exc:
+                    info(f"could not release {job.cluster}:{job.logical_name}: {exc}")
+                    # Security/authentication failures are not best-effort
+                    # scheduler errors.  Stop before touching another allocation;
+                    # the projection scope repairs state changed by earlier jobs.
                     raise
+                except HpcAllocError as exc:
+                    failed += 1
+                    info(f"could not release {job.cluster}:{job.logical_name}: {exc}")
+                    if not args.all:
+                        raise
+    except (AuthRequired, HostKeyChanged):
+        if args.all and projection.synchronized:
+            for message in successes:
+                info(message)
+        raise
     for message in successes:
         info(message)
     return 1 if failed else 0
@@ -1697,13 +1742,24 @@ def cmd_logs(
     if not args.follow:
         assessment = None
         try:
-            assessment = JobMonitor(client).assess(job, auth=AuthMode.NONINTERACTIVE).assessment
-            job = _persist_and_render(ctx, paths, job, assessment)
+            assessment = JobMonitor(client).assess(
+                job, auth=AuthMode.NONINTERACTIVE
+            ).assessment
+            job, assessment, _tracker = _persist_reconciled_assessment(
+                ctx=ctx,
+                paths=paths,
+                client=client,
+                job=job,
+                assessment=assessment,
+                monotonic_evidence=assessment,
+            )
         except SchedulerUnavailable:
+            job = ctx.state.get_job(job.operation_id)
             if not job.ever_started:
                 raise
+            assessment = None
             info("scheduler unavailable; reading the already-known log without a lifecycle guard")
-        if assessment is not None and not assessment.log_eligible and not assessment.final:
+        if assessment is not None and not assessment.log_eligible:
             raise HpcAllocError(
                 f"job {job.cluster}:{job.job_id} has not started; use logs -f to wait safely"
             )
@@ -1726,6 +1782,7 @@ def cmd_logs(
             follower=follower,
         )
     except BrokenPipeError:
+        neutralize_stdout()
         info(
             f"output pipe closed — detached; job {job.cluster}:{job.job_id} continues "
             f"(reattach: hpc-alloc logs {job.cluster}:{job.job_id} -f)"
@@ -1918,7 +1975,14 @@ def _active_allocation(
     transport, client = _services(ctx, paths, entrypoint, job.cluster)
     transport.bootstrap(job.cluster)
     assessment = JobMonitor(client).assess(job).assessment
-    job = _persist_and_render(ctx, paths, job, assessment)
+    job, assessment, _tracker = _persist_reconciled_assessment(
+        ctx=ctx,
+        paths=paths,
+        client=client,
+        job=job,
+        assessment=assessment,
+        monotonic_evidence=assessment,
+    )
     if assessment.phase != AssessmentPhase.ACTIVE or not assessment.current_node:
         raise HpcAllocError(
             f"allocation {job.cluster}:{job.logical_name} is {assessment.phase.value}; "
@@ -2021,12 +2085,20 @@ def _recover_submission(ctx: Any, client: Any, operation: Any, job: Any) -> bool
             # used by normal monitoring so start history and log eligibility
             # stay identical for states such as BOOT_FAIL and REVOKED.
             from .lifecycle import EvidenceEvent
-            from .monitor import JobMonitor, persist_assessment
+            from .monitor import JobMonitor
 
             tracker = JobMonitor.tracker(adopted)
             assessment = tracker.accept(EvidenceEvent.final(record))
-            persist_assessment(ctx.state, adopted, assessment)
-        info(f"recovered accounting job {operation.cluster}:{record.job_id}")
+            adopted, assessment, _tracker = _persist_reconciled_assessment(
+                ctx=ctx,
+                paths=None,
+                client=client,
+                job=adopted,
+                assessment=assessment,
+                monotonic_evidence=assessment,
+                synchronize_projection=False,
+            )
+        info(f"recovered accounting job {operation.cluster}:{adopted.job_id}")
         return True
     return False
 

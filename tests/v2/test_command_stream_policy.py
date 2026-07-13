@@ -77,6 +77,7 @@ class CommandStreamPolicyTests(unittest.TestCase):
             patch("hpc_alloc.commands._submit_job", return_value=self.job()),
             patch("hpc_alloc.commands._cancel_record", cancel),
             patch("hpc_alloc.streaming.LogFollower", follower),
+            patch("hpc_alloc.commands.neutralize_stdout"),
             patch("hpc_alloc.commands.info"),
         ):
             result = cmd_run(

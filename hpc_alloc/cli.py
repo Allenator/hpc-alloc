@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import argparse
-import os
 import signal
 import sys
 from pathlib import Path
 from typing import Sequence
 
 from .errors import HpcAllocError
+from .output import neutralize_stdout
 
 
 def add_cluster_flag(parser: argparse.ArgumentParser) -> None:
@@ -134,12 +134,9 @@ def main(argv: Sequence[str] | None = None, *, entrypoint: Path | None = None) -
         print(file=sys.stderr)
         return 130
     except BrokenPipeError:
+        neutralize_stdout()
         # Context-aware streaming paths handle this themselves. This is only a
         # final no-traceback fallback for non-job payload commands.
-        try:
-            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-        except OSError:
-            pass
         return 141
     except HpcAllocError as exc:
         print(f"hpc-alloc: error: {exc}", file=sys.stderr, flush=True)

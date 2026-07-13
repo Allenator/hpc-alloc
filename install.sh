@@ -30,6 +30,7 @@ runtime_modules=(
   hpc_alloc.models
   hpc_alloc.monitor
   hpc_alloc.ownership
+  hpc_alloc.output
   hpc_alloc.paths
   hpc_alloc.selectors
   hpc_alloc.slurm
