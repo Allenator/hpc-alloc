@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import os
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -12,8 +14,8 @@ from unittest.mock import Mock, patch
 
 from hpc_alloc import commands
 from hpc_alloc.commands import cmd_setup, dispatch
-from hpc_alloc.errors import ConfigInvalid, StateConflict
-from hpc_alloc.locking import configuration_scope_lock
+from hpc_alloc.errors import ConfigInvalid, StateConflict, StateInvalid
+from hpc_alloc.locking import configuration_scope_lock, operation_scope_lock
 from hpc_alloc.models import JobKind
 from hpc_alloc.ownership import format_tag, slurm_job_name
 from hpc_alloc.paths import AppPaths
@@ -100,6 +102,133 @@ class ConfigurationScopeLockTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ConfigInvalid, "exactly one hard link"):
             with configuration_scope_lock(self.path, exclusive=True):
+                pass
+
+
+class OperationScopeLockTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.path = Path(self.directory.name) / "private" / "operation-locks"
+        self.operation_id = "a" * 32
+
+    def test_lock_is_secure_stable_and_released_after_exception(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "injected"):
+            with operation_scope_lock(
+                self.path,
+                self.operation_id,
+                blocking=True,
+            ):
+                lock_file = self.path / f"{self.operation_id}.lock"
+                self.assertEqual(self.path.stat().st_mode & 0o777, 0o700)
+                self.assertEqual(lock_file.stat().st_mode & 0o777, 0o600)
+                raise RuntimeError("injected")
+
+        lock_file = self.path / f"{self.operation_id}.lock"
+        self.assertTrue(lock_file.exists())
+        with operation_scope_lock(self.path, self.operation_id, blocking=True):
+            pass
+        self.assertTrue(lock_file.exists())
+
+    def test_nonblocking_contender_fails_until_owner_releases(self) -> None:
+        with operation_scope_lock(self.path, self.operation_id, blocking=True):
+            with self.assertRaisesRegex(StateConflict, "active in another"):
+                with operation_scope_lock(
+                    self.path,
+                    self.operation_id,
+                    blocking=False,
+                ):
+                    pass
+
+        with operation_scope_lock(
+            self.path,
+            self.operation_id,
+            blocking=False,
+        ):
+            pass
+
+    def test_process_crash_releases_lock_without_unlinking_file(self) -> None:
+        project_root = Path(__file__).resolve().parents[2]
+        child = "\n".join(
+            (
+                "import os",
+                "import sys",
+                "from pathlib import Path",
+                "from hpc_alloc.locking import operation_scope_lock",
+                "with operation_scope_lock(Path(sys.argv[1]), sys.argv[2], blocking=True):",
+                "    print('locked', flush=True)",
+                "    os.read(0, 1)",
+            )
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", child, str(self.path), self.operation_id],
+            cwd=project_root,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert process.stdout is not None
+            self.assertEqual(process.stdout.readline().strip(), "locked")
+            with self.assertRaisesRegex(StateConflict, "active in another"):
+                with operation_scope_lock(
+                    self.path,
+                    self.operation_id,
+                    blocking=False,
+                ):
+                    pass
+        finally:
+            process.kill()
+            process.wait(timeout=5)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+
+        lock_file = self.path / f"{self.operation_id}.lock"
+        self.assertTrue(lock_file.exists())
+        with operation_scope_lock(
+            self.path,
+            self.operation_id,
+            blocking=False,
+        ):
+            pass
+
+    def test_invalid_operation_ids_are_rejected_before_filesystem_changes(self) -> None:
+        for operation_id in ("A" * 32, "a" * 31, "../" + "a" * 29):
+            with self.subTest(operation_id=operation_id):
+                with self.assertRaisesRegex(StateConflict, "32 lowercase hexadecimal"):
+                    with operation_scope_lock(
+                        self.path,
+                        operation_id,
+                        blocking=False,
+                    ):
+                        pass
+        self.assertFalse(self.path.exists())
+
+    def test_symlink_and_multiply_linked_lock_files_are_rejected(self) -> None:
+        self.path.mkdir(parents=True)
+        lock_file = self.path / f"{self.operation_id}.lock"
+        target = self.path / "target"
+        target.touch()
+        lock_file.symlink_to(target)
+        with self.assertRaises(StateInvalid):
+            with operation_scope_lock(
+                self.path,
+                self.operation_id,
+                blocking=False,
+            ):
+                pass
+
+        lock_file.unlink()
+        lock_file.touch()
+        os.link(lock_file, self.path / "second-link")
+        with self.assertRaisesRegex(StateInvalid, "exactly one hard link"):
+            with operation_scope_lock(
+                self.path,
+                self.operation_id,
+                blocking=False,
+            ):
                 pass
 
 

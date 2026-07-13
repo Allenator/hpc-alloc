@@ -35,7 +35,7 @@ from .errors import (
     StateConflict,
     TransportLost,
 )
-from .locking import configuration_scope_lock
+from .locking import configuration_scope_lock, operation_scope_lock
 from .models import (
     EvidenceProvenance,
     FinalSource,
@@ -98,14 +98,40 @@ def machine_host() -> str:
     return normalize_host_label(platform.node())
 
 
-def _sync_ssh_projection(ctx: Any, paths: AppPaths) -> bool:
-    return sync_managed_config(
+def _sync_ssh_projection_repository(repository: Any, paths: AppPaths) -> bool:
+    """Project aliases and best-effort retire masters from the old projection."""
+
+    from .ssh import retire_compute_masters
+
+    warnings: list[str] = []
+
+    def retire(retirement: Any) -> None:
+        try:
+            warnings.extend(
+                retire_compute_masters(retirement, ssh_dir=paths.ssh_dir)
+            )
+        except Exception as exc:
+            # Local cleanup must not prevent authoritative lifecycle state
+            # from removing or retargeting an obsolete alias.  Asynchronous
+            # interrupts still propagate so the old projection remains
+            # available for the next invocation to repair.
+            warnings.append(f"could not retire obsolete SSH masters: {exc}")
+
+    changed = sync_managed_config(
         config_path=paths.config_file,
-        repository=ctx.state,
+        repository=repository,
         managed_path=paths.managed_ssh_config,
         lock_path=paths.ssh_config_lock,
         known_hosts=paths.known_hosts,
+        before_replace=retire,
     )
+    for warning in warnings:
+        _best_effort_info(f"warning: {warning}")
+    return changed
+
+
+def _sync_ssh_projection(ctx: Any, paths: AppPaths) -> bool:
+    return _sync_ssh_projection_repository(ctx.state, paths)
 
 
 @dataclass
@@ -414,13 +440,7 @@ def cmd_setup(args: Any, *, paths: AppPaths, entrypoint: Path) -> int:
 
         repository.get_or_create_machine_id(machine_host())
         atomic_write_600(paths.config_file, text)
-        sync_managed_config(
-            config_path=paths.config_file,
-            repository=repository,
-            managed_path=paths.managed_ssh_config,
-            lock_path=paths.ssh_config_lock,
-            known_hosts=paths.known_hosts,
-        )
+        _sync_ssh_projection_repository(repository, paths)
         ensure_include(paths.user_ssh_config)
     info(f"configured cluster {cluster!r} ({host}) for NetID {netid!r}")
     print("Your SSH public key:")
@@ -1048,89 +1068,91 @@ def _submit_job(
     client.prepare_submission(spec, auth=AuthMode.NONINTERACTIVE)
     result: Any | None = None
     dispatch_may_have_started = False
-    try:
-        ctx.state.reserve_submission(
-            operation_id=operation_id,
-            cluster=cluster,
-            logical_name=logical_name,
-            kind=kind,
-            owner_id=owner_id,
-            slurm_job_name=spec.job_name,
-            slurm_comment=spec.comment,
-            resources=resources,
-        )
-        # From this point onward an asynchronous interrupt is conservatively
-        # treated as possibly overlapping the one-shot scheduler mutation.
-        dispatch_may_have_started = True
+    with operation_scope_lock(
+        paths.operation_locks_dir,
+        operation_id,
+        blocking=True,
+    ):
         try:
-            result = client.submit(spec, auth=AuthMode.NONINTERACTIVE)
-        except (AuthRequired, HostKeyChanged) as exc:
-            # These typed SSH failures prove the mutation was never dispatched.
-            # Clear the dispatch flag before the local failure write so an
-            # interrupt there cannot turn definitive pre-dispatch evidence
-            # into a false ambiguous-submit warning.
-            dispatch_may_have_started = False
-            ctx.state.fail_submission(operation_id, str(exc))
-            raise
-        except AmbiguousSubmission as exc:
-            guidance = _submission_recovery_guidance(operation_id)
+            ctx.state.reserve_submission(
+                operation_id=operation_id,
+                cluster=cluster,
+                logical_name=logical_name,
+                kind=kind,
+                owner_id=owner_id,
+                slurm_job_name=spec.job_name,
+                slurm_comment=spec.comment,
+                resources=resources,
+            )
+            # From this point onward an asynchronous interrupt is
+            # conservatively treated as possibly overlapping the one-shot
+            # scheduler mutation.
+            dispatch_may_have_started = True
             try:
-                ctx.state.mark_submission_ambiguous(operation_id, str(exc))
-            except Exception:
-                # PREPARED is itself an unresolved, recoverable phase.  A
-                # journal problem here must not replace the no-replay
-                # instruction with a generic persistence failure.
-                pass
-            raise AmbiguousSubmission(guidance) from exc
+                result = client.submit(spec, auth=AuthMode.NONINTERACTIVE)
+            except (AuthRequired, HostKeyChanged) as exc:
+                # These typed SSH failures prove the mutation was never
+                # dispatched.  Clear the flag before the failure write so an
+                # interrupt there cannot create false ambiguity.
+                dispatch_may_have_started = False
+                ctx.state.fail_submission(operation_id, str(exc))
+                raise
+            except AmbiguousSubmission as exc:
+                guidance = _submission_recovery_guidance(operation_id)
+                try:
+                    ctx.state.mark_submission_ambiguous(operation_id, str(exc))
+                except Exception:
+                    # PREPARED remains unresolved and recoverable if this
+                    # secondary journal update cannot commit.
+                    pass
+                raise AmbiguousSubmission(guidance) from exc
 
-        job_id = result.job_id
-        guidance = _submission_recovery_guidance(operation_id, job_id=job_id)
-        try:
-            return ctx.state.acknowledge_submission(operation_id, job_id)
-        except Exception as exc:
-            _best_effort_mark_submission_ambiguous(
-                ctx,
-                operation_id,
-                f"Slurm acknowledged job {job_id}, but local acknowledgement failed: {exc}",
-            )
-            raise AmbiguousSubmission(guidance) from exc
-    except KeyboardInterrupt:
-        if not dispatch_may_have_started:
-            # The reservation may have committed immediately before the
-            # interrupt reached Python, but remote dispatch was not entered.
-            # Close it definitively when possible without replacing the
-            # interrupt if cleanup itself fails or was already committed.
+            job_id = result.job_id
+            guidance = _submission_recovery_guidance(operation_id, job_id=job_id)
             try:
-                ctx.state.fail_submission(
+                return ctx.state.acknowledge_submission(operation_id, job_id)
+            except Exception as exc:
+                _best_effort_mark_submission_ambiguous(
+                    ctx,
                     operation_id,
-                    "submission was interrupted before remote dispatch",
+                    f"Slurm acknowledged job {job_id}, but local acknowledgement failed: {exc}",
                 )
-            except BaseException:
-                pass
+                raise AmbiguousSubmission(guidance) from exc
+        except KeyboardInterrupt:
+            if not dispatch_may_have_started:
+                # The reservation may have committed immediately before the
+                # interrupt reached Python, but remote dispatch was not entered.
+                try:
+                    ctx.state.fail_submission(
+                        operation_id,
+                        "submission was interrupted before remote dispatch",
+                    )
+                except BaseException:
+                    try:
+                        _best_effort_info(_submission_recovery_guidance(operation_id))
+                    except BaseException:
+                        # Recovery guidance is secondary to the original
+                        # interrupt even if the diagnostic stream itself is
+                        # unexpectedly unusable.
+                        pass
+                raise
+            # Keep the operation guard until conservative ambiguity is durable.
+            job_id = None
+            if result is not None:
+                try:
+                    job_id = result.job_id
+                except BaseException:
+                    pass
+            guidance = _submission_recovery_guidance(operation_id, job_id=job_id)
+            detail = "submission was interrupted after remote dispatch may have started"
+            if job_id is not None:
+                detail = (
+                    f"Slurm acknowledged job {job_id}, but local acknowledgement "
+                    "was interrupted"
+                )
+            _best_effort_mark_submission_ambiguous(ctx, operation_id, detail)
+            _best_effort_info(guidance)
             raise
-        # This outer guard covers the entire post-dispatch region, including
-        # the narrow interval after submit returns and before acknowledgement
-        # handling starts.  Recover a trusted job ID when the reply made it
-        # back, but never let diagnostic inspection replace the interrupt.
-        job_id = None
-        if result is not None:
-            try:
-                job_id = result.job_id
-            except BaseException:
-                pass
-        guidance = _submission_recovery_guidance(operation_id, job_id=job_id)
-        detail = "submission was interrupted after remote dispatch may have started"
-        if job_id is not None:
-            detail = (
-                f"Slurm acknowledged job {job_id}, but local acknowledgement "
-                "was interrupted"
-            )
-        _best_effort_mark_submission_ambiguous(ctx, operation_id, detail)
-        # Output is secondary to both recovery journaling and the interrupt.
-        # In particular, a closed stderr must not leave a PREPARED operation
-        # unmarked or replace KeyboardInterrupt with BrokenPipeError.
-        _best_effort_info(guidance)
-        raise
 
 
 def _persist_and_render(ctx: Any, paths: AppPaths, job: Any, assessment: Any) -> Any:
@@ -1368,15 +1390,30 @@ def _cancellation_lifecycle_evidence(
     return evidence
 
 
-def _cancel_record(ctx: Any, client: Any, job: Any) -> Any:
+def _cancel_record(ctx: Any, paths: AppPaths, client: Any, job: Any) -> Any:
+    if job.ref is None:
+        raise StateConflict("cannot cancel a submission without a confirmed Slurm job ID")
+    operation_id = uuid.uuid4().hex
+    with operation_scope_lock(
+        paths.operation_locks_dir,
+        operation_id,
+        blocking=True,
+    ):
+        return _cancel_record_owned(ctx, client, job, operation_id)
+
+
+def _cancel_record_owned(
+    ctx: Any,
+    client: Any,
+    job: Any,
+    operation_id: str,
+) -> Any:
     from .errors import ProtocolViolation, SchedulerUnavailable
     from .lifecycle import EvidenceEvent
     from .monitor import JobMonitor
     from .slurm import CancellationInspectionStatus, CancellationStatus
 
-    if job.ref is None:
-        raise StateConflict("cannot cancel a submission without a confirmed Slurm job ID")
-    operation = ctx.state.begin_cancel(job.operation_id)
+    operation = ctx.state.begin_cancel(job.operation_id, operation_id=operation_id)
     current = job
     while True:
         assert current.ref is not None
@@ -1588,7 +1625,7 @@ def cmd_run(
         if args.detach:
             return 141
         try:
-            _cancel_record(ctx, client, job)
+            _cancel_record(ctx, paths, client, job)
         except HpcAllocError as exc:
             _best_effort_info(
                 f"output pipe closed — could not confirm cancellation of foreground "
@@ -1603,7 +1640,7 @@ def cmd_run(
         if args.detach:
             raise
         try:
-            _cancel_record(ctx, client, job)
+            _cancel_record(ctx, paths, client, job)
         except HpcAllocError as exc:
             _best_effort_info(f"could not confirm cancellation: {exc}")
         else:
@@ -1656,7 +1693,7 @@ def cmd_cancel(
     with _ssh_projection_scope(ctx, paths):
         transport, client = _services(ctx, paths, entrypoint, job.cluster)
         transport.bootstrap(job.cluster)
-        outcome = _cancel_record(ctx, client, job)
+        outcome = _cancel_record(ctx, paths, client, job)
     info(f"{outcome.status.value.lower().replace('_', ' ')}: {job.cluster}:{job.job_id}")
     return 0
 
@@ -1713,7 +1750,7 @@ def cmd_down(
                 try:
                     transport, client = _services(ctx, paths, entrypoint, job.cluster)
                     transport.bootstrap(job.cluster)
-                    outcome = _cancel_record(ctx, client, job)
+                    outcome = _cancel_record(ctx, paths, client, job)
                     successes.append(
                         f"{outcome.status.value.lower().replace('_', ' ')} allocation "
                         f"{job.cluster}:{job.logical_name} ({job.job_id})"
@@ -1805,10 +1842,13 @@ def cmd_logs(
             )
         except SchedulerUnavailable:
             job = ctx.state.get_job(job.operation_id)
-            if not job.ever_started:
+            if not JobMonitor.tracker(job).assessment.log_eligible:
                 raise
             assessment = None
-            info("scheduler unavailable; reading the already-known log without a lifecycle guard")
+            info(
+                "scheduler unavailable; reading the operation-scoped log from "
+                "durable final/start evidence"
+            )
         if assessment is not None and not assessment.log_eligible:
             raise HpcAllocError(
                 f"job {job.cluster}:{job.job_id} has not started; use logs -f to wait safely"
@@ -2275,33 +2315,62 @@ def cmd_recover(
                 if answer not in {"y", "yes"}:
                     info("not abandoned")
                     return 1
-            ctx.state.abandon_operation(
+            with operation_scope_lock(
+                paths.operation_locks_dir,
                 operation.operation_id,
-                "explicitly abandoned; remote side effect was not changed",
-            )
+                blocking=False,
+            ):
+                operation = ctx.state.get_operation(operation.operation_id)
+                if not operation.unresolved:
+                    raise StateConflict(
+                        f"operation {operation.operation_id} is not unresolved "
+                        f"(durable phase {operation.phase.value})"
+                    )
+                ctx.state.abandon_operation(
+                    operation.operation_id,
+                    "explicitly abandoned; remote side effect was not changed",
+                )
             info(f"abandoned local operation {operation.operation_id}")
             return 0
         unresolved = 0
-        for operation in operations:
-            job = ctx.state.get_job(operation.target_job_operation_id)
-            if (
-                operation.kind == OperationKind.CANCEL
-                and operation.phase is OperationPhase.CANCEL_PENDING
+        for selected_operation in operations:
+            with operation_scope_lock(
+                paths.operation_locks_dir,
+                selected_operation.operation_id,
+                blocking=False,
             ):
-                resolved = _recover_cancel(ctx, None, operation, job)
-            else:
-                transport, client = _services(ctx, paths, entrypoint, operation.cluster)
-                transport.bootstrap(operation.cluster)
-                if operation.kind == OperationKind.SUBMIT:
-                    resolved = _recover_submission(ctx, client, operation, job)
+                operation = ctx.state.get_operation(selected_operation.operation_id)
+                if not operation.unresolved:
+                    if args.operation_id:
+                        info(
+                            f"operation {operation.operation_id} is already resolved "
+                            f"with durable phase {operation.phase.value}"
+                        )
+                    continue
+                job = ctx.state.get_job(operation.target_job_operation_id)
+                if (
+                    operation.kind == OperationKind.CANCEL
+                    and operation.phase is OperationPhase.CANCEL_PENDING
+                ):
+                    resolved = _recover_cancel(ctx, None, operation, job)
                 else:
-                    resolved = _recover_cancel(ctx, client, operation, job)
-            if not resolved:
-                unresolved += 1
-                info(
-                    f"operation {operation.operation_id} remains unresolved; "
-                    "no conclusive remote outcome found"
-                )
+                    transport, client = _services(
+                        ctx,
+                        paths,
+                        entrypoint,
+                        operation.cluster,
+                    )
+                    transport.bootstrap(operation.cluster)
+                    if operation.kind == OperationKind.SUBMIT:
+                        resolved = _recover_submission(ctx, client, operation, job)
+                    else:
+                        resolved = _recover_cancel(ctx, client, operation, job)
+                if not resolved:
+                    unresolved += 1
+                    info(
+                        f"operation {operation.operation_id} remains unresolved; "
+                        "no conclusive remote outcome found"
+                    )
         return 1 if unresolved else 0
 
 

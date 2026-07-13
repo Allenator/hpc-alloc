@@ -118,6 +118,11 @@ class StreamingTests(unittest.TestCase):
                     args=(self.ref,),
                     kwargs={"attempts": (0, 9)},
                 ),
+                ExpectedCall(
+                    "log_size",
+                    result=LogSizeResult(LogSizeStatus.MISSING),
+                    args=(LOG_PATH,),
+                ),
             ]
         )
         follower = self.follower(script)
@@ -129,7 +134,7 @@ class StreamingTests(unittest.TestCase):
         confirmed = follower.poll_once()
         self.assertEqual(confirmed.assessment.phase, AssessmentPhase.FINAL)
         self.assertEqual(confirmed.assessment.final_source, FinalSource.CONFIRMED_QUEUE)
-        self.assertEqual(script.count("log_size"), 0)
+        self.assertEqual(script.count("log_size"), 1)
         script.assert_complete()
 
     def test_recycled_id_observation_error_breaks_confirmation(self) -> None:
@@ -163,7 +168,8 @@ class StreamingTests(unittest.TestCase):
         self.assertEqual(follower.tracker.assessment.terminal_evidence, 0)
         script.assert_complete()
 
-    def test_never_started_final_follow_skips_size_read_and_drain(self) -> None:
+    def test_unknown_start_queue_final_streams_and_drains_operation_log(self) -> None:
+        output = io.BytesIO()
         script = StrictScript(
             [
                 ExpectedCall("observe", result=None, args=(self.ref,)),
@@ -180,16 +186,35 @@ class StreamingTests(unittest.TestCase):
                     args=(self.ref,),
                     kwargs={"attempts": (0, 9)},
                 ),
+                ExpectedCall(
+                    "log_size",
+                    result=LogSizeResult.available(5),
+                    args=(LOG_PATH,),
+                ),
+                ExpectedCall(
+                    "read_log_chunk",
+                    result=b"done\n",
+                    args=(LOG_PATH, 0),
+                    kwargs={"limit": 5},
+                ),
+                ExpectedCall(
+                    "log_size",
+                    result=LogSizeResult.available(5),
+                    args=(LOG_PATH,),
+                ),
             ]
         )
         clock = VirtualClock()
-        follower = self.follower(script, clock=clock)
+        follower = self.follower(script, clock=clock, output=output)
         outcome = follower.follow(drain=True)
         self.assertTrue(outcome.assessment.final)
         self.assertFalse(outcome.assessment.ever_started)
-        self.assertEqual(outcome.final_log_offset, 0)
-        self.assertEqual(script.count("log_size"), 0)
-        self.assertEqual(script.count("read_log_chunk"), 0)
+        self.assertTrue(outcome.assessment.log_eligible)
+        self.assertEqual(outcome.final_log_offset, 5)
+        self.assertEqual(outcome.bytes_written, 5)
+        self.assertEqual(output.getvalue(), b"done\n")
+        self.assertEqual(script.count("log_size"), 2)
+        self.assertEqual(script.count("read_log_chunk"), 1)
         self.assertEqual(clock.sleeps, [5])
         script.assert_complete()
 
@@ -210,6 +235,11 @@ class StreamingTests(unittest.TestCase):
                     args=(self.ref,),
                     kwargs={"attempts": (0,)},
                 ),
+                ExpectedCall(
+                    "log_size",
+                    result=LogSizeResult(LogSizeStatus.MISSING),
+                    args=(LOG_PATH,),
+                ),
             ]
         )
         follower = self.follower(script)
@@ -218,7 +248,8 @@ class StreamingTests(unittest.TestCase):
         self.assertEqual(result.assessment.final_source, "accounting")
         self.assertEqual(result.assessment.terminal_state, "CANCELLED")
         self.assertFalse(result.assessment.ever_started)
-        self.assertEqual(script.count("log_size"), 0)
+        self.assertTrue(result.assessment.log_eligible)
+        self.assertEqual(script.count("log_size"), 1)
         self.assertEqual(script.count("read_log_chunk"), 0)
         script.assert_complete()
 
@@ -657,6 +688,41 @@ class StreamingTests(unittest.TestCase):
         self.assertEqual(script.count("observe"), 0)
         self.assertEqual(script.count("final"), 0)
         self.assertEqual(script.count("log_size"), 1)
+        script.assert_complete()
+
+    def test_unknown_start_final_seeded_follow_also_drains_once(self) -> None:
+        output = io.BytesIO()
+        tracker = EvidenceTracker(
+            phase=AssessmentPhase.FINAL,
+            terminal_state="CANCELLED",
+            exit_code="0:15",
+            final_source=FinalSource.ACCOUNTING,
+        )
+        script = StrictScript(
+            [
+                ExpectedCall(
+                    "log_size",
+                    result=LogSizeResult.available(10),
+                    args=(LOG_PATH,),
+                ),
+                ExpectedCall(
+                    "read_log_chunk",
+                    result=b"cancelled\n",
+                    args=(LOG_PATH, 0),
+                    kwargs={"limit": 10},
+                ),
+            ]
+        )
+
+        outcome = self.follower(script, tracker=tracker, output=output).follow()
+
+        self.assertFalse(outcome.assessment.ever_started)
+        self.assertTrue(outcome.assessment.log_eligible)
+        self.assertEqual(outcome.final_log_offset, 10)
+        self.assertEqual(outcome.bytes_written, 10)
+        self.assertEqual(output.getvalue(), b"cancelled\n")
+        self.assertEqual(script.count("observe"), 0)
+        self.assertEqual(script.count("final"), 0)
         script.assert_complete()
 
     def test_rebase_replaces_only_lifecycle_tracker_and_preserves_stream_progress(self) -> None:

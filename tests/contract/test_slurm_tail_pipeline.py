@@ -66,17 +66,11 @@ class TailPipelineContractTests(unittest.TestCase):
                 f"""\
                 #!/bin/sh
                 if [ "$1" = "-n" ]; then
-                    case "$HPC_ALLOC_FAKE_TAIL_SOURCE" in
-                        partial_failure)
-                            printf 'partial source output'
-                            printf 'simulated source read failure\\n' >&2
-                            exit 23
-                            ;;
-                        empty_failure)
-                            printf 'simulated empty source failure\\n' >&2
-                            exit 24
-                            ;;
-                    esac
+                    if [ "$HPC_ALLOC_FAKE_TAIL_SINK" = "failure" ]; then
+                        cat >/dev/null
+                        printf 'simulated line-selection failure\\n' >&2
+                        exit 25
+                    fi
                 elif [ "$1" = "-c" ]; then
                     case "$2" in
                         +*)
@@ -97,12 +91,20 @@ class TailPipelineContractTests(unittest.TestCase):
                                     ;;
                             esac
                             ;;
+                        *)
+                            case "$HPC_ALLOC_FAKE_TAIL_SOURCE" in
+                                partial_failure)
+                                    printf 'partial source output'
+                                    printf 'simulated source read failure\\n' >&2
+                                    exit 23
+                                    ;;
+                                empty_failure)
+                                    printf 'simulated empty source failure\\n' >&2
+                                    exit 24
+                                    ;;
+                            esac
+                            ;;
                     esac
-                    if [ "$HPC_ALLOC_FAKE_TAIL_SINK" = "failure" ]; then
-                        cat >/dev/null
-                        printf 'simulated bounded-tail failure\\n' >&2
-                        exit 25
-                    fi
                 fi
                 exec {shlex.quote(real_tail)} "$@"
                 """
@@ -197,9 +199,43 @@ class TailPipelineContractTests(unittest.TestCase):
 
         self.assertEqual(result, payload[-MAX_LOG_CHUNK_BYTES:])
 
+    def test_bounded_source_preserves_single_and_multiline_tail_semantics(self) -> None:
+        cases = (
+            (
+                "single-large-line",
+                b"x" * (MAX_LOG_CHUNK_BYTES + 257),
+                1,
+                b"x" * MAX_LOG_CHUNK_BYTES,
+            ),
+            (
+                "many-lines",
+                b"discard\n" * (MAX_LOG_CHUNK_BYTES // len(b"discard\n") + 17)
+                + b"keep one\nkeep two\n",
+                2,
+                b"keep one\nkeep two\n",
+            ),
+        )
+        for label, payload, lines, expected in cases:
+            with self.subTest(case=label):
+                self.log_path.write_bytes(payload)
+                self.assertEqual(
+                    self.client().tail_log(str(self.log_path), lines),
+                    expected,
+                )
+
     def test_sink_failure_is_preserved_when_source_succeeds(self) -> None:
-        with self.assertRaisesRegex(RemoteCommandFailed, "simulated bounded-tail failure"):
+        with self.assertRaisesRegex(RemoteCommandFailed, "simulated line-selection failure"):
             self.client(sink="failure").tail_log(str(self.log_path), 10)
+
+    def test_zero_lines_checks_readability_without_starting_the_pipeline(self) -> None:
+        result = self.client(
+            source="partial_failure",
+            sink="failure",
+        ).tail_log(str(self.log_path), 0)
+        self.assertEqual(result, b"")
+
+        with self.assertRaises(RemoteCommandFailed):
+            self.client().tail_log(str(self.log_path.with_name("missing.log")), 0)
 
 
 if __name__ == "__main__":

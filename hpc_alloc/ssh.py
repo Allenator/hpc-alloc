@@ -8,6 +8,7 @@ exit status without turning it into a process exit.
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -22,7 +23,11 @@ from .errors import (
     SchedulerUnavailable,
     TransportLost,
 )
-from .ssh_config import login_alias
+from .ssh_config import (
+    ComputeMasterRetirement,
+    compute_control_socket_prefix,
+    login_alias,
+)
 
 
 class AuthMode(StrEnum):
@@ -101,6 +106,150 @@ def can_prompt() -> bool:
         return False
     os.close(fd)
     return True
+
+
+def _effective_compute_control_path(
+    alias: str,
+    *,
+    ssh_dir: Path,
+    runner: Callable[..., subprocess.CompletedProcess],
+) -> tuple[bool, Path | None, str | None]:
+    """Resolve one old alias to an app-owned effective control socket."""
+
+    try:
+        result = runner(
+            ["ssh", "-G", "-T", "--", alias],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception as exc:
+        return False, None, f"could not inspect obsolete SSH alias {alias}: {exc}"
+    if result.returncode != 0:
+        detail = str(result.stderr or "").strip().splitlines()
+        reason = detail[0] if detail else f"ssh -G exited {result.returncode}"
+        return False, None, f"could not inspect obsolete SSH alias {alias}: {reason}"
+    stdout = result.stdout
+    if not isinstance(stdout, str):
+        return False, None, f"could not inspect obsolete SSH alias {alias}: non-text ssh -G output"
+    values = [
+        fields[1]
+        for line in stdout.splitlines()
+        if len(fields := line.split(None, 1)) == 2
+        and fields[0].lower() == "controlpath"
+    ]
+    if len(values) != 1:
+        return (
+            False,
+            None,
+            f"could not inspect obsolete SSH alias {alias}: expected one controlpath",
+        )
+    if values[0].lower() == "none":
+        return True, None, None
+
+    body = alias.removeprefix("hpc-")
+    cluster, separator, _name = body.partition(".")
+    if not separator or not cluster:
+        return False, None, f"could not inspect malformed obsolete SSH alias {alias}"
+    root = Path(os.path.abspath(os.path.expanduser(str(ssh_dir))))
+    path = Path(os.path.abspath(os.path.expanduser(values[0])))
+    if path.parent != root or not path.name.startswith(
+        compute_control_socket_prefix(cluster)
+    ):
+        return (
+            False,
+            None,
+            f"refusing to retire non-managed SSH control path for {alias}: {path}",
+        )
+    return True, path, None
+
+
+def retire_compute_masters(
+    retirement: ComputeMasterRetirement,
+    *,
+    ssh_dir: Path,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> tuple[str, ...]:
+    """Best-effort close old compute masters without disturbing shared ones."""
+
+    warnings: list[str] = []
+    resolved: dict[str, Path | None] = {}
+
+    # Resolve retained aliases first.  If any cannot be inspected, do not risk
+    # closing a socket still shared by that active allocation.
+    for alias in retirement.retained_aliases:
+        ok, path, warning = _effective_compute_control_path(
+            alias, ssh_dir=ssh_dir, runner=runner
+        )
+        if warning is not None:
+            warnings.append(warning)
+        if not ok:
+            warnings.append(
+                "skipped obsolete SSH master retirement because a retained "
+                "allocation's control path could not be protected"
+            )
+            return tuple(warnings)
+        resolved[alias] = path
+    retained_paths = {path for path in resolved.values() if path is not None}
+
+    obsolete_paths: dict[Path, str] = {}
+    for alias in retirement.old_aliases:
+        if alias not in resolved:
+            ok, path, warning = _effective_compute_control_path(
+                alias, ssh_dir=ssh_dir, runner=runner
+            )
+            if warning is not None:
+                warnings.append(warning)
+            if not ok:
+                continue
+            resolved[alias] = path
+        path = resolved[alias]
+        if path is not None and path not in retained_paths:
+            obsolete_paths.setdefault(path, alias)
+
+    for path, alias in sorted(obsolete_paths.items()):
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            warnings.append(f"could not inspect obsolete SSH control socket {path}: {exc}")
+            continue
+        if not stat.S_ISSOCK(metadata.st_mode):
+            warnings.append(
+                f"refusing to retire non-socket SSH control path {path}"
+            )
+            continue
+        if metadata.st_uid != os.geteuid():
+            warnings.append(
+                f"refusing to retire SSH control socket not owned by the "
+                f"current user: {path}"
+            )
+            continue
+        try:
+            result = runner(
+                ["ssh", "-S", str(path), "-O", "exit", "--", alias],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception as exc:
+            warnings.append(f"could not retire obsolete SSH control socket {path}: {exc}")
+            continue
+        if result.returncode == 0:
+            continue
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            warnings.append(f"could not verify obsolete SSH control socket {path}: {exc}")
+            continue
+        detail = str(result.stderr or "").strip().splitlines()
+        reason = detail[0] if detail else f"ssh -O exit returned {result.returncode}"
+        warnings.append(f"could not retire obsolete SSH control socket {path}: {reason}")
+
+    return tuple(warnings)
 
 
 class SshTransport:
@@ -493,5 +642,6 @@ __all__ = [
     "RetryPolicy",
     "SshTransport",
     "can_prompt",
+    "retire_compute_masters",
     "ssh_argv",
 ]

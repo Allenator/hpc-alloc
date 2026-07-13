@@ -238,6 +238,13 @@ transactions:
 4. Record the acknowledgement, or mark the operation ambiguous if the reply
    may have been lost.
 
+The live submit or cancel process owns a secure operation-scoped advisory lock
+from intent publication through remote dispatch and the final journal update.
+Recovery and abandonment acquire that same lock without waiting, then reload
+the durable operation. If its live owner is still dispatching or journaling,
+they fail closed and ask you to retry after that process exits. The operating
+system releases the lock if a process crashes.
+
 An ambiguous mutation is never guessed safe to retry. `status` exposes it and
 prints the relevant operation ID. Reconcile it with:
 
@@ -316,7 +323,7 @@ foreign live tags are not cancelled.
 ## Lifecycle and stream policy
 
 Queue absence is evidence, not immediate proof that a job ended. The lifecycle
-tracker distinguishes never-started, active, started-but-inactive, requeueing,
+tracker distinguishes no-observed-start, active, started-but-inactive, requeueing,
 terminal-candidate, final, and uncertain states. Candidate termination is
 confirmed with another successful observation, and final accounting is used
 when available; transport and scheduler failures do not masquerade as job
@@ -324,6 +331,8 @@ death. A present `COMPLETING` job is started-but-inactive, remains log-eligible,
 and cannot become final merely because it appears in two consecutive polls.
 Recycled numeric IDs count as non-live evidence only for the old exact
 operation; partial name/comment matches remain hard identity conflicts.
+An exact scheduler-final job remains eligible for a best-effort read of its
+operation-scoped log even when no earlier observation proved that it started.
 
 Final evidence is monotonic. Later missing or weaker observations cannot erase
 persisted terminal state or exit code; exact accounting may enrich a
@@ -389,6 +398,8 @@ usually wait longer and affect fair share.
 
 - `~/.config/hpc-alloc/config.toml` — authoritative user configuration
 - `~/.config/hpc-alloc/state.db*` — SQLite state, WAL, and transient sidecar
+- `~/.config/hpc-alloc/operation-locks/*.lock` — retained per-operation advisory
+  lock files; do not remove them while hpc-alloc processes may be running
 - `~/.config/hpc-alloc/ssh_config` — lock-serialized regenerated login/allocation aliases
 - `~/.config/hpc-alloc/known_hosts` — managed host-key store, namespaced by cluster and physical node
 - `~/.ssh/config` — only an `Include` for the managed SSH config is added

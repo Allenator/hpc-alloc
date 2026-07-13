@@ -179,6 +179,36 @@ class LifecycleTraceTests(unittest.TestCase):
         self.assertEqual(assessment.exit_code, "0:0")
         self.assertIsNone(assessment.current_node)
 
+    def test_only_scheduler_finals_are_log_eligible_without_start_proof(self) -> None:
+        for state, exit_code in (("CANCELLED", "0:15"), ("BOOT_FAIL", "1:0")):
+            with self.subTest(accounting_state=state):
+                accounting = EvidenceTracker().accept(
+                    EvidenceEvent.final(final_record(state, exit_code))
+                )
+                self.assertFalse(accounting.ever_started)
+                self.assertTrue(accounting.log_eligible)
+
+        queue_tracker = EvidenceTracker()
+        queue_tracker.accept(EvidenceEvent.absent())
+        queue_final = queue_tracker.accept(EvidenceEvent.absent())
+        self.assertFalse(queue_final.ever_started)
+        self.assertEqual(queue_final.final_source, FinalSource.CONFIRMED_QUEUE)
+        self.assertTrue(queue_final.log_eligible)
+
+        for source, state in (
+            (FinalSource.SUBMIT_FAILED, "SUBMIT_FAILED"),
+            (FinalSource.ABANDONED, "ABANDONED"),
+        ):
+            with self.subTest(source=source):
+                local = EvidenceTracker(
+                    phase=JobPhase.FINAL,
+                    ever_started=True,
+                    terminal_state=state,
+                    final_source=source,
+                ).assessment
+                self.assertTrue(local.ever_started)
+                self.assertFalse(local.log_eligible)
+
     def test_confirmed_queue_death_retains_the_observed_terminal_state(self) -> None:
         tracker = EvidenceTracker(ever_started=True, last_node="node01")
         candidate = tracker.accept(EvidenceEvent.queue(row("COMPLETED")))

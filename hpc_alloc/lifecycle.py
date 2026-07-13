@@ -91,7 +91,15 @@ class JobAssessment:
 
     @property
     def log_eligible(self) -> bool:
-        return self.ever_started
+        if self.final_source in {
+            FinalSource.SUBMIT_FAILED,
+            FinalSource.ABANDONED,
+        }:
+            return False
+        return self.ever_started or self.final_source in {
+            FinalSource.CONFIRMED_QUEUE,
+            FinalSource.ACCOUNTING,
+        }
 
 
 _ACTIVE = frozenset({"RUNNING"})

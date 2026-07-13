@@ -176,7 +176,11 @@ class SlurmProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ProtocolViolation, "payload limit"):
             client.tail_log("log", 999_999)
         command = transport.calls[0][1]
-        self.assertIn(f"tail -c {MAX_LOG_CHUNK_BYTES}", command)
+        source = f"tail -c {MAX_LOG_CHUNK_BYTES} -- log; source_rc=$?"
+        sink = "| tail -n 999999; sink_rc=$?"
+        self.assertIn(source, command)
+        self.assertIn(sink, command)
+        self.assertLess(command.index(source), command.index(sink))
         self.assertIn(f'[ "$n" -le {MAX_LOG_CHUNK_BYTES} ]', command)
 
     def test_nonzero_scheduler_status_is_typed_not_empty_snapshot(self) -> None:

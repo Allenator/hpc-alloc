@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, call, patch
@@ -118,6 +120,27 @@ host = "grace.example.edu"
         project.assert_called_once_with(context, paths)
         transport_constructor.assert_not_called()
         client_constructor.assert_not_called()
+
+    def test_retirement_failure_warns_but_does_not_block_projection(self) -> None:
+        paths, context = self.context()
+        _sync_ssh_projection(context, paths)
+        active = context.state.list_jobs.return_value[0]
+        active.current_node = None
+        stderr = io.StringIO()
+
+        with (
+            patch(
+                "hpc_alloc.ssh.retire_compute_masters",
+                side_effect=RuntimeError("local cleanup failed"),
+            ),
+            redirect_stderr(stderr),
+        ):
+            changed = _sync_ssh_projection(context, paths)
+
+        self.assertTrue(changed)
+        self.assertNotIn("Host hpc-grace.dev", paths.managed_ssh_config.read_text())
+        self.assertIn("warning", stderr.getvalue())
+        self.assertIn("local cleanup failed", stderr.getvalue())
 
     def test_invalid_cluster_is_rejected_before_projection(self) -> None:
         paths, context = self.context()
@@ -313,7 +336,12 @@ class CommandSshPolicyTests(unittest.TestCase):
                 client = object()
                 events: list[str] = []
 
-                def cancel(_ctx: object, _client: object, job: object) -> object:
+                def cancel(
+                    _ctx: object,
+                    _paths: object,
+                    _client: object,
+                    job: object,
+                ) -> object:
                     name = str(getattr(job, "logical_name"))
                     events.append(f"cancel:{name}")
                     if name == "released":
@@ -397,7 +425,12 @@ class CommandSshPolicyTests(unittest.TestCase):
                 projection_failure = ConfigInvalid("managed SSH projection failed")
                 events: list[str] = []
 
-                def cancel(_ctx: object, _client: object, job: object) -> object:
+                def cancel(
+                    _ctx: object,
+                    _paths: object,
+                    _client: object,
+                    job: object,
+                ) -> object:
                     name = str(getattr(job, "logical_name"))
                     events.append(f"cancel:{name}")
                     if name == "released":
@@ -620,7 +653,7 @@ class CommandSshPolicyTests(unittest.TestCase):
         )
         transports["grace"].bootstrap.assert_called_once_with("grace")
         transports["bouchet"].bootstrap.assert_called_once_with("bouchet")
-        self.assertEqual([call.args[2] for call in cancel.call_args_list], jobs)
+        self.assertEqual([call.args[3] for call in cancel.call_args_list], jobs)
         project.assert_called_once_with(context, self.paths)
 
     def test_cmd_down_all_explicit_cluster_restricts_the_job_set(self) -> None:
@@ -669,7 +702,12 @@ class CommandSshPolicyTests(unittest.TestCase):
             "grace",
         )
         transport.bootstrap.assert_called_once_with("grace")
-        cancel.assert_called_once_with(context, service_factory.return_value[1], jobs[0])
+        cancel.assert_called_once_with(
+            context,
+            self.paths,
+            service_factory.return_value[1],
+            jobs[0],
+        )
 
 
 if __name__ == "__main__":

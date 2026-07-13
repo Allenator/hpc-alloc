@@ -1,15 +1,20 @@
-"""Stable, secure process locks for authoritative local configuration scope."""
+"""Stable, secure process locks for configuration and remote mutations."""
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import os
+import re
 import stat
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-from .errors import ConfigInvalid
+from .errors import ConfigInvalid, StateConflict, StateInvalid
+
+
+_OPERATION_ID = re.compile(r"[0-9a-f]{32}\Z")
 
 
 @contextmanager
@@ -72,4 +77,124 @@ def configuration_scope_lock(
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
             except OSError:
                 pass
-        os.close(descriptor)
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+@contextmanager
+def operation_scope_lock(
+    directory: Path,
+    operation_id: str,
+    *,
+    blocking: bool,
+) -> Iterator[None]:
+    """Own one operation while it may still issue a remote mutation.
+
+    Lock files are stable and intentionally retained.  Unlinking after use
+    could let a waiter and a new opener lock different inodes for the same
+    operation.  The containing directory and file are opened without
+    following their final symlink components and validated through their open
+    descriptors before the advisory lock is acquired.
+    """
+
+    if (
+        not isinstance(operation_id, str)
+        or _OPERATION_ID.fullmatch(operation_id) is None
+    ):
+        raise StateConflict("operation ID must be 32 lowercase hexadecimal characters")
+    if not isinstance(blocking, bool):
+        raise TypeError("blocking must be a boolean")
+
+    lock_path = directory / f"{operation_id}.lock"
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        directory_flags |= getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        directory_descriptor = os.open(directory, directory_flags)
+    except OSError as exc:
+        raise StateInvalid(
+            f"cannot prepare operation-lock directory {directory}: {exc}",
+            path=directory,
+        ) from exc
+
+    descriptor: int | None = None
+    locked = False
+    try:
+        try:
+            directory_metadata = os.fstat(directory_descriptor)
+            if not stat.S_ISDIR(directory_metadata.st_mode):
+                raise StateInvalid(
+                    f"operation-lock directory is not a directory: {directory}",
+                    path=directory,
+                )
+            if directory_metadata.st_uid != os.geteuid():
+                raise StateInvalid(
+                    f"operation-lock directory is not owned by the current user: {directory}",
+                    path=directory,
+                )
+            os.fchmod(directory_descriptor, 0o700)
+
+            flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(
+                f"{operation_id}.lock",
+                flags,
+                0o600,
+                dir_fd=directory_descriptor,
+            )
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise StateInvalid(
+                    f"operation lock is not a regular file: {lock_path}",
+                    path=lock_path,
+                )
+            if metadata.st_uid != os.geteuid():
+                raise StateInvalid(
+                    f"operation lock is not owned by the current user: {lock_path}",
+                    path=lock_path,
+                )
+            if metadata.st_nlink != 1:
+                raise StateInvalid(
+                    f"operation lock must have exactly one hard link: {lock_path}",
+                    path=lock_path,
+                )
+            os.fchmod(descriptor, 0o600)
+            lock_flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+            try:
+                fcntl.flock(descriptor, lock_flags)
+            except OSError as exc:
+                if not blocking and exc.errno in {errno.EACCES, errno.EAGAIN}:
+                    raise StateConflict(
+                        f"operation {operation_id} is active in another hpc-alloc "
+                        "process; retry after it exits"
+                    ) from exc
+                raise
+            locked = True
+        except StateConflict:
+            raise
+        except StateInvalid:
+            raise
+        except OSError as exc:
+            raise StateInvalid(
+                f"cannot acquire operation lock {lock_path}: {exc}",
+                path=lock_path,
+            ) from exc
+        yield
+    finally:
+        if locked and descriptor is not None:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        try:
+            os.close(directory_descriptor)
+        except OSError:
+            pass

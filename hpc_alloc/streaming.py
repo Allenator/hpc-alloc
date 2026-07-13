@@ -38,7 +38,8 @@ class LogFollower:
     """Follow one job without mixing scheduler metadata and arbitrary bytes.
 
     A poll always observes Slurm first.  Log size and log content are separate
-    remote calls and are made only after ``ever_started`` is established.
+    remote calls and are made only after start evidence or a scheduler-final
+    verdict makes the operation-scoped log eligible.
     """
 
     def __init__(
@@ -160,7 +161,7 @@ class LogFollower:
             if record is not None:
                 assessment = self.tracker.accept(EvidenceEvent.final(record))
         self._state_note(row, assessment)
-        if not assessment.ever_started:
+        if not assessment.log_eligible:
             return PollResult(assessment)
 
         try:
@@ -191,9 +192,9 @@ class LogFollower:
         )
 
     def drain(self) -> int:
-        """Best-effort final read, but only for a job known to have started."""
+        """Best-effort read for a known start or scheduler-final job."""
 
-        if not self.tracker.assessment.ever_started:
+        if not self.tracker.assessment.log_eligible:
             return 0
         try:
             size = self.client.log_size(self.log_path)

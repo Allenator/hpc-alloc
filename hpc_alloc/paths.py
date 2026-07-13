@@ -13,6 +13,7 @@ class AppPaths:
     config_file: Path
     state_db: Path
     config_scope_lock: Path
+    operation_locks_dir: Path
     managed_ssh_config: Path
     ssh_config_lock: Path
     known_hosts: Path
@@ -30,6 +31,7 @@ class AppPaths:
             config_file=config_dir / "config.toml",
             state_db=config_dir / "state.db",
             config_scope_lock=config_dir / ".config_scope.lock",
+            operation_locks_dir=config_dir / "operation-locks",
             managed_ssh_config=config_dir / "ssh_config",
             ssh_config_lock=config_dir / ".ssh_config.lock",
             known_hosts=config_dir / "known_hosts",

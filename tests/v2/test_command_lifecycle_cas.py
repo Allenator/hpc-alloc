@@ -11,7 +11,13 @@ from unittest.mock import Mock, patch
 
 from hpc_alloc.commands import cmd_logs, cmd_recover, cmd_status, cmd_sync, cmd_up
 from hpc_alloc.errors import HpcAllocError, SchedulerUnavailable
-from hpc_alloc.models import FinalSource, JobKind, JobPhase, OperationPhase
+from hpc_alloc.models import (
+    EvidenceProvenance,
+    FinalSource,
+    JobKind,
+    JobPhase,
+    OperationPhase,
+)
 from hpc_alloc.ownership import format_tag, slurm_job_name
 from hpc_alloc.paths import AppPaths
 from hpc_alloc.slurm import AccountingRecord, QueueRow, RawQueueRow, RawQueueScan
@@ -42,7 +48,7 @@ class SchedulerStub:
         *,
         observations: tuple[QueueRow | BaseException, ...] = (),
         scan_rows: tuple[RawQueueRow, ...] = (),
-        accounting: AccountingRecord | None = None,
+        accounting: AccountingRecord | BaseException | None = None,
         recovered: AccountingRecord | None = None,
     ) -> None:
         self.observations = list(observations)
@@ -70,6 +76,8 @@ class SchedulerStub:
         self, _ref: object, *, attempts: tuple[float, ...], auth: object
     ) -> AccountingRecord | None:
         self.final_calls += 1
+        if isinstance(self.accounting, BaseException):
+            raise self.accounting
         return self.accounting
 
     def tail_log(self, _path: str, _lines: int) -> bytes:
@@ -363,7 +371,7 @@ class CommandLifecycleCasTests(unittest.TestCase):
         submit.assert_called_once()
         self.assertEqual(client.observe_calls, 1)
 
-    def test_nonfollow_logs_does_not_tail_after_fresh_never_started_final(self) -> None:
+    def test_nonfollow_logs_tails_after_fresh_unknown_start_final(self) -> None:
         self.reserve()
         client = SchedulerStub(
             observations=(self.row("PENDING", reason="Resources"),)
@@ -385,6 +393,35 @@ class CommandLifecycleCasTests(unittest.TestCase):
                 "hpc_alloc.commands.sys.stdout",
                 SimpleNamespace(buffer=output),
             ),
+        ):
+            result = cmd_logs(
+                SimpleNamespace(
+                    target=f"@{OPERATION_ID}",
+                    cluster=None,
+                    lines=20,
+                    follow=False,
+                ),
+                ctx=self.context,
+                paths=self.paths,
+                entrypoint=self.entrypoint,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(client.tail_calls, 1)
+        self.assertEqual(output.getvalue(), b"unexpected stale log\n")
+
+    def test_nonfollow_logs_still_rejects_pending_job_without_start_proof(self) -> None:
+        self.reserve()
+        client = SchedulerStub(
+            observations=(self.row("PENDING", reason="Resources"),)
+        )
+
+        with (
+            patch(
+                "hpc_alloc.commands._services",
+                return_value=(TransportStub(), client),
+            ),
+            patch("hpc_alloc.commands._sync_ssh_projection", return_value=True),
             self.assertRaisesRegex(HpcAllocError, "has not started"),
         ):
             cmd_logs(
@@ -400,7 +437,53 @@ class CommandLifecycleCasTests(unittest.TestCase):
             )
 
         self.assertEqual(client.tail_calls, 0)
-        self.assertEqual(output.getvalue(), b"")
+
+    def test_nonfollow_logs_uses_queue_final_during_accounting_outage(self) -> None:
+        self.reserve()
+        self.state.update_job(
+            OPERATION_ID,
+            phase=JobPhase.FINAL,
+            evidence_provenance=EvidenceProvenance.ABSENT,
+            evidence_detail="job was absent from two exact queue observations",
+            final_source=FinalSource.CONFIRMED_QUEUE,
+        )
+        client = SchedulerStub(
+            accounting=SchedulerUnavailable("accounting is temporarily unavailable")
+        )
+        output = io.BytesIO()
+
+        with (
+            patch(
+                "hpc_alloc.commands._services",
+                return_value=(TransportStub(), client),
+            ),
+            patch("hpc_alloc.commands._sync_ssh_projection", return_value=True),
+            patch(
+                "hpc_alloc.commands.sys.stdout",
+                SimpleNamespace(buffer=output),
+            ),
+            patch("hpc_alloc.commands.info") as report,
+        ):
+            result = cmd_logs(
+                SimpleNamespace(
+                    target=f"@{OPERATION_ID}",
+                    cluster=None,
+                    lines=20,
+                    follow=False,
+                ),
+                ctx=self.context,
+                paths=self.paths,
+                entrypoint=self.entrypoint,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(client.final_calls, 1)
+        self.assertEqual(client.tail_calls, 1)
+        self.assertEqual(output.getvalue(), b"unexpected stale log\n")
+        report.assert_called_once_with(
+            "scheduler unavailable; reading the operation-scoped log from "
+            "durable final/start evidence"
+        )
 
     def test_nonfollow_logs_uses_durable_start_after_race_then_fresh_outage(self) -> None:
         self.reserve()
@@ -443,7 +526,8 @@ class CommandLifecycleCasTests(unittest.TestCase):
         self.assertEqual(client.tail_calls, 1)
         self.assertEqual(output.getvalue(), b"unexpected stale log\n")
         report.assert_called_once_with(
-            "scheduler unavailable; reading the already-known log without a lifecycle guard"
+            "scheduler unavailable; reading the operation-scoped log from "
+            "durable final/start evidence"
         )
 
     def test_active_allocation_does_not_reach_node_after_fresh_final(self) -> None:

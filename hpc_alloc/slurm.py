@@ -1199,13 +1199,15 @@ class SlurmClient:
         status_template = "${TMPDIR:-/tmp}/hpc-alloc-tail.XXXXXX"
         command = (
             f"[ -r {quoted} ] || exit 1; "
+            f"[ {lines} -eq 0 ] && exit 0; "
             f'status=$(mktemp "{status_template}") || exit 125; '
             "trap 'rm -f \"$status\"' 0; "
             "trap 'exit 129' 1; trap 'exit 130' 2; trap 'exit 143' 15; "
             "{ "
-            f"tail -n {lines} -- {quoted}; source_rc=$?; "
+            f"tail -c {MAX_LOG_CHUNK_BYTES} -- {quoted}; source_rc=$?; "
             "printf '%s\\n' \"$source_rc\" >\"$status\"; "
-            f"}} | tail -c {MAX_LOG_CHUNK_BYTES}; sink_rc=$?; "
+            f"}} | tail -n {lines}; sink_rc=$?; "
+            '[ "$sink_rc" -eq 0 ] || exit "$sink_rc"; '
             'IFS= read -r source_rc <"$status" || { '
             "printf '%s\\n' 'log-tail source status was unavailable' >&2; exit 125; }; "
             'case "$source_rc" in \'\'|*[!0-9]*) '
@@ -1213,7 +1215,7 @@ class SlurmClient:
             '[ "$source_rc" -le 255 ] 2>/dev/null || { '
             "printf '%s\\n' 'log-tail source status was invalid' >&2; exit 125; }; "
             '[ "$source_rc" -eq 0 ] || exit "$source_rc"; '
-            'exit "$sink_rc"'
+            "exit 0"
         )
         framed = self._framed(
             command,

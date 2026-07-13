@@ -198,6 +198,53 @@ host = "secondary.example.edu"
         transport_script.assert_complete()
         client_script.assert_complete()
 
+    def test_live_submission_rejects_recovery_and_abandon_until_journaled(self) -> None:
+        transport, transport_script = self.transport()
+
+        def submit_once(
+            _spec: SubmissionSpec,
+            **_kwargs: object,
+        ) -> SubmissionResult:
+            for abandon in (False, True):
+                with self.subTest(abandon=abandon):
+                    with (
+                        patch(
+                            "hpc_alloc.commands._sync_ssh_projection",
+                            return_value=False,
+                        ),
+                        self.assertRaisesRegex(StateConflict, "active in another"),
+                    ):
+                        cmd_recover(
+                            SimpleNamespace(
+                                operation_id=OPERATION_ID,
+                                cluster=None,
+                                abandon=abandon,
+                                yes=True,
+                            ),
+                            ctx=self.context,
+                            paths=self.paths,
+                            entrypoint=Path("/tmp/hpc-alloc"),
+                        )
+            return SubmissionResult("12345", "12345")
+
+        client_script = StrictScript(
+            [
+                ExpectedCall("prepare_submission"),
+                ExpectedCall("submit", result=submit_once),
+            ]
+        )
+
+        job = self.invoke(transport, StrictProxy(client_script))
+
+        self.assertEqual(job.job_id, "12345")
+        self.assertEqual(client_script.count("submit"), 1)
+        self.assertEqual(
+            self.repository.get_operation(OPERATION_ID).phase,
+            OperationPhase.ACKNOWLEDGED,
+        )
+        transport_script.assert_complete()
+        client_script.assert_complete()
+
     def test_submission_preparation_failure_creates_no_intent_or_remote_job(self) -> None:
         transport, transport_script = self.transport()
 
@@ -271,7 +318,7 @@ host = "secondary.example.edu"
             ]
         )
         with self.assertRaisesRegex(IdentityMismatch, "another operation"):
-            _cancel_record(self.context, StrictProxy(client_script), job)
+            _cancel_record(self.context, self.paths, StrictProxy(client_script), job)
 
         self.assertEqual(self.repository.get_job(OPERATION_ID).phase, JobPhase.QUEUED)
         cancels = [
@@ -304,13 +351,69 @@ host = "secondary.example.edu"
             ]
         )
         with self.assertRaisesRegex(TransportLost, "cancellation .* is ambiguous"):
-            _cancel_record(self.context, StrictProxy(client_script), job)
+            _cancel_record(self.context, self.paths, StrictProxy(client_script), job)
 
         unresolved = self.repository.list_unresolved_operations()
         self.assertEqual(len(unresolved), 1)
         self.assertEqual(unresolved[0].phase, OperationPhase.AMBIGUOUS)
         self.assertIn("mid-scancel", unresolved[0].detail or "")
         self.assertEqual(self.repository.get_job(OPERATION_ID).phase, JobPhase.QUEUED)
+        client_script.assert_complete()
+
+    def test_live_cancel_rejects_recovery_and_abandon_until_journaled(self) -> None:
+        job = self.acknowledged_job()
+        assert job.ref is not None
+        cancel_id = "c" * 32
+
+        def cancel_once(_ref: object) -> CancellationResult:
+            for abandon in (False, True):
+                with self.subTest(abandon=abandon):
+                    with (
+                        patch(
+                            "hpc_alloc.commands._sync_ssh_projection",
+                            return_value=False,
+                        ),
+                        self.assertRaisesRegex(StateConflict, "active in another"),
+                    ):
+                        cmd_recover(
+                            SimpleNamespace(
+                                operation_id=cancel_id,
+                                cluster=None,
+                                abandon=abandon,
+                                yes=True,
+                            ),
+                            ctx=self.context,
+                            paths=self.paths,
+                            entrypoint=Path("/tmp/hpc-alloc"),
+                        )
+            return CancellationResult(CancellationStatus.CANCELLED)
+
+        client_script = StrictScript(
+            [
+                ExpectedCall(
+                    "inspect_cancel",
+                    result=CancellationInspection(CancellationInspectionStatus.READY),
+                    args=(job.ref,),
+                ),
+                ExpectedCall("execute_cancel", result=cancel_once, args=(job.ref,)),
+            ]
+        )
+        fake_uuid = SimpleNamespace(hex=cancel_id)
+
+        with patch("hpc_alloc.commands.uuid.uuid4", return_value=fake_uuid):
+            outcome = _cancel_record(
+                self.context,
+                self.paths,
+                StrictProxy(client_script),
+                job,
+            )
+
+        self.assertEqual(outcome.status, CancellationStatus.CANCELLED)
+        self.assertEqual(client_script.count("execute_cancel"), 1)
+        self.assertEqual(
+            self.repository.get_operation(cancel_id).phase,
+            OperationPhase.RESOLVED,
+        )
         client_script.assert_complete()
 
     def test_running_cancel_preflight_persists_start_proof_before_dispatch(self) -> None:
@@ -349,7 +452,7 @@ host = "secondary.example.edu"
         )
 
         with self.assertRaises(TransportLost):
-            _cancel_record(self.context, StrictProxy(script), job)
+            _cancel_record(self.context, self.paths, StrictProxy(script), job)
 
         stored = self.repository.get_job(OPERATION_ID)
         self.assertTrue(stored.ever_started)
@@ -441,7 +544,7 @@ host = "secondary.example.edu"
             "mark_cancel_dispatching",
             side_effect=racing_mark,
         ):
-            _cancel_record(self.context, StrictProxy(script), job)
+            _cancel_record(self.context, self.paths, StrictProxy(script), job)
 
         stored = self.repository.get_job(OPERATION_ID)
         self.assertEqual(mark_calls, 3)
@@ -484,7 +587,7 @@ host = "secondary.example.edu"
             ]
         )
 
-        _cancel_record(self.context, StrictProxy(script), job)
+        _cancel_record(self.context, self.paths, StrictProxy(script), job)
 
         stored = self.repository.get_job(OPERATION_ID)
         self.assertFalse(stored.ever_started)
@@ -528,7 +631,7 @@ host = "secondary.example.edu"
             ]
         )
 
-        _cancel_record(self.context, StrictProxy(script), job)
+        _cancel_record(self.context, self.paths, StrictProxy(script), job)
 
         stored = self.repository.get_job(OPERATION_ID)
         self.assertTrue(stored.ever_started)
@@ -576,7 +679,7 @@ host = "secondary.example.edu"
         )
 
         with self.assertRaises(TransportLost):
-            _cancel_record(self.context, StrictProxy(script), job)
+            _cancel_record(self.context, self.paths, StrictProxy(script), job)
 
         stored = self.repository.get_job(OPERATION_ID)
         self.assertEqual(stored.phase, JobPhase.TERMINAL_CANDIDATE)
@@ -643,7 +746,7 @@ host = "secondary.example.edu"
                     ]
                 )
 
-                _cancel_record(context, StrictProxy(script), job)
+                _cancel_record(context, paths, StrictProxy(script), job)
 
                 stored = repository.get_job(operation_id)
                 self.assertEqual(stored.phase, JobPhase.FINAL)
@@ -687,7 +790,7 @@ host = "secondary.example.edu"
             ]
         )
         with self.assertRaises(TransportLost):
-            _cancel_record(self.context, StrictProxy(dispatch), job)
+            _cancel_record(self.context, self.paths, StrictProxy(dispatch), job)
         dispatch.assert_complete()
 
         stored = self.repository.get_job(OPERATION_ID)
@@ -752,7 +855,12 @@ host = "secondary.example.edu"
             ]
         )
 
-        outcome = _cancel_record(self.context, StrictProxy(client_script), job)
+        outcome = _cancel_record(
+            self.context,
+            self.paths,
+            StrictProxy(client_script),
+            job,
+        )
 
         self.assertEqual(outcome.status, CancellationStatus.CANCELLED)
         updated = self.repository.get_job(OPERATION_ID)
@@ -782,7 +890,12 @@ host = "secondary.example.edu"
             ]
         )
 
-        outcome = _cancel_record(self.context, StrictProxy(client_script), job)
+        outcome = _cancel_record(
+            self.context,
+            self.paths,
+            StrictProxy(client_script),
+            job,
+        )
 
         self.assertEqual(
             outcome.status, CancellationInspectionStatus.CONFIRMED_ABSENT
@@ -811,7 +924,7 @@ host = "secondary.example.edu"
             [ExpectedCall("inspect_cancel", result=unavailable, args=(job.ref,))]
         )
         with self.assertRaisesRegex(SchedulerUnavailable, "before dispatch"):
-            _cancel_record(self.context, StrictProxy(client_script), job)
+            _cancel_record(self.context, self.paths, StrictProxy(client_script), job)
 
         cancellation = [
             operation
@@ -833,7 +946,7 @@ host = "secondary.example.edu"
         )
 
         with self.assertRaises(HostKeyChanged) as raised:
-            _cancel_record(self.context, StrictProxy(client_script), job)
+            _cancel_record(self.context, self.paths, StrictProxy(client_script), job)
 
         self.assertIs(raised.exception, failure)
         cancellation = [
@@ -881,6 +994,7 @@ host = "secondary.example.edu"
                 with self.assertRaises(type(failure)) as raised:
                     _cancel_record(
                         self.context,
+                        self.paths,
                         StrictProxy(client_script),
                         current,
                     )
@@ -921,7 +1035,7 @@ host = "secondary.example.edu"
             ]
         )
         with self.assertRaisesRegex(SchedulerUnavailable, "guard failed"):
-            _cancel_record(self.context, StrictProxy(client_script), job)
+            _cancel_record(self.context, self.paths, StrictProxy(client_script), job)
 
         cancellation = [
             operation
@@ -1364,6 +1478,76 @@ host = "secondary.example.edu"
             resources=self.resources,
         )
         self.assertEqual(replacement.phase, OperationPhase.PREPARED)
+        transport_script.assert_complete()
+        client_script.assert_complete()
+
+    def test_reservation_interrupt_cleanup_failure_reports_recovery_and_unlocks(
+        self,
+    ) -> None:
+        transport, transport_script = self.transport()
+        client_script = StrictScript([ExpectedCall("prepare_submission")])
+        reserve = self.repository.reserve_submission
+        interrupt = KeyboardInterrupt()
+
+        def commit_then_interrupt(**kwargs: object) -> object:
+            reserve(**kwargs)
+            raise interrupt
+
+        stderr = io.StringIO()
+        with (
+            patch.object(
+                self.repository,
+                "reserve_submission",
+                side_effect=commit_then_interrupt,
+            ),
+            patch.object(
+                self.repository,
+                "fail_submission",
+                side_effect=StateConflict("failure journal unavailable"),
+            ),
+            redirect_stderr(stderr),
+            self.assertRaises(KeyboardInterrupt) as raised,
+        ):
+            self.invoke(transport, StrictProxy(client_script))
+
+        self.assertIs(raised.exception, interrupt)
+        operation = self.repository.get_operation(OPERATION_ID)
+        self.assertEqual(operation.phase, OperationPhase.PREPARED)
+        self.assertEqual(self.repository.get_job(OPERATION_ID).phase, JobPhase.SUBMITTING)
+        self.assertEqual(client_script.count("submit"), 0)
+        self.assertIn(f"submission {OPERATION_ID} may have committed", stderr.getvalue())
+        self.assertIn("do not resubmit", stderr.getvalue())
+        self.assertIn(f"`hpc-alloc recover {OPERATION_ID}`", stderr.getvalue())
+
+        recovery_transport = SimpleNamespace(bootstrap=Mock())
+        with (
+            patch(
+                "hpc_alloc.commands._services",
+                return_value=(recovery_transport, object()),
+            ),
+            patch("hpc_alloc.commands._recover_submission", return_value=False) as recover,
+            patch("hpc_alloc.commands._sync_ssh_projection", return_value=False),
+            patch("hpc_alloc.commands.info"),
+        ):
+            result = cmd_recover(
+                SimpleNamespace(
+                    operation_id=OPERATION_ID,
+                    cluster=None,
+                    abandon=False,
+                    yes=False,
+                ),
+                ctx=self.context,
+                paths=self.paths,
+                entrypoint=Path("/tmp/hpc-alloc"),
+            )
+
+        self.assertEqual(result, 1)
+        recovery_transport.bootstrap.assert_called_once_with("grace")
+        recover.assert_called_once()
+        self.assertEqual(
+            self.repository.get_operation(OPERATION_ID).phase,
+            OperationPhase.PREPARED,
+        )
         transport_script.assert_complete()
         client_script.assert_complete()
 
@@ -1930,9 +2114,8 @@ host = "secondary.example.edu"
                 self.assertEqual(recovered.terminal_state, state)
                 self.assertEqual(recovered.exit_code, record.exit_code)
                 self.assertEqual(recovered.ever_started, proves_started)
-                self.assertEqual(
-                    JobMonitor.tracker(recovered).assessment.log_eligible,
-                    proves_started,
+                self.assertTrue(
+                    JobMonitor.tracker(recovered).assessment.log_eligible
                 )
                 self.assertEqual(
                     self.repository.get_operation(operation_id).phase,
@@ -1975,7 +2158,12 @@ host = "secondary.example.edu"
         failure = TransportLost("guarded cancellation reply was lost")
         transport = SimpleNamespace(bootstrap=lambda _cluster: None)
 
-        def finalize_then_fail(_ctx: object, _client: object, target: object) -> object:
+        def finalize_then_fail(
+            _ctx: object,
+            _paths: object,
+            _client: object,
+            target: object,
+        ) -> object:
             self.repository.update_job(
                 target.operation_id,
                 phase=JobPhase.FINAL,
@@ -2009,7 +2197,12 @@ host = "secondary.example.edu"
         failure = TransportLost("guarded cancellation reply was lost")
         transport = SimpleNamespace(bootstrap=lambda _cluster: None)
 
-        def finalize_then_fail(_ctx: object, _client: object, target: object) -> object:
+        def finalize_then_fail(
+            _ctx: object,
+            _paths: object,
+            _client: object,
+            target: object,
+        ) -> object:
             self.repository.update_job(
                 target.operation_id,
                 phase=JobPhase.FINAL,

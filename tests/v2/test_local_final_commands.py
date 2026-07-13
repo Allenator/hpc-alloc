@@ -518,6 +518,15 @@ host = "grace.example.edu"
                 client.tail_log.assert_not_called()
 
     def test_why_ignores_nonaccess_accounting_enrichment_failures(self) -> None:
+        self.state.update_job(
+            RECYCLED_ID,
+            phase=JobPhase.FINAL,
+            terminal_state="CANCELLED",
+            exit_code="0:15",
+            final_source=FinalSource.ACCOUNTING,
+        )
+        self.assertFalse(self.state.get_job(RECYCLED_ID).ever_started)
+
         class Transport:
             def bootstrap(self, *_args: object, **_kwargs: object) -> None:
                 return None
@@ -541,7 +550,7 @@ host = "grace.example.edu"
                 ):
                     result = cmd_why(
                         SimpleNamespace(
-                            target=f"grace:@{HISTORICAL_ID}",
+                            target=f"grace:@{RECYCLED_ID}",
                             cluster=None,
                             json=True,
                         ),
@@ -552,13 +561,18 @@ host = "grace.example.edu"
 
                 self.assertEqual(result, 0)
                 payload = json.loads(stdout.getvalue())
-                self.assertEqual(payload["terminal_state"], "COMPLETED")
-                self.assertEqual(payload["exit_code"], "0:0")
+                self.assertEqual(payload["terminal_state"], "CANCELLED")
+                self.assertEqual(payload["exit_code"], "0:15")
+                self.assertFalse(payload["ever_started"])
                 self.assertEqual(
                     payload["final_source"], FinalSource.ACCOUNTING.value
                 )
                 self.assertNotIn("elapsed", payload)
                 self.assertNotIn("timelimit", payload)
+                self.assertEqual(
+                    payload["detail"],
+                    ["--- log tail ---", "historical output"],
+                )
                 client.tail_log.assert_called_once()
 
     def test_queue_final_enrichment_failure_still_propagates(self) -> None:
@@ -701,7 +715,10 @@ host = "grace.example.edu"
             def bootstrap(self, *_args: object, **_kwargs: object) -> None:
                 return None
 
-        client = SimpleNamespace(final=Mock(return_value=None))
+        client = SimpleNamespace(
+            final=Mock(return_value=None),
+            tail_log=Mock(return_value=b""),
+        )
         stdout = io.StringIO()
         with (
             patch(
@@ -881,6 +898,9 @@ host = "grace.example.edu"
             def final(self, *_args: object, **_kwargs: object) -> None:
                 self.accounting_checks += 1
                 return None
+
+            def tail_log(self, _path: str, _lines: int) -> bytes:
+                return b""
 
         client = Client()
         stdout = io.StringIO()

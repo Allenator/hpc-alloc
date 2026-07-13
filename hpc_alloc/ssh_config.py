@@ -8,16 +8,30 @@ import os
 import re
 import stat
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from .errors import ConfigInvalid
 from .models import JobKind
 
 
 INCLUDE_LINE = "Include ~/.config/hpc-alloc/ssh_config"
+_MANAGED_HEADER = "# Managed by hpc-alloc v2 — regenerated; do not edit."
 _COMPUTE_NODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,252}\Z")
+_MANAGED_ALLOCATION_ALIAS = re.compile(
+    r"hpc-([A-Za-z0-9][A-Za-z0-9_-]{0,62})\."
+    r"([A-Za-z0-9][A-Za-z0-9_-]{0,62})\Z"
+)
 _CONTROL_CLUSTER_DIGEST_LENGTH = 8
+
+
+@dataclass(frozen=True, slots=True)
+class ComputeMasterRetirement:
+    """Old aliases and the unchanged subset that may share their masters."""
+
+    old_aliases: tuple[str, ...]
+    retained_aliases: tuple[str, ...]
 
 
 def login_alias(cluster: str) -> str:
@@ -36,13 +50,19 @@ def compute_host_key_alias(cluster: str, node: str) -> str:
     return f"hpc-alloc-node.{cluster}.{node}"
 
 
-def _compute_control_path(cluster: str) -> str:
-    """Keep cross-cluster masters distinct without risking long socket paths."""
+def compute_control_socket_prefix(cluster: str) -> str:
+    """Return the basename prefix reserved for one cluster's compute masters."""
 
     digest = hashlib.sha256(cluster.encode("utf-8")).hexdigest()[
         :_CONTROL_CLUSTER_DIGEST_LENGTH
     ]
-    return f"~/.ssh/hpc-alloc-{digest}-%C"
+    return f"hpc-alloc-{digest}-"
+
+
+def _compute_control_path(cluster: str) -> str:
+    """Keep cross-cluster masters distinct without risking long socket paths."""
+
+    return f"~/.ssh/{compute_control_socket_prefix(cluster)}%C"
 
 
 def _quoted_value(value: str | Path) -> str:
@@ -64,6 +84,94 @@ def _hostname_value(host: str) -> str:
     return _quoted_value(host.replace("%", "%%"))
 
 
+def _managed_compute_stanzas(text: str) -> dict[str, str]:
+    """Extract only compute stanzas that match this renderer's safe shape."""
+
+    if not text.startswith(f"{_MANAGED_HEADER}\n"):
+        return {}
+    stanzas: dict[str, str] = {}
+    duplicate_aliases: set[str] = set()
+    for block in text.split("\n\n"):
+        lines = block.splitlines()
+        if not lines or not lines[0].startswith("Host "):
+            continue
+        alias = lines[0].removeprefix("Host ")
+        alias_match = _MANAGED_ALLOCATION_ALIAS.fullmatch(alias)
+        if alias_match is None:
+            continue
+        if alias in stanzas or alias in duplicate_aliases:
+            stanzas.pop(alias, None)
+            duplicate_aliases.add(alias)
+            continue
+        cluster = alias_match.group(1)
+        directives: dict[str, str] = {}
+        valid = True
+        for line in lines[1:]:
+            match = re.fullmatch(r"    ([A-Za-z][A-Za-z0-9]*) (.+)", line)
+            if match is None or match.group(1) in directives:
+                valid = False
+                break
+            directives[match.group(1)] = match.group(2)
+        node = directives.get("HostName", "")
+        required = {
+            "HostName",
+            "HostKeyAlias",
+            "User",
+            "ProxyJump",
+            "ControlMaster",
+            "ControlPath",
+            "ControlPersist",
+            "StrictHostKeyChecking",
+            "UserKnownHostsFile",
+            "ServerAliveInterval",
+            "ServerAliveCountMax",
+        }
+        allowed = required | {"IdentityFile", "IdentitiesOnly"}
+        identity_shape = (
+            "IdentityFile" in directives
+            and directives.get("IdentitiesOnly") == "yes"
+        ) or (
+            "IdentityFile" not in directives
+            and "IdentitiesOnly" not in directives
+        )
+        if (
+            not valid
+            or set(directives) - allowed
+            or not required.issubset(directives)
+            or not identity_shape
+            or _COMPUTE_NODE.fullmatch(node) is None
+            or directives["HostKeyAlias"]
+            != compute_host_key_alias(cluster, node)
+            or directives["ProxyJump"] != login_alias(cluster)
+            or directives["ControlMaster"] != "auto"
+            or directives["ControlPath"] != _compute_control_path(cluster)
+            or directives["ControlPersist"] != "4h"
+            or directives["StrictHostKeyChecking"] != "accept-new"
+            or directives["ServerAliveInterval"] != "15"
+            or directives["ServerAliveCountMax"] != "3"
+        ):
+            continue
+        if alias not in duplicate_aliases:
+            stanzas[alias] = block
+    return stanzas
+
+
+def _compute_master_retirement(
+    previous: str, replacement: str
+) -> ComputeMasterRetirement | None:
+    old = _managed_compute_stanzas(previous)
+    if not old:
+        return None
+    new = _managed_compute_stanzas(replacement)
+    retained = tuple(
+        sorted(alias for alias, block in old.items() if new.get(alias) == block)
+    )
+    old_aliases = tuple(sorted(old))
+    if len(retained) == len(old_aliases):
+        return None
+    return ComputeMasterRetirement(old_aliases, retained)
+
+
 def atomic_write_600(path: Path, data: str) -> bool:
     """Atomically replace *path*, fsyncing both content and its directory."""
 
@@ -73,24 +181,117 @@ def atomic_write_600(path: Path, data: str) -> bool:
         raise ConfigInvalid(f"cannot update {path}: {exc}") from exc
 
 
+def _same_inode(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _trusted_regular_file(metadata: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == os.geteuid()
+        and metadata.st_nlink == 1
+    )
+
+
+def _open_regular_nofollow(path: Path) -> tuple[int, os.stat_result] | None:
+    """Open one stable, app-trusted inode without following the final path."""
+
+    try:
+        before = path.lstat()
+    except OSError:
+        return None
+    if not _trusted_regular_file(before):
+        return None
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        opened = os.fstat(fd)
+    except OSError:
+        os.close(fd)
+        return None
+    except BaseException:
+        os.close(fd)
+        raise
+    if not _trusted_regular_file(opened) or not _same_inode(before, opened):
+        os.close(fd)
+        return None
+    return fd, opened
+
+
+def _read_utf8_fd(fd: int) -> str:
+    os.lseek(fd, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(fd, 64 * 1024)
+        if not chunk:
+            return b"".join(chunks).decode("utf-8", errors="strict")
+        chunks.append(chunk)
+
+
+def _write_utf8_fd(fd: int, data: str) -> None:
+    remaining = memoryview(data.encode("utf-8"))
+    while remaining:
+        written = os.write(fd, remaining)
+        if written <= 0:
+            raise OSError("short write while updating managed configuration")
+        remaining = remaining[written:]
+
+
+def _read_regular_nofollow(path: Path) -> str | None:
+    """Read UTF-8 only from a validated regular file at *path*."""
+
+    opened = _open_regular_nofollow(path)
+    if opened is None:
+        return None
+    fd, _metadata = opened
+    try:
+        return _read_utf8_fd(fd)
+    except (OSError, UnicodeError):
+        return None
+    finally:
+        os.close(fd)
+
+
 def _atomic_write_600(path: Path, data: str) -> bool:
     """Unchecked implementation used behind the typed filesystem boundary."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        if path.exists() and path.read_text() == data:
-            path.chmod(0o600)
-            return False
-    except (OSError, UnicodeError):
-        pass
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    opened = _open_regular_nofollow(path)
+    if opened is not None:
+        fd, metadata = opened
+        try:
+            unchanged = _read_utf8_fd(fd) == data
+            if unchanged:
+                current = path.lstat()
+                if _trusted_regular_file(current) and _same_inode(metadata, current):
+                    os.fchmod(fd, 0o600)
+                    current = path.lstat()
+                    opened_after = os.fstat(fd)
+                    if (
+                        _trusted_regular_file(current)
+                        and _trusted_regular_file(opened_after)
+                        and _same_inode(metadata, current)
+                        and _same_inode(metadata, opened_after)
+                    ):
+                        return False
+        except (OSError, UnicodeError):
+            pass
+        finally:
+            os.close(fd)
+    raw_fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    fd: int | None = raw_fd
     tmp = Path(tmp_name)
     try:
+        assert fd is not None
         os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
+        _write_utf8_fd(fd, data)
+        os.fsync(fd)
+        closing_fd, fd = fd, None
+        os.close(closing_fd)
         tmp.replace(path)
         dirfd = os.open(path.parent, os.O_RDONLY)
         try:
@@ -100,9 +301,13 @@ def _atomic_write_600(path: Path, data: str) -> bool:
         return True
     finally:
         try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
+            if fd is not None:
+                os.close(fd)
+        finally:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def render(config: object, jobs: Iterable[object], known_hosts: Path) -> str:
@@ -112,7 +317,7 @@ def render(config: object, jobs: Iterable[object], known_hosts: Path) -> str:
     netid = getattr(getattr(config, "identity"), "netid")
     id_lines = [f"    IdentityFile {identity}", "    IdentitiesOnly yes"] if identity else []
     lines = [
-        "# Managed by hpc-alloc v2 — regenerated; do not edit.",
+        _MANAGED_HEADER,
         "",
     ]
     clusters = getattr(config, "clusters")
@@ -167,6 +372,7 @@ def sync_managed_config(
     managed_path: Path,
     lock_path: Path,
     known_hosts: Path,
+    before_replace: Callable[[ComputeMasterRetirement], None] | None = None,
 ) -> bool:
     """Project current config/state into one serialized managed SSH file.
 
@@ -200,7 +406,16 @@ def sync_managed_config(
 
         config = Config.load(config_path)
         jobs = repository.list_jobs(include_final=False)
-        return atomic_write_600(managed_path, render(config, jobs, known_hosts))
+        replacement = render(config, jobs, known_hosts)
+        # Only the contents of the validated regular-file inode at the managed
+        # path may authorize retirement.  A symlink (including one whose
+        # target looks exactly like our projection) is untrusted input and is
+        # repaired by the atomic replacement below without being followed.
+        previous = _read_regular_nofollow(managed_path) or ""
+        retirement = _compute_master_retirement(previous, replacement)
+        if retirement is not None and before_replace is not None:
+            before_replace(retirement)
+        return atomic_write_600(managed_path, replacement)
     finally:
         try:
             fcntl.flock(fd, fcntl.LOCK_UN)

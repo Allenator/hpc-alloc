@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -13,7 +15,17 @@ from hpc_alloc.errors import (
     LocalToolUnavailable,
     TransportLost,
 )
-from hpc_alloc.ssh import AuthMode, RetryPolicy, SshTransport, ssh_argv
+from hpc_alloc.ssh import (
+    AuthMode,
+    RetryPolicy,
+    SshTransport,
+    retire_compute_masters,
+    ssh_argv,
+)
+from hpc_alloc.ssh_config import (
+    ComputeMasterRetirement,
+    compute_control_socket_prefix,
+)
 
 
 def completed(argv: object, rc: int = 0, stdout: str = "", stderr: str = ""):
@@ -25,6 +37,208 @@ class SshTransportTests(unittest.TestCase):
         config = SimpleNamespace(clusters={"grace": object()}, ssh=SimpleNamespace(identity_file=None))
         paths = SimpleNamespace(ssh_dir=root)
         return SshTransport(config, paths, runner=runner)
+
+    def control_socket(self, root: Path, suffix: str) -> Path:
+        return root / f"{compute_control_socket_prefix('grace')}{suffix}"
+
+    def test_retirement_protects_shared_retained_path_and_closes_obsolete_once(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shared = self.control_socket(root, "shared")
+            obsolete = self.control_socket(root, "obsolete")
+            paths = {
+                "hpc-grace.dev": shared,
+                "hpc-grace.research": shared,
+                "hpc-grace.old": obsolete,
+            }
+            closes: list[Path] = []
+
+            def runner(argv: list[str], **_kwargs: object):
+                if "-G" in argv:
+                    alias = argv[-1]
+                    return completed(
+                        argv,
+                        stdout=f"host {alias}\ncontrolpath {paths[alias]}\n",
+                    )
+                path = Path(argv[argv.index("-S") + 1])
+                closes.append(path)
+                return completed(argv)
+
+            with patch.object(
+                Path,
+                "lstat",
+                return_value=SimpleNamespace(
+                    st_mode=stat.S_IFSOCK,
+                    st_uid=os.geteuid(),
+                ),
+            ):
+                warnings = retire_compute_masters(
+                    ComputeMasterRetirement(
+                        (
+                            "hpc-grace.dev",
+                            "hpc-grace.old",
+                            "hpc-grace.research",
+                        ),
+                        ("hpc-grace.research",),
+                    ),
+                    ssh_dir=root,
+                    runner=runner,
+                )
+
+            self.assertEqual(warnings, ())
+            self.assertEqual(closes, [obsolete])
+
+    def test_retirement_deduplicates_two_aliases_for_one_obsolete_socket(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            obsolete = self.control_socket(root, "obsolete")
+            closes = 0
+
+            def runner(argv: list[str], **_kwargs: object):
+                nonlocal closes
+                if "-G" in argv:
+                    return completed(argv, stdout=f"controlpath {obsolete}\n")
+                self.assertIn(argv[-1], {"hpc-grace.dev", "hpc-grace.research"})
+                closes += 1
+                return completed(argv)
+
+            with patch.object(
+                Path,
+                "lstat",
+                return_value=SimpleNamespace(
+                    st_mode=stat.S_IFSOCK,
+                    st_uid=os.geteuid(),
+                ),
+            ):
+                warnings = retire_compute_masters(
+                    ComputeMasterRetirement(
+                        ("hpc-grace.dev", "hpc-grace.research"), ()
+                    ),
+                    ssh_dir=root,
+                    runner=runner,
+                )
+
+            self.assertEqual(warnings, ())
+            self.assertEqual(closes, 1)
+
+    def test_retirement_warns_and_skips_a_non_socket_managed_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / f"{compute_control_socket_prefix('grace')}regular"
+            path.write_text("not a socket")
+            close_calls = 0
+
+            def runner(argv: list[str], **_kwargs: object):
+                nonlocal close_calls
+                if "-G" in argv:
+                    return completed(argv, stdout=f"controlpath {path}\n")
+                close_calls += 1
+                return completed(argv)
+
+            warnings = retire_compute_masters(
+                ComputeMasterRetirement(("hpc-grace.dev",), ()),
+                ssh_dir=root,
+                runner=runner,
+            )
+
+            self.assertEqual(close_calls, 0)
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("non-socket", warnings[0])
+
+    def test_retirement_warns_when_exit_fails_and_socket_remains(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = self.control_socket(root, "stubborn")
+
+            def runner(argv: list[str], **_kwargs: object):
+                if "-G" in argv:
+                    return completed(argv, stdout=f"controlpath {path}\n")
+                return completed(argv, 255, stderr="master refused exit")
+
+            with patch.object(
+                Path,
+                "lstat",
+                return_value=SimpleNamespace(
+                    st_mode=stat.S_IFSOCK,
+                    st_uid=os.geteuid(),
+                ),
+            ):
+                warnings = retire_compute_masters(
+                    ComputeMasterRetirement(("hpc-grace.dev",), ()),
+                    ssh_dir=root,
+                    runner=runner,
+                )
+
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("master refused exit", warnings[0])
+
+    def test_retirement_refuses_a_socket_owned_by_another_user(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = self.control_socket(root, "foreign")
+            close_calls = 0
+
+            def runner(argv: list[str], **_kwargs: object):
+                nonlocal close_calls
+                if "-G" in argv:
+                    return completed(argv, stdout=f"controlpath {path}\n")
+                close_calls += 1
+                return completed(argv)
+
+            with patch.object(
+                Path,
+                "lstat",
+                return_value=SimpleNamespace(
+                    st_mode=stat.S_IFSOCK,
+                    st_uid=os.geteuid() + 1,
+                ),
+            ):
+                warnings = retire_compute_masters(
+                    ComputeMasterRetirement(("hpc-grace.dev",), ()),
+                    ssh_dir=root,
+                    runner=runner,
+                )
+
+            self.assertEqual(close_calls, 0)
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("not owned by the current user", warnings[0])
+
+    def test_retirement_aborts_when_a_retained_path_cannot_be_protected(self) -> None:
+        calls: list[list[str]] = []
+
+        def runner(argv: list[str], **_kwargs: object):
+            calls.append(argv)
+            return completed(argv, 255, stderr="invalid old projection")
+
+        with tempfile.TemporaryDirectory() as directory:
+            warnings = retire_compute_masters(
+                ComputeMasterRetirement(
+                    ("hpc-grace.dev", "hpc-grace.research"),
+                    ("hpc-grace.research",),
+                ),
+                ssh_dir=Path(directory),
+                runner=runner,
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(warnings), 2)
+        self.assertIn("could not inspect", warnings[0])
+        self.assertIn("could not be protected", warnings[1])
+
+    def test_retirement_propagates_keyboard_interrupt(self) -> None:
+        def runner(_argv: list[str], **_kwargs: object):
+            raise KeyboardInterrupt
+
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(
+            KeyboardInterrupt
+        ):
+            retire_compute_masters(
+                ComputeMasterRetirement(("hpc-grace.dev",), ()),
+                ssh_dir=Path(directory),
+                runner=runner,
+            )
 
     def test_ssh_argv_sets_batch_mode_explicitly_for_both_policies(self) -> None:
         self.assertEqual(
