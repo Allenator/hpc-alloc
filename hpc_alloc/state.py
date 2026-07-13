@@ -472,7 +472,7 @@ class StateRepository:
             except sqlite3.Error:
                 pass
             raise StateInvalid(f"state database operation failed: {exc}", path=self.path) from exc
-        except Exception:
+        except BaseException:
             try:
                 connection.execute("ROLLBACK")
             except sqlite3.Error:

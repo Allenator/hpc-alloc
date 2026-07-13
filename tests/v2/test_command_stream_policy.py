@@ -32,6 +32,7 @@ from hpc_alloc.monitor import JobMonitor
 from hpc_alloc.ownership import format_tag, slurm_job_name
 from hpc_alloc.paths import AppPaths
 from hpc_alloc.slurm import AccountingRecord, QueueRow
+from hpc_alloc.ssh_config import sync_managed_config
 from hpc_alloc.state import StateRepository
 from hpc_alloc.streaming import FollowOutcome, LogFollower
 
@@ -373,6 +374,130 @@ host = "grace.example.edu"
             projection = paths.managed_ssh_config.read_text()
             self.assertIn("Host hpc-grace.dev", projection)
             self.assertIn("    HostName node01", projection)
+
+    def test_terminal_checkpoint_leases_real_alias_before_log_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = AppPaths.for_home(Path(directory))
+            repository = StateRepository(
+                paths.state_db,
+                machine_id_factory=lambda: "deadbeef1234",
+            ).initialize()
+            owner = repository.get_or_create_machine_id("laptop")
+            job_name = slurm_job_name("allocation", self.operation_id)
+            comment = format_tag(
+                owner,
+                self.operation_id,
+                "laptop",
+                "allocation",
+                "dev",
+            )
+            repository.reserve_submission(
+                operation_id=self.operation_id,
+                cluster="grace",
+                logical_name="dev",
+                kind=JobKind.ALLOCATION,
+                owner_id=owner,
+                slurm_job_name=job_name,
+                slurm_comment=comment,
+                resources={"partition": "day", "time": "1:00:00", "cpus": 2},
+            )
+            repository.acknowledge_submission(self.operation_id, "12345")
+            source = repository.update_job(
+                self.operation_id,
+                phase=JobPhase.ACTIVE,
+                ever_started=True,
+                current_node="node01",
+                last_node="node01",
+            )
+            paths.config_dir.mkdir(parents=True, exist_ok=True)
+            paths.config_file.write_text(
+                """\
+[identity]
+netid = "ab1234"
+[defaults]
+cluster = "grace"
+[cluster.grace]
+host = "grace.example.edu"
+"""
+            )
+            sync_managed_config(
+                config_path=paths.config_file,
+                repository=repository,
+                managed_path=paths.managed_ssh_config,
+                lock_path=paths.ssh_config_lock,
+                known_hosts=paths.known_hosts,
+            )
+            prior_projection = paths.managed_ssh_config.read_bytes()
+            failure = SchedulerUnavailable("identical post-candidate log failure")
+
+            class Client:
+                def observe(inner_self, ref: object) -> QueueRow:
+                    if ref != source.ref:
+                        raise AssertionError("unexpected job identity")
+                    return QueueRow(
+                        job_id="12345",
+                        state="COMPLETED",
+                        node="node01",
+                        reason="",
+                        time_left="0:00",
+                        partition="day",
+                        name=job_name,
+                        submitted_at="2026-07-10T12:00:00",
+                        comment=comment,
+                    )
+
+                def final(
+                    inner_self,
+                    ref: object,
+                    *,
+                    attempts: tuple[float, ...],
+                ) -> None:
+                    if ref != source.ref or attempts != (0,):
+                        raise AssertionError("unexpected accounting lookup")
+                    return None
+
+                def log_size(inner_self, _path: str):
+                    raise failure
+
+            client = Client()
+            follower = LogFollower(
+                client,  # type: ignore[arg-type]
+                source.ref,  # type: ignore[arg-type]
+                ".hpc-alloc/allocation.log",
+                tracker=JobMonitor.tracker(source),
+                output=io.BytesIO(),
+            )
+
+            with (
+                patch("hpc_alloc.ssh.retire_compute_masters") as retire,
+                self.assertRaises(SchedulerUnavailable) as raised,
+            ):
+                _follow_with_reconciliation(
+                    ctx=SimpleNamespace(
+                        state=repository,
+                        config=Config.load(paths.config_file),
+                    ),
+                    paths=paths,
+                    client=client,
+                    job=source,
+                    follower=follower,
+                )
+
+            self.assertIs(raised.exception, failure)
+            durable = repository.get_job(self.operation_id)
+            self.assertEqual(durable.phase, JobPhase.TERMINAL_CANDIDATE)
+            self.assertTrue(durable.ever_started)
+            self.assertIsNone(durable.current_node)
+            self.assertEqual(durable.last_node, "node01")
+            self.assertEqual(
+                durable.evidence_provenance,
+                EvidenceProvenance.QUEUE_TERMINAL,
+            )
+            self.assertEqual(
+                paths.managed_ssh_config.read_bytes(),
+                prior_projection,
+            )
+            retire.assert_not_called()
 
     def test_revision_retry_checkpoints_terminal_row_before_accounting_error(self) -> None:
         source = self.job(phase=JobPhase.QUEUED, updated_at="v1")

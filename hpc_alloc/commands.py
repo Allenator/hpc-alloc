@@ -32,6 +32,7 @@ from .errors import (
     IdentityMismatch,
     LifecycleRevisionConflict,
     LocalToolUnavailable,
+    RecordNotFound,
     StateConflict,
     TransportLost,
 )
@@ -1127,6 +1128,12 @@ def _submit_job(
                         operation_id,
                         "submission was interrupted before remote dispatch",
                     )
+                except RecordNotFound:
+                    # An interrupt inside the reservation transaction rolls
+                    # both rows back.  With the operation guard still held,
+                    # absence proves there is no local recovery intent and no
+                    # remote dispatch to reconcile.
+                    pass
                 except BaseException:
                     try:
                         _best_effort_info(_submission_recovery_guidance(operation_id))

@@ -350,6 +350,22 @@ class StateRepositoryTests(unittest.TestCase):
         )
         self.assertGreater(updated.updated_at, active.updated_at)
 
+    def test_transaction_rolls_back_keyboard_interrupt_without_replacing_it(self) -> None:
+        interrupt = KeyboardInterrupt()
+        before = self.repo.get_machine()
+        assert before is not None
+
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            with self.repo.transaction() as connection:
+                connection.execute(
+                    "UPDATE machine SET hostname = ? WHERE singleton = 1",
+                    ("interrupted-host",),
+                )
+                raise interrupt
+
+        self.assertIs(raised.exception, interrupt)
+        self.assertEqual(self.repo.get_machine(), before)
+
     def test_non_database_bytes_raise_typed_state_error(self) -> None:
         path = Path(self.directory.name) / "corrupt.db"
         path.write_bytes(b"\xffnot-a-sqlite-database")

@@ -13,7 +13,8 @@ from unittest.mock import Mock, patch
 
 from hpc_alloc.config import Config
 from hpc_alloc.errors import ConfigInvalid
-from hpc_alloc.models import JobKind
+from hpc_alloc.models import EvidenceProvenance, JobKind, JobPhase
+from hpc_alloc.ownership import format_tag, slurm_job_name
 from hpc_alloc.ssh_config import (
     ComputeMasterRetirement,
     allocation_alias,
@@ -22,6 +23,7 @@ from hpc_alloc.ssh_config import (
     render,
     sync_managed_config,
 )
+from hpc_alloc.state import StateRepository
 
 
 def stanza(text: str, alias: str) -> str:
@@ -250,6 +252,30 @@ class SshConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigInvalid, "unsafe compute-node"):
             render(config, [job], Path("/tmp/known-hosts"))
 
+    def test_render_never_consumes_a_lease_for_cancellation_evidence(self) -> None:
+        config = SimpleNamespace(
+            identity=SimpleNamespace(netid="ab1234"),
+            ssh=SimpleNamespace(identity_file=None),
+            clusters={"grace": SimpleNamespace(host="grace.example.edu")},
+        )
+        job = SimpleNamespace(
+            cluster="grace",
+            logical_name="dev",
+            kind=JobKind.ALLOCATION,
+            phase=JobPhase.TERMINAL_CANDIDATE,
+            current_node=None,
+            evidence_provenance=EvidenceProvenance.CANCELLATION,
+        )
+
+        text = render(
+            config,
+            [job],
+            Path("/tmp/known-hosts"),
+            leased_nodes={"hpc-grace.dev": "node01"},
+        )
+
+        self.assertNotIn("Host hpc-grace.dev", text)
+
     @unittest.skipUnless(shutil.which("ssh"), "OpenSSH client is unavailable")
     def test_openssh_effective_config_keeps_cross_cluster_keys_and_masters_distinct(self) -> None:
         config = SimpleNamespace(
@@ -392,6 +418,440 @@ class SshConfigTests(unittest.TestCase):
             self.assertIn("HostName node02", replacement)
             self.assertNotIn("HostName node01", replacement)
 
+    def test_scheduler_terminal_candidates_lease_only_the_trusted_prior_node(
+        self,
+    ) -> None:
+        for provenance in (
+            EvidenceProvenance.QUEUE_TERMINAL,
+            EvidenceProvenance.ABSENT,
+            EvidenceProvenance.ID_REUSED,
+        ):
+            with self.subTest(provenance=provenance), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                config_path = root / "config.toml"
+                managed_path = root / "ssh_config"
+                lock_path = root / ".ssh_config.lock"
+                config_path.write_text(
+                    '[identity]\nnetid = "ab1234"\n[cluster.grace]\n'
+                    'host = "grace.example.edu"\n'
+                )
+                job = SimpleNamespace(
+                    operation_id="a" * 32,
+                    cluster="grace",
+                    logical_name="dev",
+                    kind=JobKind.ALLOCATION,
+                    phase=JobPhase.ACTIVE,
+                    current_node="node01",
+                    last_node="node01",
+                    evidence_provenance=None,
+                )
+                repository = SimpleNamespace(
+                    list_jobs=lambda **_kwargs: [job],
+                    list_operations=lambda: [],
+                )
+                sync_managed_config(
+                    config_path=config_path,
+                    repository=repository,
+                    managed_path=managed_path,
+                    lock_path=lock_path,
+                    known_hosts=root / "known_hosts",
+                )
+                job.phase = JobPhase.TERMINAL_CANDIDATE
+                job.current_node = None
+                job.last_node = "node99"
+                job.evidence_provenance = provenance
+                observed: list[ComputeMasterRetirement] = []
+
+                changed = sync_managed_config(
+                    config_path=config_path,
+                    repository=repository,
+                    managed_path=managed_path,
+                    lock_path=lock_path,
+                    known_hosts=root / "known_hosts",
+                    before_replace=observed.append,
+                )
+
+                self.assertFalse(changed)
+                self.assertEqual(observed, [])
+                candidate = managed_path.read_text()
+                self.assertIn("Host hpc-grace.dev", candidate)
+                self.assertIn("HostName node01", candidate)
+                self.assertNotIn("HostName node99", candidate)
+                self.assertIsNone(job.current_node)
+
+    def test_non_leased_phases_retire_the_prior_alias(self) -> None:
+        cases = {
+            "cancellation": (
+                JobPhase.TERMINAL_CANDIDATE,
+                EvidenceProvenance.CANCELLATION,
+            ),
+            "requeue": (JobPhase.REQUEUEING, None),
+            "final": (JobPhase.FINAL, None),
+        }
+        for label, (phase, provenance) in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                config_path = root / "config.toml"
+                managed_path = root / "ssh_config"
+                lock_path = root / ".ssh_config.lock"
+                config_path.write_text(
+                    '[identity]\nnetid = "ab1234"\n[cluster.grace]\n'
+                    'host = "grace.example.edu"\n'
+                )
+                job = SimpleNamespace(
+                    operation_id="a" * 32,
+                    cluster="grace",
+                    logical_name="dev",
+                    kind=JobKind.ALLOCATION,
+                    phase=JobPhase.ACTIVE,
+                    current_node="node01",
+                    evidence_provenance=None,
+                )
+                repository = SimpleNamespace(
+                    list_jobs=lambda **_kwargs: [job],
+                    list_operations=lambda: [],
+                )
+                sync_managed_config(
+                    config_path=config_path,
+                    repository=repository,
+                    managed_path=managed_path,
+                    lock_path=lock_path,
+                    known_hosts=root / "known_hosts",
+                )
+                job.phase = phase
+                job.current_node = None
+                job.evidence_provenance = provenance
+                observed: list[ComputeMasterRetirement] = []
+
+                changed = sync_managed_config(
+                    config_path=config_path,
+                    repository=repository,
+                    managed_path=managed_path,
+                    lock_path=lock_path,
+                    known_hosts=root / "known_hosts",
+                    before_replace=observed.append,
+                )
+
+                self.assertTrue(changed)
+                self.assertNotIn("Host hpc-grace.dev", managed_path.read_text())
+                self.assertEqual(
+                    observed,
+                    [ComputeMasterRetirement(("hpc-grace.dev",), ())],
+                )
+
+    def test_resolved_cancel_overrides_retained_scheduler_candidate_evidence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.toml"
+            managed_path = root / "ssh_config"
+            lock_path = root / ".ssh_config.lock"
+            config_path.write_text(
+                '[identity]\nnetid = "ab1234"\n[cluster.grace]\n'
+                'host = "grace.example.edu"\n'
+            )
+            repository = StateRepository(
+                root / "state.db",
+                machine_id_factory=lambda: "deadbeef1234",
+            ).initialize()
+            owner = repository.get_or_create_machine_id("laptop")
+            operation_id = "a" * 32
+            repository.reserve_submission(
+                cluster="grace",
+                logical_name="dev",
+                kind=JobKind.ALLOCATION,
+                owner_id=owner,
+                slurm_job_name=slurm_job_name("allocation", operation_id),
+                slurm_comment=format_tag(
+                    owner,
+                    operation_id,
+                    "laptop",
+                    "allocation",
+                    "dev",
+                ),
+                operation_id=operation_id,
+            )
+            repository.acknowledge_submission(operation_id, "12345")
+            active = repository.update_job(
+                operation_id,
+                phase=JobPhase.ACTIVE,
+                ever_started=True,
+                current_node="node01",
+                last_node="node01",
+            )
+            sync_managed_config(
+                config_path=config_path,
+                repository=repository,
+                managed_path=managed_path,
+                lock_path=lock_path,
+                known_hosts=root / "known_hosts",
+            )
+            cancel_id = "c" * 32
+            repository.begin_cancel(operation_id, operation_id=cancel_id)
+            repository.mark_cancel_dispatching(
+                cancel_id,
+                expected_target_updated_at=active.updated_at,
+                phase=JobPhase.TERMINAL_CANDIDATE,
+                ever_started=True,
+                current_node=None,
+                last_node="node01",
+                observation_epoch=1,
+                evidence_provenance=EvidenceProvenance.QUEUE_TERMINAL,
+                evidence_detail="exact queue row was terminal-looking",
+            )
+
+            # Preflight scheduler uncertainty alone keeps the old endpoint.
+            self.assertFalse(
+                sync_managed_config(
+                    config_path=config_path,
+                    repository=repository,
+                    managed_path=managed_path,
+                    lock_path=lock_path,
+                    known_hosts=root / "known_hosts",
+                )
+            )
+            self.assertIn("Host hpc-grace.dev", managed_path.read_text())
+
+            repository.resolve_cancel_departed(
+                cancel_id,
+                "cancellation request acknowledged",
+            )
+            stored = repository.get_job(operation_id)
+            self.assertEqual(stored.phase, JobPhase.TERMINAL_CANDIDATE)
+            self.assertEqual(
+                stored.evidence_provenance,
+                EvidenceProvenance.QUEUE_TERMINAL,
+            )
+            observed: list[ComputeMasterRetirement] = []
+
+            changed = sync_managed_config(
+                config_path=config_path,
+                repository=repository,
+                managed_path=managed_path,
+                lock_path=lock_path,
+                known_hosts=root / "known_hosts",
+                before_replace=observed.append,
+            )
+
+            self.assertTrue(changed)
+            self.assertNotIn("Host hpc-grace.dev", managed_path.read_text())
+            self.assertEqual(
+                observed,
+                [ComputeMasterRetirement(("hpc-grace.dev",), ())],
+            )
+
+            # Fresh live authority still projects normally despite the
+            # durable, successfully resolved cancellation operation.
+            repository.update_job(
+                operation_id,
+                phase=JobPhase.ACTIVE,
+                ever_started=True,
+                current_node="node02",
+                last_node="node02",
+                evidence_provenance=None,
+                evidence_detail=None,
+            )
+            sync_managed_config(
+                config_path=config_path,
+                repository=repository,
+                managed_path=managed_path,
+                lock_path=lock_path,
+                known_hosts=root / "known_hosts",
+            )
+            active_projection = managed_path.read_text()
+            self.assertIn("Host hpc-grace.dev", active_projection)
+            self.assertIn("HostName node02", active_projection)
+
+    def test_terminal_candidate_without_a_prior_alias_cannot_resurrect_one(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.toml"
+            managed_path = root / "ssh_config"
+            config_path.write_text(
+                '[identity]\nnetid = "ab1234"\n[cluster.grace]\n'
+                'host = "grace.example.edu"\n'
+            )
+            job = SimpleNamespace(
+                operation_id="a" * 32,
+                cluster="grace",
+                logical_name="dev",
+                kind=JobKind.ALLOCATION,
+                phase=JobPhase.TERMINAL_CANDIDATE,
+                current_node=None,
+                last_node="node99",
+                evidence_provenance=EvidenceProvenance.ABSENT,
+            )
+            list_operations = Mock(
+                side_effect=AssertionError("candidate has no trusted prior alias")
+            )
+            repository = SimpleNamespace(
+                list_jobs=lambda **_kwargs: [job],
+                list_operations=list_operations,
+            )
+
+            sync_managed_config(
+                config_path=config_path,
+                repository=repository,
+                managed_path=managed_path,
+                lock_path=root / ".ssh_config.lock",
+                known_hosts=root / "known_hosts",
+            )
+
+            self.assertNotIn("Host hpc-grace.dev", managed_path.read_text())
+            self.assertIsNone(job.current_node)
+            list_operations.assert_not_called()
+
+    def test_group_writable_prior_cannot_authorize_a_candidate_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.toml"
+            managed_path = root / "ssh_config"
+            lock_path = root / ".ssh_config.lock"
+            config_path.write_text(
+                '[identity]\nnetid = "ab1234"\n[cluster.grace]\n'
+                'host = "grace.example.edu"\n'
+            )
+            job = SimpleNamespace(
+                operation_id="a" * 32,
+                cluster="grace",
+                logical_name="dev",
+                kind=JobKind.ALLOCATION,
+                phase=JobPhase.ACTIVE,
+                current_node="node01",
+                evidence_provenance=None,
+            )
+            repository = SimpleNamespace(
+                list_jobs=lambda **_kwargs: [job],
+                list_operations=lambda: [],
+            )
+            sync_managed_config(
+                config_path=config_path,
+                repository=repository,
+                managed_path=managed_path,
+                lock_path=lock_path,
+                known_hosts=root / "known_hosts",
+            )
+            managed_path.chmod(0o660)
+            job.phase = JobPhase.TERMINAL_CANDIDATE
+            job.current_node = None
+            job.evidence_provenance = EvidenceProvenance.ABSENT
+            observed: list[ComputeMasterRetirement] = []
+
+            changed = sync_managed_config(
+                config_path=config_path,
+                repository=repository,
+                managed_path=managed_path,
+                lock_path=lock_path,
+                known_hosts=root / "known_hosts",
+                before_replace=observed.append,
+            )
+
+            self.assertTrue(changed)
+            self.assertEqual(observed, [])
+            self.assertNotIn("Host hpc-grace.dev", managed_path.read_text())
+            self.assertEqual(managed_path.stat().st_mode & 0o777, 0o600)
+
+    def test_group_writable_equal_projection_is_atomically_replaced(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.toml"
+            managed_path = root / "ssh_config"
+            lock_path = root / ".ssh_config.lock"
+            config_path.write_text(
+                '[identity]\nnetid = "ab1234"\n[cluster.grace]\n'
+                'host = "grace.example.edu"\n'
+            )
+            job = SimpleNamespace(
+                cluster="grace",
+                logical_name="dev",
+                kind=JobKind.ALLOCATION,
+                phase=JobPhase.ACTIVE,
+                current_node="node01",
+            )
+            repository = SimpleNamespace(list_jobs=lambda **_kwargs: [job])
+            sync_managed_config(
+                config_path=config_path,
+                repository=repository,
+                managed_path=managed_path,
+                lock_path=lock_path,
+                known_hosts=root / "known_hosts",
+            )
+            managed_path.chmod(0o660)
+            prior_inode = managed_path.stat().st_ino
+            held_fd = os.open(managed_path, os.O_WRONLY)
+            try:
+                changed = sync_managed_config(
+                    config_path=config_path,
+                    repository=repository,
+                    managed_path=managed_path,
+                    lock_path=lock_path,
+                    known_hosts=root / "known_hosts",
+                )
+                replacement = managed_path.read_bytes()
+                os.lseek(held_fd, 0, os.SEEK_SET)
+                os.write(held_fd, b"untrusted old descriptor")
+            finally:
+                os.close(held_fd)
+
+            self.assertTrue(changed)
+            self.assertNotEqual(managed_path.stat().st_ino, prior_inode)
+            self.assertEqual(managed_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(managed_path.read_bytes(), replacement)
+
+    def test_candidate_lease_rebuilds_directives_from_current_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.toml"
+            managed_path = root / "ssh_config"
+            lock_path = root / ".ssh_config.lock"
+            config_path.write_text(
+                '[identity]\nnetid = "ab1234"\n[cluster.grace]\n'
+                'host = "grace.example.edu"\n'
+            )
+            job = SimpleNamespace(
+                operation_id="a" * 32,
+                cluster="grace",
+                logical_name="dev",
+                kind=JobKind.ALLOCATION,
+                phase=JobPhase.ACTIVE,
+                current_node="node01",
+                evidence_provenance=None,
+            )
+            repository = SimpleNamespace(
+                list_jobs=lambda **_kwargs: [job],
+                list_operations=lambda: [],
+            )
+            sync_managed_config(
+                config_path=config_path,
+                repository=repository,
+                managed_path=managed_path,
+                lock_path=lock_path,
+                known_hosts=root / "known_hosts",
+            )
+            job.phase = JobPhase.TERMINAL_CANDIDATE
+            job.current_node = None
+            job.evidence_provenance = EvidenceProvenance.ABSENT
+            config_path.write_text(
+                '[identity]\nnetid = "cd5678"\n[cluster.grace]\n'
+                'host = "new-login.example.edu"\n'
+            )
+
+            sync_managed_config(
+                config_path=config_path,
+                repository=repository,
+                managed_path=managed_path,
+                lock_path=lock_path,
+                known_hosts=root / "known_hosts",
+            )
+
+            replacement = managed_path.read_text()
+            candidate = stanza(replacement, "hpc-grace.dev")
+            self.assertIn("HostName node01", candidate)
+            self.assertIn("User cd5678", candidate)
+            self.assertNotIn("User ab1234", candidate)
+            self.assertIn("HostName new-login.example.edu", replacement)
+
     def test_projection_replaces_equal_content_symlink_without_touching_target(
         self,
     ) -> None:
@@ -443,7 +903,7 @@ class SshConfigTests(unittest.TestCase):
             )
             self.assertEqual(observed, [])
 
-    def test_projection_does_not_authorize_retirement_from_symlink_target(
+    def test_symlink_target_authorizes_neither_candidate_lease_nor_retirement(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -456,13 +916,22 @@ class SshConfigTests(unittest.TestCase):
             )
             jobs = [
                 SimpleNamespace(
+                    operation_id="a" * 32,
                     cluster="grace",
                     logical_name="dev",
                     kind=JobKind.ALLOCATION,
+                    phase=JobPhase.ACTIVE,
                     current_node="node01",
+                    evidence_provenance=None,
                 )
             ]
-            repository = SimpleNamespace(list_jobs=lambda **_kwargs: list(jobs))
+            list_operations = Mock(
+                side_effect=AssertionError("symlink cannot authorize a lease")
+            )
+            repository = SimpleNamespace(
+                list_jobs=lambda **_kwargs: list(jobs),
+                list_operations=list_operations,
+            )
             old_path = root / "old-projection"
             sync_managed_config(
                 config_path=config_path,
@@ -479,7 +948,9 @@ class SshConfigTests(unittest.TestCase):
                 target.stat().st_mode,
                 target.stat().st_ino,
             )
-            jobs.clear()
+            jobs[0].phase = JobPhase.TERMINAL_CANDIDATE
+            jobs[0].current_node = None
+            jobs[0].evidence_provenance = EvidenceProvenance.ABSENT
             managed_path = root / "ssh_config"
             managed_path.symlink_to(target)
             observed: list[ComputeMasterRetirement] = []
@@ -501,6 +972,7 @@ class SshConfigTests(unittest.TestCase):
                 target_before,
             )
             self.assertEqual(observed, [])
+            list_operations.assert_not_called()
 
     def test_equal_content_atomic_write_replaces_hardlink_without_chmodding_peer(
         self,
@@ -529,7 +1001,7 @@ class SshConfigTests(unittest.TestCase):
                 target_before,
             )
 
-    def test_projection_does_not_authorize_retirement_from_hardlinked_file(
+    def test_hardlinked_file_authorizes_neither_candidate_lease_nor_retirement(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -542,13 +1014,22 @@ class SshConfigTests(unittest.TestCase):
             )
             jobs = [
                 SimpleNamespace(
+                    operation_id="a" * 32,
                     cluster="grace",
                     logical_name="dev",
                     kind=JobKind.ALLOCATION,
+                    phase=JobPhase.ACTIVE,
                     current_node="node01",
+                    evidence_provenance=None,
                 )
             ]
-            repository = SimpleNamespace(list_jobs=lambda **_kwargs: list(jobs))
+            list_operations = Mock(
+                side_effect=AssertionError("hardlink cannot authorize a lease")
+            )
+            repository = SimpleNamespace(
+                list_jobs=lambda **_kwargs: list(jobs),
+                list_operations=list_operations,
+            )
             old_path = root / "old-projection"
             sync_managed_config(
                 config_path=config_path,
@@ -565,7 +1046,9 @@ class SshConfigTests(unittest.TestCase):
             )
             managed_path = root / "ssh_config"
             os.link(old_path, managed_path)
-            jobs.clear()
+            jobs[0].phase = JobPhase.TERMINAL_CANDIDATE
+            jobs[0].current_node = None
+            jobs[0].evidence_provenance = EvidenceProvenance.ABSENT
             observed: list[ComputeMasterRetirement] = []
 
             changed = sync_managed_config(
@@ -589,6 +1072,7 @@ class SshConfigTests(unittest.TestCase):
                 target_before,
             )
             self.assertEqual(observed, [])
+            list_operations.assert_not_called()
 
     def test_projection_plan_preserves_unchanged_alias_that_may_share_a_master(
         self,
@@ -651,13 +1135,22 @@ class SshConfigTests(unittest.TestCase):
                 'host = "grace.example.edu"\n'
             )
             job = SimpleNamespace(
+                operation_id="a" * 32,
                 cluster="grace",
                 logical_name="dev",
                 kind=JobKind.ALLOCATION,
+                phase=JobPhase.ACTIVE,
                 current_node="node01",
+                evidence_provenance=None,
             )
             jobs = [job]
-            repository = SimpleNamespace(list_jobs=lambda **_kwargs: list(jobs))
+            list_operations = Mock(
+                side_effect=AssertionError("tampered stanza cannot authorize a lease")
+            )
+            repository = SimpleNamespace(
+                list_jobs=lambda **_kwargs: list(jobs),
+                list_operations=list_operations,
+            )
             sync_managed_config(
                 config_path=config_path,
                 repository=repository,
@@ -679,7 +1172,9 @@ class SshConfigTests(unittest.TestCase):
                 ),
                 "duplicate-stanza": f"{valid}\n{compute_block}\n",
             }
-            jobs.clear()
+            job.phase = JobPhase.TERMINAL_CANDIDATE
+            job.current_node = None
+            job.evidence_provenance = EvidenceProvenance.ABSENT
 
             for label, prior in cases.items():
                 with self.subTest(label=label):
@@ -695,6 +1190,7 @@ class SshConfigTests(unittest.TestCase):
                     )
                     self.assertEqual(observed, [])
                     self.assertNotIn("Host hpc-grace.dev", managed_path.read_text())
+            list_operations.assert_not_called()
 
     def test_retirement_interrupt_leaves_old_projection_for_retry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

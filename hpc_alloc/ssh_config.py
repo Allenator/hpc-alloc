@@ -9,11 +9,17 @@ import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 from .errors import ConfigInvalid
 from .locking import configuration_scope_lock
-from .models import JobKind
+from .models import (
+    EvidenceProvenance,
+    JobKind,
+    JobPhase,
+    OperationKind,
+    OperationPhase,
+)
 
 
 INCLUDE_LINE = "Include ~/.config/hpc-alloc/ssh_config"
@@ -24,6 +30,13 @@ _MANAGED_ALLOCATION_ALIAS = re.compile(
     r"([A-Za-z0-9][A-Za-z0-9_-]{0,62})\Z"
 )
 _CONTROL_CLUSTER_DIGEST_LENGTH = 8
+_SCHEDULER_TERMINAL_PROVENANCE = frozenset(
+    {
+        EvidenceProvenance.QUEUE_TERMINAL,
+        EvidenceProvenance.ABSENT,
+        EvidenceProvenance.ID_REUSED,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +169,88 @@ def _managed_compute_stanzas(text: str) -> dict[str, str]:
     return stanzas
 
 
+def _managed_stanza_hostname(stanza: str) -> str:
+    """Return the HostName from a stanza already validated above."""
+
+    prefix = "    HostName "
+    return next(
+        line.removeprefix(prefix)
+        for line in stanza.splitlines()
+        if line.startswith(prefix)
+    )
+
+
+def _is_scheduler_terminal_candidate(job: object) -> bool:
+    try:
+        phase = JobPhase(getattr(job, "phase", None))
+        provenance = EvidenceProvenance(
+            getattr(job, "evidence_provenance", None)
+        )
+    except (TypeError, ValueError):
+        return False
+    return (
+        phase == JobPhase.TERMINAL_CANDIDATE
+        and provenance in _SCHEDULER_TERMINAL_PROVENANCE
+    )
+
+
+def _resolved_cancel_targets(
+    repository: object, candidate_ids: frozenset[str]
+) -> frozenset[str]:
+    """Return jobs whose durable cancellation operation completed successfully."""
+
+    list_operations = getattr(repository, "list_operations", None)
+    if list_operations is None:
+        # Lightweight projection fakes predate the operation query.  The real
+        # repository always exposes it, so production never relies on this
+        # compatibility path.
+        return frozenset()
+    targets: set[str] = set()
+    for operation in list_operations():
+        try:
+            kind = OperationKind(getattr(operation, "kind", None))
+            phase = OperationPhase(getattr(operation, "phase", None))
+        except (TypeError, ValueError):
+            continue
+        target = getattr(operation, "target_job_operation_id", None)
+        if (
+            kind == OperationKind.CANCEL
+            and phase == OperationPhase.RESOLVED
+            and target in candidate_ids
+        ):
+            targets.add(target)
+    return frozenset(targets)
+
+
+def _terminal_candidate_leases(
+    jobs: Iterable[object],
+    prior_stanzas: Mapping[str, str],
+    resolved_cancel_targets: frozenset[str],
+) -> dict[str, str]:
+    """Lease trusted prior nodes across scheduler-derived terminal uncertainty."""
+
+    leases: dict[str, str] = {}
+    for job in jobs:
+        if getattr(job, "kind", None) != JobKind.ALLOCATION:
+            continue
+        name = getattr(job, "logical_name", None)
+        cluster = getattr(job, "cluster", None)
+        if not name or not cluster:
+            continue
+        if not _is_scheduler_terminal_candidate(job):
+            continue
+        # A successful cancellation is durable operator intent.  It
+        # conservatively suppresses this and later candidate leases for the
+        # same job, while a later ACTIVE row still projects its current node.
+        if getattr(job, "operation_id", None) in resolved_cancel_targets:
+            continue
+        alias = allocation_alias(cluster, name)
+        prior_stanza = prior_stanzas.get(alias)
+        if prior_stanza is not None:
+            leases[alias] = _managed_stanza_hostname(prior_stanza)
+    return leases
+
+
 def _compute_master_retirement(
     previous: str, replacement: str
 ) -> ComputeMasterRetirement | None:
@@ -247,8 +342,13 @@ def _read_regular_nofollow(path: Path) -> str | None:
     opened = _open_regular_nofollow(path)
     if opened is None:
         return None
-    fd, _metadata = opened
+    fd, metadata = opened
     try:
+        # Group/world-writable content is not authoritative input even when
+        # the inode itself is otherwise app-owned.  atomic_write_600 still
+        # repairs or replaces it through the separately validated descriptor.
+        if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            return None
         return _read_utf8_fd(fd)
     except (OSError, UnicodeError):
         return None
@@ -265,7 +365,13 @@ def _atomic_write_600(path: Path, data: str) -> bool:
         fd, metadata = opened
         try:
             unchanged = _read_utf8_fd(fd) == data
-            if unchanged:
+            # Never repair an inode that was writable by another principal
+            # in place.  An attacker may retain a writable descriptor after
+            # chmod; atomic replacement detaches that descriptor from the
+            # managed pathname before the new content becomes authoritative.
+            if unchanged and not (
+                metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
                 current = path.lstat()
                 if _trusted_regular_file(current) and _same_inode(metadata, current):
                     os.fchmod(fd, 0o600)
@@ -310,7 +416,13 @@ def _atomic_write_600(path: Path, data: str) -> bool:
                 pass
 
 
-def render(config: object, jobs: Iterable[object], known_hosts: Path) -> str:
+def render(
+    config: object,
+    jobs: Iterable[object],
+    known_hosts: Path,
+    *,
+    leased_nodes: Mapping[str, str] | None = None,
+) -> str:
     """Render login aliases and currently-active allocation aliases."""
 
     identity = getattr(getattr(config, "ssh"), "identity_file", None)
@@ -320,6 +432,7 @@ def render(config: object, jobs: Iterable[object], known_hosts: Path) -> str:
         _MANAGED_HEADER,
         "",
     ]
+    leased_nodes = leased_nodes or {}
     clusters = getattr(config, "clusters")
     for name, cluster in sorted(clusters.items()):
         lines += [
@@ -340,14 +453,32 @@ def render(config: object, jobs: Iterable[object], known_hosts: Path) -> str:
             continue
         if getattr(job, "cluster", None) not in clusters:
             continue
-        node = getattr(job, "current_node", None)
         name = getattr(job, "logical_name", None)
-        if not node or not name:
+        if not name:
+            continue
+        alias = allocation_alias(job.cluster, name)
+        node = getattr(job, "current_node", None)
+        try:
+            phase = JobPhase(getattr(job, "phase", None))
+        except (TypeError, ValueError):
+            phase = None
+        if phase == JobPhase.TERMINAL_CANDIDATE:
+            # A terminal candidate may keep only the endpoint established by
+            # the prior trusted projection.  State nodes (including last_node)
+            # cannot resurrect or retarget an alias during uncertainty.
+            node = (
+                leased_nodes.get(alias)
+                if _is_scheduler_terminal_candidate(job)
+                else None
+            )
+        elif phase == JobPhase.FINAL:
+            node = None
+        if not node:
             continue
         if _COMPUTE_NODE.fullmatch(node) is None:
             raise ConfigInvalid(f"unsafe compute-node name in state: {node!r}")
         lines += [
-            f"Host {allocation_alias(job.cluster, name)}",
+            f"Host {alias}",
             f"    HostName {node}",
             f"    HostKeyAlias {compute_host_key_alias(job.cluster, node)}",
             f"    User {netid}",
@@ -388,13 +519,40 @@ def sync_managed_config(
         from .config import Config
 
         config = Config.load(config_path)
-        jobs = repository.list_jobs(include_final=False)
-        replacement = render(config, jobs, known_hosts)
+        jobs = list(repository.list_jobs(include_final=False))
         # Only the contents of the validated regular-file inode at the managed
-        # path may authorize retirement.  A symlink (including one whose
-        # target looks exactly like our projection) is untrusted input and is
-        # repaired by the atomic replacement below without being followed.
+        # path may authorize a terminal-candidate node lease or retirement. A
+        # symlink (including one whose target looks exactly like our
+        # projection) is untrusted input and is repaired by the atomic
+        # replacement below without being followed.
         previous = _read_regular_nofollow(managed_path) or ""
+        prior_stanzas = _managed_compute_stanzas(previous)
+        candidate_ids = frozenset(
+            operation_id
+            for job in jobs
+            if getattr(job, "kind", None) == JobKind.ALLOCATION
+            and getattr(job, "cluster", None) in config.clusters
+            and getattr(job, "logical_name", None)
+            and _is_scheduler_terminal_candidate(job)
+            and allocation_alias(job.cluster, job.logical_name) in prior_stanzas
+            and (operation_id := getattr(job, "operation_id", None))
+        )
+        resolved_cancel_targets = (
+            _resolved_cancel_targets(repository, candidate_ids)
+            if candidate_ids
+            else frozenset()
+        )
+        leased_nodes = _terminal_candidate_leases(
+            jobs,
+            prior_stanzas,
+            resolved_cancel_targets,
+        )
+        replacement = render(
+            config,
+            jobs,
+            known_hosts,
+            leased_nodes=leased_nodes,
+        )
         retirement = _compute_master_retirement(previous, replacement)
         if retirement is not None and before_replace is not None:
             before_replace(retirement)

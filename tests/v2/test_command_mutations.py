@@ -3,7 +3,7 @@ from __future__ import annotations
 import io
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -28,6 +28,7 @@ from hpc_alloc.errors import (
     StateConflict,
     TransportLost,
 )
+from hpc_alloc.locking import operation_scope_lock
 from hpc_alloc.models import (
     EvidenceProvenance,
     FinalSource,
@@ -1428,6 +1429,103 @@ host = "secondary.example.edu"
         self.assertIn(f"`hpc-alloc recover {OPERATION_ID}`", stderr.getvalue())
         transport_script.assert_complete()
         client_script.assert_complete()
+
+    def assert_reservation_interrupt_rolls_back(self, point: str) -> None:
+        transport, transport_script = self.transport()
+        client_script = StrictScript([ExpectedCall("prepare_submission")])
+        real_transaction = self.repository.transaction
+        interrupt = KeyboardInterrupt()
+        interrupt_pending = True
+        self.assertIn(point, {"before-jobs", "after-jobs", "after-operations"})
+
+        class InterruptingConnection:
+            def __init__(self, connection: object) -> None:
+                self.connection = connection
+
+            def execute(
+                self, statement: str, *args: object, **kwargs: object
+            ) -> object:
+                nonlocal interrupt_pending
+                is_jobs_insert = "INSERT INTO jobs(" in statement
+                is_operations_insert = "INSERT INTO operations(" in statement
+                if point == "before-jobs" and is_jobs_insert:
+                    interrupt_pending = False
+                    raise interrupt
+                cursor = self.connection.execute(statement, *args, **kwargs)
+                if (
+                    point == "after-jobs" and is_jobs_insert
+                ) or (
+                    point == "after-operations" and is_operations_insert
+                ):
+                    interrupt_pending = False
+                    raise interrupt
+                return cursor
+
+        @contextmanager
+        def interrupting_transaction():
+            with real_transaction() as connection:
+                if interrupt_pending:
+                    yield InterruptingConnection(connection)
+                else:
+                    yield connection
+
+        stderr = io.StringIO()
+        with (
+            patch.object(
+                self.repository,
+                "transaction",
+                side_effect=interrupting_transaction,
+            ),
+            redirect_stderr(stderr),
+            self.assertRaises(KeyboardInterrupt) as raised,
+        ):
+            self.invoke(transport, StrictProxy(client_script))
+
+        self.assertIs(raised.exception, interrupt)
+        self.assertEqual(self.repository.list_operations(), [])
+        self.assertEqual(self.repository.list_jobs(), [])
+        self.assertEqual(client_script.count("submit"), 0)
+        self.assertNotIn("may have committed", stderr.getvalue())
+        self.assertNotIn("do not resubmit", stderr.getvalue())
+        self.assertNotIn("hpc-alloc recover", stderr.getvalue())
+
+        with operation_scope_lock(
+            self.paths.operation_locks_dir,
+            OPERATION_ID,
+            blocking=False,
+        ):
+            pass
+
+        replacement_id = "b" * 32
+        owner = self.repository.get_or_create_machine_id("laptop")
+        replacement = self.repository.reserve_submission(
+            operation_id=replacement_id,
+            cluster="grace",
+            logical_name="dev",
+            kind=JobKind.ALLOCATION,
+            owner_id=owner,
+            slurm_job_name=slurm_job_name("allocation", replacement_id),
+            slurm_comment=format_tag(
+                owner,
+                replacement_id,
+                "laptop",
+                "allocation",
+                "dev",
+            ),
+            resources=self.resources,
+        )
+        self.assertEqual(replacement.phase, OperationPhase.PREPARED)
+        transport_script.assert_complete()
+        client_script.assert_complete()
+
+    def test_interrupt_before_reservation_first_insert_rolls_back(self) -> None:
+        self.assert_reservation_interrupt_rolls_back("before-jobs")
+
+    def test_interrupt_after_reservation_job_insert_rolls_back(self) -> None:
+        self.assert_reservation_interrupt_rolls_back("after-jobs")
+
+    def test_interrupt_after_reservation_operation_insert_rolls_back(self) -> None:
+        self.assert_reservation_interrupt_rolls_back("after-operations")
 
     def test_interrupt_after_reservation_commit_fails_before_dispatch(self) -> None:
         transport, transport_script = self.transport()
