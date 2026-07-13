@@ -55,6 +55,17 @@ class StateRepositoryTests(unittest.TestCase):
             operation_id=operation_id,
         )
 
+    def test_get_or_create_machine_id_rejects_corrupt_stored_identity(self) -> None:
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                "UPDATE machine SET machine_id = ? WHERE singleton = 1",
+                ("invalid machine ID",),
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(StateInvalid, "machine record is malformed"):
+            self.repo.get_or_create_machine_id("renamed-laptop")
+
     def test_ambiguous_submission_remains_durable_and_blocks_duplicate(self) -> None:
         prepared = self.reserve()
         self.assertEqual(prepared.phase, OperationPhase.PREPARED)

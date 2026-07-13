@@ -421,12 +421,13 @@ class StateRepository:
             )
             row = connection.execute("SELECT * FROM machine WHERE singleton = 1").fetchone()
             assert row is not None
-            if row["hostname"] != hostname:
+            machine = self._machine_from_row(row)
+            if machine.hostname != hostname:
                 connection.execute(
                     "UPDATE machine SET hostname = ?, updated_at = ? WHERE singleton = 1",
                     (hostname, now),
                 )
-        return str(row["machine_id"])
+        return machine.machine_id
 
     def reserve_submission(
         self,

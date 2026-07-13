@@ -218,6 +218,22 @@ class CliIntegrationTests(unittest.TestCase):
                 result = self.run_cli(*arguments)
                 self.assertEqual(result.returncode, 1)
                 self.assertNotIn("Traceback", result.stderr)
+                self.assertNotIn("sbatch", result.stdout)
+        self.assertFalse((self.home / ".config" / "hpc-alloc" / "state.db").exists())
+
+    def test_explicitly_empty_walltime_is_rejected_without_remote_work(self) -> None:
+        self.write_config()
+        for arguments in (
+            ("up", "--dry-run", "--time", ""),
+            ("run", "--dry-run", "--time", "", "--", "true"),
+        ):
+            with self.subTest(arguments=arguments):
+                result = self.run_cli(*arguments)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("[command line].time", result.stderr)
+                self.assertIn("non-empty string", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertNotIn("sbatch", result.stdout)
         self.assertFalse((self.home / ".config" / "hpc-alloc" / "state.db").exists())
 
     def test_all_documented_duration_forms_are_accepted_as_cli_overrides(self) -> None:

@@ -14,6 +14,7 @@ from hpc_alloc.config import Config
 from hpc_alloc.errors import (
     AuthRequired,
     HostKeyChanged,
+    ProtocolViolation,
     SchedulerUnavailable,
     StateConflict,
 )
@@ -28,6 +29,7 @@ from hpc_alloc.monitor import JobMonitor
 from hpc_alloc.ownership import format_tag, slurm_job_name
 from hpc_alloc.paths import AppPaths
 from hpc_alloc.slurm import AccountingRecord, LogSizeResult, QueueRow
+from hpc_alloc.ssh import AuthMode
 from hpc_alloc.state import StateRepository
 
 
@@ -239,17 +241,40 @@ host = "grace.example.edu"
                     f"hpc-alloc recover {UNRESOLVED_ID}", str(raised.exception)
                 )
 
-    def test_historical_why_uses_persisted_verdict_after_numeric_id_reuse(self) -> None:
+    def test_historical_why_enriches_persisted_accounting_without_queue_observation(
+        self,
+    ) -> None:
+        historical = self.state.get_job(HISTORICAL_ID)
+        assert historical.ref is not None
+        record = AccountingRecord(
+            job_id="12345",
+            state="COMPLETED",
+            exit_code="0:0",
+            job_name=slurm_job_name("allocation", HISTORICAL_ID),
+            comment=format_tag(
+                self.owner,
+                HISTORICAL_ID,
+                "laptop",
+                "allocation",
+                "historical",
+            ),
+            extra=("00:20:00", "01:00:00"),
+        )
+
         class Transport:
             def bootstrap(self, *_args: object, **_kwargs: object) -> None:
                 return None
 
         class Client:
+            def __init__(self) -> None:
+                self.final_calls: list[tuple[object, dict[str, object]]] = []
+
             def observe(self, *_args: object, **_kwargs: object) -> object:
                 raise AssertionError("historical why observed a recycled numeric ID")
 
-            def final(self, *_args: object, **_kwargs: object) -> object:
-                raise AssertionError("authoritative persisted accounting was re-queried")
+            def final(self, ref: object, **kwargs: object) -> AccountingRecord:
+                self.final_calls.append((ref, kwargs))
+                return record
 
             def tail_log(self, path: str, lines: int) -> bytes:
                 self.path = path
@@ -257,6 +282,176 @@ host = "grace.example.edu"
                 return b"historical output\n"
 
         client = Client()
+        stdout = io.StringIO()
+        with (
+            patch(
+                "hpc_alloc.commands._services",
+                return_value=(Transport(), client),
+            ),
+            patch(
+                "hpc_alloc.commands._sync_ssh_projection",
+                return_value=True,
+            ) as projection,
+            redirect_stdout(stdout),
+        ):
+            result = cmd_why(
+                SimpleNamespace(
+                    target=f"grace:@{HISTORICAL_ID}",
+                    cluster=None,
+                    json=True,
+                ),
+                ctx=self.context,
+                paths=self.paths,
+                entrypoint=Path("/tmp/hpc-alloc"),
+            )
+
+        self.assertEqual(result, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["terminal_state"], "COMPLETED")
+        self.assertEqual(payload["final_source"], FinalSource.ACCOUNTING.value)
+        self.assertEqual(payload["elapsed"], "00:20:00")
+        self.assertEqual(payload["timelimit"], "01:00:00")
+        self.assertIn(HISTORICAL_ID, client.path)
+        self.assertEqual(
+            client.final_calls,
+            [
+                (
+                    historical.ref,
+                    {
+                        "attempts": (0, 2, 2),
+                        "auth": AuthMode.NONINTERACTIVE,
+                        "extra_fields": ("Elapsed", "Timelimit"),
+                    },
+                )
+            ],
+        )
+        self.assertEqual(projection.call_count, 1)
+
+    def test_why_enriches_a_nonfinal_job_reconciled_directly_to_accounting(
+        self,
+    ) -> None:
+        queued = self.state.get_job(RECYCLED_ID)
+        assert queued.ref is not None
+        base_record = AccountingRecord(
+            job_id="54321",
+            state="FAILED",
+            exit_code="7:0",
+            job_name=slurm_job_name("allocation", RECYCLED_ID),
+            comment=format_tag(
+                self.owner,
+                RECYCLED_ID,
+                "laptop",
+                "allocation",
+                "recycled",
+            ),
+        )
+        timing_record = AccountingRecord(
+            job_id=base_record.job_id,
+            state=base_record.state,
+            exit_code=base_record.exit_code,
+            job_name=base_record.job_name,
+            comment=base_record.comment,
+            extra=("00:12:34", "01:00:00"),
+        )
+
+        class Transport:
+            def bootstrap(self, *_args: object, **_kwargs: object) -> None:
+                return None
+
+        class Client:
+            def __init__(self) -> None:
+                self.observations = 0
+                self.final_calls: list[tuple[object, dict[str, object]]] = []
+
+            def observe(self, *_args: object, **_kwargs: object) -> None:
+                self.observations += 1
+                return None
+
+            def final(self, ref: object, **kwargs: object) -> AccountingRecord:
+                self.final_calls.append((ref, kwargs))
+                return timing_record if kwargs.get("extra_fields") else base_record
+
+            def tail_log(self, _path: str, _lines: int) -> bytes:
+                return b"failed output\n"
+
+        client = Client()
+        stdout = io.StringIO()
+        with (
+            patch(
+                "hpc_alloc.commands._services",
+                return_value=(Transport(), client),
+            ),
+            patch(
+                "hpc_alloc.commands._sync_ssh_projection",
+                return_value=True,
+            ) as projection,
+            redirect_stdout(stdout),
+        ):
+            result = cmd_why(
+                SimpleNamespace(
+                    target=f"grace:@{RECYCLED_ID}",
+                    cluster=None,
+                    json=True,
+                ),
+                ctx=self.context,
+                paths=self.paths,
+                entrypoint=Path("/tmp/hpc-alloc"),
+            )
+
+        self.assertEqual(result, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["terminal_state"], "FAILED")
+        self.assertEqual(payload["exit_code"], "7:0")
+        self.assertEqual(payload["final_source"], FinalSource.ACCOUNTING.value)
+        self.assertEqual(payload["elapsed"], "00:12:34")
+        self.assertEqual(payload["timelimit"], "01:00:00")
+        stored = self.state.get_job(RECYCLED_ID)
+        self.assertEqual(stored.final_source, FinalSource.ACCOUNTING)
+        self.assertEqual(stored.terminal_state, "FAILED")
+        self.assertEqual(stored.exit_code, "7:0")
+        self.assertEqual(client.observations, 1)
+        self.assertEqual(len(client.final_calls), 2)
+        self.assertEqual(client.final_calls[0][0], queued.ref)
+        self.assertNotIn("extra_fields", client.final_calls[0][1])
+        self.assertEqual(
+            client.final_calls[1],
+            (
+                queued.ref,
+                {
+                    "attempts": (0, 2, 2),
+                    "auth": AuthMode.NONINTERACTIVE,
+                    "extra_fields": ("Elapsed", "Timelimit"),
+                },
+            ),
+        )
+        self.assertEqual(projection.call_count, 1)
+
+    def test_why_omits_stale_timing_that_disagrees_with_accounting_verdict(
+        self,
+    ) -> None:
+        record = AccountingRecord(
+            job_id="12345",
+            state="FAILED",
+            exit_code="7:0",
+            job_name=slurm_job_name("allocation", HISTORICAL_ID),
+            comment=format_tag(
+                self.owner,
+                HISTORICAL_ID,
+                "laptop",
+                "allocation",
+                "historical",
+            ),
+            extra=("00:12:34", "01:00:00"),
+        )
+
+        class Transport:
+            def bootstrap(self, *_args: object, **_kwargs: object) -> None:
+                return None
+
+        client = SimpleNamespace(
+            final=Mock(return_value=record),
+            tail_log=Mock(return_value=b"historical output\n"),
+        )
         stdout = io.StringIO()
         with (
             patch(
@@ -279,8 +474,143 @@ host = "grace.example.edu"
         self.assertEqual(result, 0)
         payload = json.loads(stdout.getvalue())
         self.assertEqual(payload["terminal_state"], "COMPLETED")
+        self.assertEqual(payload["exit_code"], "0:0")
         self.assertEqual(payload["final_source"], FinalSource.ACCOUNTING.value)
-        self.assertIn(HISTORICAL_ID, client.path)
+        self.assertNotIn("elapsed", payload)
+        self.assertNotIn("timelimit", payload)
+        stored = self.state.get_job(HISTORICAL_ID)
+        self.assertEqual(stored.terminal_state, "COMPLETED")
+        self.assertEqual(stored.exit_code, "0:0")
+
+    def test_why_preserves_access_failures_from_accounting_enrichment(self) -> None:
+        class Transport:
+            def bootstrap(self, *_args: object, **_kwargs: object) -> None:
+                return None
+
+        for failure in (
+            HostKeyChanged("SSH host-key verification failed for hpc-grace"),
+            AuthRequired("SSH authentication failed for hpc-grace"),
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                client = SimpleNamespace(
+                    final=Mock(side_effect=failure),
+                    tail_log=Mock(),
+                )
+                with (
+                    patch(
+                        "hpc_alloc.commands._services",
+                        return_value=(Transport(), client),
+                    ),
+                    self.assertRaises(type(failure)) as raised,
+                ):
+                    cmd_why(
+                        SimpleNamespace(
+                            target=f"grace:@{HISTORICAL_ID}",
+                            cluster=None,
+                            json=True,
+                        ),
+                        ctx=self.context,
+                        paths=self.paths,
+                        entrypoint=Path("/tmp/hpc-alloc"),
+                    )
+
+                self.assertIs(raised.exception, failure)
+                client.tail_log.assert_not_called()
+
+    def test_why_ignores_nonaccess_accounting_enrichment_failures(self) -> None:
+        class Transport:
+            def bootstrap(self, *_args: object, **_kwargs: object) -> None:
+                return None
+
+        for failure in (
+            SchedulerUnavailable("accounting is temporarily unavailable"),
+            ProtocolViolation("accounting returned malformed output"),
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                client = SimpleNamespace(
+                    final=Mock(side_effect=failure),
+                    tail_log=Mock(return_value=b"historical output\n"),
+                )
+                stdout = io.StringIO()
+                with (
+                    patch(
+                        "hpc_alloc.commands._services",
+                        return_value=(Transport(), client),
+                    ),
+                    redirect_stdout(stdout),
+                ):
+                    result = cmd_why(
+                        SimpleNamespace(
+                            target=f"grace:@{HISTORICAL_ID}",
+                            cluster=None,
+                            json=True,
+                        ),
+                        ctx=self.context,
+                        paths=self.paths,
+                        entrypoint=Path("/tmp/hpc-alloc"),
+                    )
+
+                self.assertEqual(result, 0)
+                payload = json.loads(stdout.getvalue())
+                self.assertEqual(payload["terminal_state"], "COMPLETED")
+                self.assertEqual(payload["exit_code"], "0:0")
+                self.assertEqual(
+                    payload["final_source"], FinalSource.ACCOUNTING.value
+                )
+                self.assertNotIn("elapsed", payload)
+                self.assertNotIn("timelimit", payload)
+                client.tail_log.assert_called_once()
+
+    def test_queue_final_enrichment_failure_still_propagates(self) -> None:
+        self.state.update_job(
+            RECYCLED_ID,
+            phase=JobPhase.FINAL,
+            terminal_state="COMPLETED",
+            evidence_provenance=EvidenceProvenance.ABSENT,
+            evidence_detail="job was absent from two exact queue observations",
+            final_source=FinalSource.CONFIRMED_QUEUE,
+        )
+        failure = SchedulerUnavailable("accounting is temporarily unavailable")
+
+        class Transport:
+            def bootstrap(self, *_args: object, **_kwargs: object) -> None:
+                return None
+
+        class Client:
+            def __init__(self) -> None:
+                self.final_calls = 0
+
+            def final(self, *_args: object, **_kwargs: object) -> None:
+                self.final_calls += 1
+                if self.final_calls == 1:
+                    return None
+                raise failure
+
+        client = Client()
+        with (
+            patch(
+                "hpc_alloc.commands._services",
+                return_value=(Transport(), client),
+            ),
+            self.assertRaises(SchedulerUnavailable) as raised,
+        ):
+            cmd_why(
+                SimpleNamespace(
+                    target=f"grace:@{RECYCLED_ID}",
+                    cluster=None,
+                    json=True,
+                ),
+                ctx=self.context,
+                paths=self.paths,
+                entrypoint=Path("/tmp/hpc-alloc"),
+            )
+
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(client.final_calls, 2)
+        self.assertEqual(
+            self.state.get_job(RECYCLED_ID).final_source,
+            FinalSource.CONFIRMED_QUEUE,
+        )
 
     def test_why_persists_delayed_accounting_before_rendering_json(self) -> None:
         self.state.update_job(
@@ -414,7 +744,10 @@ host = "grace.example.edu"
             AuthRequired("SSH authentication failed for hpc-grace"),
         ):
             with self.subTest(failure=type(failure).__name__):
-                client = SimpleNamespace(tail_log=Mock(side_effect=failure))
+                client = SimpleNamespace(
+                    final=Mock(return_value=None),
+                    tail_log=Mock(side_effect=failure),
+                )
                 with patch(
                     "hpc_alloc.commands._services",
                     return_value=(Transport(), client),
@@ -439,7 +772,10 @@ host = "grace.example.edu"
                 return None
 
         failure = SchedulerUnavailable("log tail is temporarily unavailable")
-        client = SimpleNamespace(tail_log=Mock(side_effect=failure))
+        client = SimpleNamespace(
+            final=Mock(return_value=None),
+            tail_log=Mock(side_effect=failure),
+        )
         stdout = io.StringIO()
         with (
             patch(

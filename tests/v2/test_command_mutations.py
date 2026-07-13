@@ -1315,6 +1315,58 @@ host = "secondary.example.edu"
         transport_script.assert_complete()
         client_script.assert_complete()
 
+    def test_interrupt_after_reservation_commit_fails_before_dispatch(self) -> None:
+        transport, transport_script = self.transport()
+        client_script = StrictScript([ExpectedCall("prepare_submission")])
+        reserve = self.repository.reserve_submission
+        interrupt = KeyboardInterrupt()
+
+        def commit_then_interrupt(**kwargs: object) -> object:
+            reserve(**kwargs)
+            raise interrupt
+
+        stderr = io.StringIO()
+        with (
+            patch.object(
+                self.repository,
+                "reserve_submission",
+                side_effect=commit_then_interrupt,
+            ),
+            redirect_stderr(stderr),
+            self.assertRaises(KeyboardInterrupt) as raised,
+        ):
+            self.invoke(transport, StrictProxy(client_script))
+
+        self.assertIs(raised.exception, interrupt)
+        operation = self.repository.get_operation(OPERATION_ID)
+        job = self.repository.get_job(OPERATION_ID)
+        self.assertEqual(operation.phase, OperationPhase.FAILED)
+        self.assertEqual(job.phase, JobPhase.FINAL)
+        self.assertEqual(job.terminal_state, "SUBMIT_FAILED")
+        self.assertEqual(job.final_source, FinalSource.SUBMIT_FAILED)
+        self.assertEqual(client_script.count("submit"), 0)
+        self.assertNotIn("may have committed", stderr.getvalue())
+        self.assertNotIn("do not resubmit", stderr.getvalue())
+        self.assertNotIn("hpc-alloc recover", stderr.getvalue())
+
+        replacement_id = "b" * 32
+        owner = self.repository.get_or_create_machine_id("laptop")
+        replacement = self.repository.reserve_submission(
+            operation_id=replacement_id,
+            cluster="grace",
+            logical_name="dev",
+            kind=JobKind.ALLOCATION,
+            owner_id=owner,
+            slurm_job_name=slurm_job_name("allocation", replacement_id),
+            slurm_comment=format_tag(
+                owner, replacement_id, "laptop", "allocation", "dev"
+            ),
+            resources=self.resources,
+        )
+        self.assertEqual(replacement.phase, OperationPhase.PREPARED)
+        transport_script.assert_complete()
+        client_script.assert_complete()
+
     def test_interrupt_between_submit_reply_and_acknowledgement_is_guarded(self) -> None:
         class InterruptingReply:
             accesses = 0

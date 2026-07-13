@@ -523,9 +523,9 @@ def _resource_values(args: Any, config: Config, cluster: str) -> dict[str, Any]:
         )
         if gpus:
             info(f"--gpus given without --partition; using {partition!r}")
-    walltime = getattr(args, "time", None) or config.resolve_option(
-        "time", cluster, fallback=DEFAULT_TIME
-    )
+    walltime = getattr(args, "time", None)
+    if walltime is None:
+        walltime = config.resolve_option("time", cluster, fallback=DEFAULT_TIME)
     cpus = _validate_positive(
         getattr(args, "cpus", None),
         "--cpus",
@@ -1042,19 +1042,22 @@ def _submit_job(
     # scheduler mutation boundary.  It cannot submit a job, so any failure
     # here leaves no local intent and no possible remote scheduler side effect.
     client.prepare_submission(spec, auth=AuthMode.NONINTERACTIVE)
-    ctx.state.reserve_submission(
-        operation_id=operation_id,
-        cluster=cluster,
-        logical_name=logical_name,
-        kind=kind,
-        owner_id=owner_id,
-        slurm_job_name=spec.job_name,
-        slurm_comment=spec.comment,
-        resources=resources,
-    )
     result: Any | None = None
-    dispatch_may_have_started = True
+    dispatch_may_have_started = False
     try:
+        ctx.state.reserve_submission(
+            operation_id=operation_id,
+            cluster=cluster,
+            logical_name=logical_name,
+            kind=kind,
+            owner_id=owner_id,
+            slurm_job_name=spec.job_name,
+            slurm_comment=spec.comment,
+            resources=resources,
+        )
+        # From this point onward an asynchronous interrupt is conservatively
+        # treated as possibly overlapping the one-shot scheduler mutation.
+        dispatch_may_have_started = True
         try:
             result = client.submit(spec, auth=AuthMode.NONINTERACTIVE)
         except (AuthRequired, HostKeyChanged) as exc:
@@ -1089,6 +1092,17 @@ def _submit_job(
             raise AmbiguousSubmission(guidance) from exc
     except KeyboardInterrupt:
         if not dispatch_may_have_started:
+            # The reservation may have committed immediately before the
+            # interrupt reached Python, but remote dispatch was not entered.
+            # Close it definitively when possible without replacing the
+            # interrupt if cleanup itself fails or was already committed.
+            try:
+                ctx.state.fail_submission(
+                    operation_id,
+                    "submission was interrupted before remote dispatch",
+                )
+            except BaseException:
+                pass
             raise
         # This outer guard covers the entire post-dispatch region, including
         # the narrow interval after submit returns and before acknowledgement
@@ -1870,10 +1884,6 @@ def cmd_why(
     else:
         transport, client = _services(ctx, paths, entrypoint, job.cluster)
         transport.bootstrap(job.cluster, AuthMode.INTERACTIVE_BOOTSTRAP)
-        queue_final_input = (
-            job.phase is JobPhase.FINAL
-            and job.final_source is FinalSource.CONFIRMED_QUEUE
-        )
         assessment = JobMonitor(client).assess(job, auth=AuthMode.NONINTERACTIVE).assessment
         job, assessment, _tracker = _persist_reconciled_assessment(
             ctx=ctx,
@@ -1884,20 +1894,30 @@ def cmd_why(
             monotonic_evidence=assessment,
         )
 
-        # A queue-derived final may predate slurmdbd.  Retry exact accounting,
-        # route any delayed record through the canonical lifecycle tracker, and
-        # make that stronger authority durable before constructing output.
+        # A queue-derived final may predate slurmdbd, while an accounting final
+        # can be durable without the output-only timing fields requested by
+        # why.  Retry exact accounting for either source, routing only delayed
+        # queue upgrades through the lifecycle tracker before rendering.
         accounting_record = None
-        if assessment.final and (
-            job.final_source is FinalSource.CONFIRMED_QUEUE
-            or (queue_final_input and job.final_source is FinalSource.ACCOUNTING)
-        ):
-            record = client.final(
-                job.ref,
-                attempts=(0, 2, 2),
-                auth=AuthMode.NONINTERACTIVE,
-                extra_fields=("Elapsed", "Timelimit"),
-            )
+        if assessment.final and job.final_source in {
+            FinalSource.CONFIRMED_QUEUE,
+            FinalSource.ACCOUNTING,
+        }:
+            try:
+                record = client.final(
+                    job.ref,
+                    attempts=(0, 2, 2),
+                    auth=AuthMode.NONINTERACTIVE,
+                    extra_fields=("Elapsed", "Timelimit"),
+                )
+            except (AuthRequired, HostKeyChanged):
+                raise
+            except HpcAllocError:
+                if job.final_source is not FinalSource.ACCOUNTING:
+                    raise
+                # The durable accounting verdict remains authoritative when
+                # this output-only timing lookup is temporarily unavailable.
+                record = None
             if record is not None:
                 if job.final_source is FinalSource.CONFIRMED_QUEUE:
                     tracker = JobMonitor.tracker(job)
