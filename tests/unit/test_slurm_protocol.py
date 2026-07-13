@@ -28,12 +28,24 @@ def framed(
     *,
     rc: int = 0,
     declared: int | None = None,
-    stderr: str = "",
+    stderr: bytes | str = "",
+    declared_stderr: int | None = None,
+    startup_stderr: str = "",
 ) -> RemoteResult:
     body = payload.encode() if isinstance(payload, str) else payload
+    stderr_body = stderr.encode() if isinstance(stderr, str) else stderr
     length = len(body) if declared is None else declared
-    header = f"\x1eHPC_ALLOC_V2_{NONCE} {rc} {length}\n".encode()
-    return RemoteResult(0, b"banner before command\n" + header + body, stderr)
+    stderr_length = (
+        len(stderr_body) if declared_stderr is None else declared_stderr
+    )
+    header = (
+        f"\x1eHPC_ALLOC_V2_{NONCE} {rc} {length} {stderr_length}\n".encode()
+    )
+    return RemoteResult(
+        0,
+        b"banner before command\n" + header + body + stderr_body,
+        startup_stderr,
+    )
 
 
 class FakeTransport:
@@ -92,8 +104,30 @@ class SlurmProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ProtocolViolation, "length mismatch"):
             client.log_size("log")
 
+    def test_declared_stderr_length_mismatch_is_not_a_valid_frame(self) -> None:
+        client, _transport = self.client(
+            [framed(b"MISSING", stderr="scheduler failed\n", declared_stderr=99)]
+        )
+        with self.assertRaisesRegex(ProtocolViolation, "length mismatch"):
+            client.log_size("log")
+
+    def test_malformed_dual_stream_header_is_rejected(self) -> None:
+        header = f"\x1eHPC_ALLOC_V2_{NONCE} 0 0\n".encode()
+        client, _transport = self.client(
+            [RemoteResult(0, b"banner\n" + header, "startup warning\n")]
+        )
+        with self.assertRaisesRegex(ProtocolViolation, "malformed frame header"):
+            client.log_size("log")
+
+    def test_missing_frame_preserves_transport_stderr_diagnostic(self) -> None:
+        client, _transport = self.client(
+            [RemoteResult(0, b"no frame", "login shell failed\n")]
+        )
+        with self.assertRaisesRegex(ProtocolViolation, "login shell failed"):
+            client.log_size("log")
+
     def test_payload_containing_exact_marker_is_not_reframed(self) -> None:
-        marker = b"\x1eHPC_ALLOC_V2_fixed 0 1\n"
+        marker = b"\x1eHPC_ALLOC_V2_fixed 0 1 0\n"
         payload = b"before" + marker + b"after\xff"
         client, _transport = self.client([framed(payload)])
         self.assertEqual(client.read_log_chunk("log", 0), payload)
@@ -129,9 +163,34 @@ class SlurmProtocolTests(unittest.TestCase):
         with self.assertRaises(SchedulerUnavailable):
             client.snapshot()
 
+    def test_only_framed_command_stderr_is_reported(self) -> None:
+        client, _transport = self.client(
+            [
+                framed(
+                    b"",
+                    rc=1,
+                    stderr=b"scheduler failed: \xff\n",
+                    startup_stderr="site startup warning\n",
+                )
+            ]
+        )
+        with self.assertRaises(SchedulerUnavailable) as raised:
+            client.snapshot()
+        self.assertIn("scheduler failed: \ufffd", str(raised.exception))
+        self.assertNotIn("site startup warning", str(raised.exception))
+
     def test_singleton_invalid_job_response_is_normalized_to_absence(self) -> None:
         error = "slurm_load_jobs error: Invalid job id specified\n"
-        client, transport = self.client([framed(b"", rc=1, stderr=error)])
+        client, transport = self.client(
+            [
+                framed(
+                    b"",
+                    rc=1,
+                    stderr=error,
+                    startup_stderr="site startup warning\n",
+                )
+            ]
+        )
         snapshot = client.snapshot(["123"])
         self.assertEqual(dict(snapshot.rows), {})
         self.assertIn(" -j 123 ", transport.calls[0][1])

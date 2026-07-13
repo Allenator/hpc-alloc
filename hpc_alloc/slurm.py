@@ -411,9 +411,10 @@ class SlurmClient:
     ) -> _FramedResult:
         """Run *command* and decode a random byte-length envelope.
 
-        The marker is emitted after the command has completed and its stdout is
-        captured.  Therefore anything printed before the remote command (for
-        example an SSH login banner) is outside the envelope and ignored.
+        The marker is emitted after the command has completed and its stdout
+        and stderr are captured.  Therefore anything printed before the remote
+        command (for example an SSH login banner) is outside the envelope and
+        ignored.
         """
 
         nonce = self._token(16)
@@ -426,20 +427,26 @@ class SlurmClient:
         marker_text = f"HPC_ALLOC_V2_{nonce}"
         marker = b"\x1e" + marker_text.encode("ascii") + b" "
         temp_template = "${TMPDIR:-/tmp}/hpc-alloc.XXXXXX"
-        emit_payload = (
-            'if [ "$n" -ge 0 ] 2>/dev/null; then cat "$tmp"; fi; '
+        emit_streams = (
+            'if [ "$n" -ge 0 ] 2>/dev/null && [ "$e" -ge 0 ] 2>/dev/null; '
+            'then cat "$tmp"; cat "$err"; fi; '
             if max_payload_bytes is None
-            else f'if [ "$n" -ge 0 ] 2>/dev/null && [ "$n" -le {max_payload_bytes} ]; '
-                 'then cat "$tmp"; fi; '
+            else f'if [ "$n" -ge 0 ] 2>/dev/null && [ "$e" -ge 0 ] 2>/dev/null '
+                 f'&& [ "$n" -le {max_payload_bytes} ]; '
+                 'then cat "$tmp"; cat "$err"; fi; '
         )
         wrapped = (
             f'tmp=$(mktemp "{temp_template}") || {{ '
-            f"printf '\\036{marker_text} 125 0\\n'; exit 0; }}; "
-            "trap 'rm -f \"$tmp\"' EXIT HUP INT TERM; "
-            f"( {command} ) >\"$tmp\"; rc=$?; "
+            f"printf '\\036{marker_text} 125 0 0\\n'; exit 0; }}; "
+            f'err=$(mktemp "{temp_template}") || {{ rm -f "$tmp"; '
+            f"printf '\\036{marker_text} 125 0 0\\n'; exit 0; }}; "
+            "trap 'rm -f \"$tmp\" \"$err\"' EXIT; "
+            "trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; "
+            f"( {command} ) >\"$tmp\" 2>\"$err\"; rc=$?; "
             "n=$(wc -c <\"$tmp\") || n=-1; "
-            f"printf '\\036{marker_text} %s %s\\n' \"$rc\" \"$n\"; "
-            + emit_payload
+            "e=$(wc -c <\"$err\") || e=-1; "
+            f"printf '\\036{marker_text} %s %s %s\\n' \"$rc\" \"$n\" \"$e\"; "
+            + emit_streams
             + "exit 0"
         )
         result = self.transport.run(
@@ -456,34 +463,48 @@ class SlurmClient:
         # reinterpreted as a second control header.
         start = raw.find(marker)
         if start < 0:
+            detail = result.stderr.strip()
             if result.returncode != 0:
                 raise RemoteCommandFailed(
-                    f"remote wrapper failed on {self.cluster}: {result.stderr.strip() or result.returncode}"
+                    f"remote wrapper failed on {self.cluster}: {detail or result.returncode}"
                 )
-            raise ProtocolViolation("remote reply did not contain its random frame marker")
+            message = "remote reply did not contain its random frame marker"
+            if detail:
+                message = f"{message}: {detail}"
+            raise ProtocolViolation(message)
         header_start = start + len(marker)
         header_end = raw.find(b"\n", header_start)
         if header_end < 0:
             raise ProtocolViolation("remote reply contained a truncated frame header")
         fields = raw[header_start:header_end].split()
-        if len(fields) != 2:
+        if len(fields) != 3:
             raise ProtocolViolation("remote reply contained a malformed frame header")
         try:
-            returncode, length = (int(field) for field in fields)
+            returncode, length, stderr_length = (int(field) for field in fields)
         except ValueError as exc:
             raise ProtocolViolation("remote reply frame status was not numeric") from exc
-        if returncode < 0 or returncode > 255 or length < 0:
+        if (
+            returncode < 0
+            or returncode > 255
+            or length < 0
+            or stderr_length < 0
+        ):
             raise ProtocolViolation("remote reply frame status was outside its valid range")
         if max_payload_bytes is not None and length > max_payload_bytes:
             raise ProtocolViolation(
                 f"remote reply exceeded payload limit ({length} > {max_payload_bytes})"
             )
-        payload = raw[header_end + 1 :]
-        if len(payload) != length:
+        streams = raw[header_end + 1 :]
+        expected_length = length + stderr_length
+        if len(streams) != expected_length:
             raise ProtocolViolation(
-                f"remote reply length mismatch (declared {length}, received {len(payload)})"
+                "remote reply length mismatch "
+                f"(declared {length} stdout and {stderr_length} stderr, "
+                f"received {len(streams)})"
             )
-        return _FramedResult(returncode, payload, result.stderr)
+        payload = streams[:length]
+        command_stderr = streams[length:].decode("utf-8", errors="replace")
+        return _FramedResult(returncode, payload, command_stderr)
 
     @staticmethod
     def _require_success(result: _FramedResult, operation: str) -> bytes:
@@ -1137,15 +1158,34 @@ class SlurmClient:
         if lines < 0:
             raise ValueError("line count cannot be negative")
         quoted = shlex.quote(path)
-        framed = self._framed(
+        status_template = "${TMPDIR:-/tmp}/hpc-alloc-tail.XXXXXX"
+        command = (
             f"[ -r {quoted} ] || exit 1; "
-            f"tail -n {lines} -- {quoted} | tail -c {MAX_LOG_CHUNK_BYTES}",
+            f'status=$(mktemp "{status_template}") || exit 125; '
+            "trap 'rm -f \"$status\"' 0; "
+            "trap 'exit 129' 1; trap 'exit 130' 2; trap 'exit 143' 15; "
+            "{ "
+            f"tail -n {lines} -- {quoted}; source_rc=$?; "
+            "printf '%s\\n' \"$source_rc\" >\"$status\"; "
+            f"}} | tail -c {MAX_LOG_CHUNK_BYTES}; sink_rc=$?; "
+            'IFS= read -r source_rc <"$status" || { '
+            "printf '%s\\n' 'log-tail source status was unavailable' >&2; exit 125; }; "
+            'case "$source_rc" in \'\'|*[!0-9]*) '
+            "printf '%s\\n' 'log-tail source status was invalid' >&2; exit 125;; esac; "
+            '[ "$source_rc" -le 255 ] 2>/dev/null || { '
+            "printf '%s\\n' 'log-tail source status was invalid' >&2; exit 125; }; "
+            '[ "$source_rc" -eq 0 ] || exit "$source_rc"; '
+            'exit "$sink_rc"'
+        )
+        framed = self._framed(
+            command,
             retry=RetryPolicy.SAFE_READ,
             auth=auth,
             max_payload_bytes=MAX_LOG_CHUNK_BYTES,
         )
         if framed.returncode != 0:
-            raise RemoteCommandFailed(f"cannot read log {path!r}: {framed.stderr.strip()}")
+            detail = framed.stderr.strip() or f"exit {framed.returncode}"
+            raise RemoteCommandFailed(f"cannot read log {path!r}: {detail}")
         if len(framed.payload) > MAX_LOG_CHUNK_BYTES:
             raise ProtocolViolation("bounded log tail exceeded its byte limit")
         return framed.payload

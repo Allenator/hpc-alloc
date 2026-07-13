@@ -138,9 +138,14 @@ def main(argv: Sequence[str] | None = None, *, entrypoint: Path | None = None) -
         return 130
     except BrokenPipeError:
         neutralize_stdout()
+        neutralize_stderr()
         # Context-aware streaming paths handle this themselves. This is only a
         # final no-traceback fallback for non-job payload commands.
         return 141
     except HpcAllocError as exc:
-        print(f"hpc-alloc: error: {exc}", file=sys.stderr, flush=True)
+        try:
+            print(f"hpc-alloc: error: {exc}", file=sys.stderr, flush=True)
+        except BrokenPipeError:
+            neutralize_stdout()
+            neutralize_stderr()
         return exc.exit_code

@@ -29,13 +29,27 @@ TIME_MARKER = f"__HPC_TIME_{NONCE}__"
 REMOTE_TIME = "2026-07-10T12:00:00"
 
 
-def framed(payload: bytes | str, *, command_rc: int = 0, stderr: str = "") -> RemoteResult:
+def framed(
+    payload: bytes | str,
+    *,
+    command_rc: int = 0,
+    stderr: bytes | str = "",
+    startup_stderr: str = "",
+) -> RemoteResult:
     """Build the exact byte envelope returned by ``SlurmClient._framed``."""
 
     body = payload.encode() if isinstance(payload, str) else payload
-    marker = f"\x1eHPC_ALLOC_V2_{NONCE} {command_rc} {len(body)}\n".encode()
+    stderr_body = stderr.encode() if isinstance(stderr, str) else stderr
+    marker = (
+        f"\x1eHPC_ALLOC_V2_{NONCE} {command_rc} {len(body)} "
+        f"{len(stderr_body)}\n"
+    ).encode()
     # Startup noise before the marker must never affect protocol parsing.
-    return RemoteResult(0, b"login banner\n" + marker + body, stderr)
+    return RemoteResult(
+        0,
+        b"login banner\n" + marker + body + stderr_body,
+        startup_stderr,
+    )
 
 
 def queue_payload(
@@ -413,6 +427,7 @@ class SlurmMutationTests(unittest.TestCase):
                     b"",
                     command_rc=46,
                     stderr="slurm_load_jobs error: Invalid job id specified\n",
+                    startup_stderr="site startup warning\n",
                 ),
             ),
         ):
