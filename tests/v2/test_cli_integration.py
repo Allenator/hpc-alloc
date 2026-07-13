@@ -75,6 +75,129 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertIn("hpc-alloc:v2:dryrun-", command.stdout)
         self.assertFalse((self.home / ".config" / "hpc-alloc" / "state.db").exists())
 
+    def test_run_dry_run_is_paste_ready_for_remote_home_and_chdir_paths(self) -> None:
+        self.write_config()
+        fake_bin = self.home / "fake-bin"
+        fake_bin.mkdir()
+        fake_sbatch = fake_bin / "sbatch"
+        fake_sbatch.write_text(
+            "#!/bin/sh\n"
+            ': "${SBATCH_ARGS_FILE:?}"\n'
+            'printf \'%s\\n\' "$@" > "$SBATCH_ARGS_FILE"\n',
+            encoding="utf-8",
+        )
+        fake_sbatch.chmod(0o755)
+
+        remote_home = self.home / "remote home's space"
+        remote_home.mkdir()
+        execution_cwd = self.home / "not-the-home-directory"
+        execution_cwd.mkdir()
+        absolute_chdir = self.home / "absolute project's directory"
+        cases = (
+            ("relative", "project dir/it's;$(touch INJECTED)"),
+            ("tilde", "~/tilde dir/it's;$(touch INJECTED)"),
+            ("home", "~"),
+            ("absolute", str(absolute_chdir)),
+        )
+
+        for label, chdir in cases:
+            with self.subTest(label=label):
+                rendered = self.run_cli(
+                    "run", "--dry-run", "--chdir", chdir, "--", "true"
+                )
+                self.assertEqual(rendered.returncode, 0, rendered.stderr)
+                self.assertIn('"${HOME:?}"/.hpc-alloc', rendered.stdout)
+                self.assertFalse(
+                    (self.home / ".config" / "hpc-alloc" / "state.db").exists()
+                )
+
+                arguments_file = self.home / f"sbatch-{label}.args"
+                execution = subprocess.run(
+                    rendered.stdout,
+                    shell=True,
+                    executable="/bin/sh",
+                    cwd=execution_cwd,
+                    env={
+                        **self.environment,
+                        "HOME": str(remote_home),
+                        "PATH": f"{fake_bin}:{self.environment['PATH']}",
+                        "SBATCH_ARGS_FILE": str(arguments_file),
+                    },
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(execution.returncode, 0, execution.stderr)
+                self.assertEqual(execution.stderr, "")
+                arguments = arguments_file.read_text(encoding="utf-8").splitlines()
+                output = arguments[arguments.index("--output") + 1]
+                self.assertEqual(Path(output).parent, remote_home / ".hpc-alloc")
+                self.assertTrue(Path(output).name.startswith("run-"), output)
+                self.assertTrue(Path(output).name.endswith(".log"), output)
+
+                actual_chdir = next(
+                    argument.removeprefix("--chdir=")
+                    for argument in arguments
+                    if argument.startswith("--chdir=")
+                )
+                if chdir == "~":
+                    expected_chdir = str(remote_home)
+                elif chdir.startswith("~/"):
+                    expected_chdir = f"{remote_home}/{chdir[2:]}"
+                elif Path(chdir).is_absolute():
+                    expected_chdir = chdir
+                else:
+                    expected_chdir = f"{remote_home}/{chdir}"
+                self.assertEqual(actual_chdir, expected_chdir)
+                self.assertFalse((execution_cwd / "INJECTED").exists())
+
+        self.assertTrue((remote_home / ".hpc-alloc").is_dir())
+        self.assertFalse((execution_cwd / ".hpc-alloc").exists())
+        self.assertFalse((self.home / ".config" / "hpc-alloc" / "state.db").exists())
+
+    def test_up_dry_run_uses_execution_time_home(self) -> None:
+        self.write_config()
+        fake_bin = self.home / "fake-bin"
+        fake_bin.mkdir()
+        fake_sbatch = fake_bin / "sbatch"
+        fake_sbatch.write_text(
+            "#!/bin/sh\n"
+            'printf \'%s\\n\' "$@" > "$SBATCH_ARGS_FILE"\n',
+            encoding="utf-8",
+        )
+        fake_sbatch.chmod(0o755)
+        remote_home = self.home / "different remote home"
+        remote_home.mkdir()
+        arguments_file = self.home / "allocation.args"
+
+        rendered = self.run_cli("up", "--dry-run", "--name", "pasteable")
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        self.assertFalse((self.home / ".config" / "hpc-alloc" / "state.db").exists())
+        execution = subprocess.run(
+            rendered.stdout,
+            shell=True,
+            executable="/bin/sh",
+            cwd=REPO,
+            env={
+                **self.environment,
+                "HOME": str(remote_home),
+                "PATH": f"{fake_bin}:{self.environment['PATH']}",
+                "SBATCH_ARGS_FILE": str(arguments_file),
+            },
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(execution.returncode, 0, execution.stderr)
+        arguments = arguments_file.read_text(encoding="utf-8").splitlines()
+        output = arguments[arguments.index("--output") + 1]
+        self.assertEqual(Path(output).parent, remote_home / ".hpc-alloc")
+        self.assertTrue(Path(output).name.startswith("alloc-"), output)
+        self.assertTrue((remote_home / ".hpc-alloc").is_dir())
+        self.assertFalse((self.home / ".config" / "hpc-alloc" / "state.db").exists())
+
     def test_invalid_cli_resources_fail_before_state_or_remote_work(self) -> None:
         self.write_config()
         for arguments in (
@@ -82,6 +205,14 @@ class CliIntegrationTests(unittest.TestCase):
             ("up", "--dry-run", "--time", "90 "),
             ("up", "--dry-run", "--time", "90;--constraint=evil"),
             ("run", "--dry-run", "--gpus", "h200:0", "--", "true"),
+            (
+                "run",
+                "--dry-run",
+                "--chdir",
+                "~someone/project",
+                "--",
+                "true",
+            ),
         ):
             with self.subTest(arguments=arguments):
                 result = self.run_cli(*arguments)

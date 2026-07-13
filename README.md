@@ -101,8 +101,10 @@ hpc-alloc cancel bouchet:123456
 hpc-alloc down bouchet:dev
 ```
 
-Use `up --dry-run` or `run --dry-run` to print the `sbatch` command without
-connecting or changing local state.
+Use `up --dry-run` or `run --dry-run` to print a paste-ready submission command
+without connecting or changing local state. The command keeps the remote home
+as `${HOME:?}`, so execute it in the target login shell; relative paths and
+`~/...` working directories then resolve beneath that account's home directory.
 
 ## Commands
 

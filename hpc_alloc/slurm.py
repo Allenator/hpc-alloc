@@ -60,6 +60,27 @@ _SACCT_BASE_FIELDS = (
 MAX_LOG_CHUNK_BYTES = 1024 * 1024
 _MAX_QUEUE_PAYLOAD_BYTES = 32 * 1024 * 1024
 _MAX_QUEUE_FIELD_BYTES = 64 * 1024
+_DRY_RUN_HOME = '"${HOME:?}"'
+
+
+def _dry_run_path(path: str) -> str:
+    """Quote a remote path for a paste-ready dry-run shell command.
+
+    SSH commands start in the remote user's home directory.  Keep that home
+    symbolic so the displayed command can be pasted into the target login
+    shell, while quoting the user-controlled suffix independently from the
+    expansion itself.
+    """
+
+    if PurePosixPath(path).is_absolute():
+        return shlex.quote(path)
+    if path == "~":
+        suffix = ""
+    elif path.startswith("~/"):
+        suffix = path[1:]
+    else:
+        suffix = f"/{path}"
+    return f"{_DRY_RUN_HOME}{shlex.quote(suffix)}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,9 +218,7 @@ class SubmissionSpec:
             "2>/dev/null || true)"
         )
 
-    def sbatch_command(self) -> str:
-        """Return only the one-shot scheduler mutation."""
-
+    def _sbatch_argv(self) -> list[str]:
         argv = [
             "sbatch",
             "--parsable",
@@ -222,12 +241,31 @@ class SubmissionSpec:
         if self.chdir:
             argv.append(f"--chdir={self.chdir}")
         argv += ["--wrap", self.wrap]
+        return argv
+
+    def sbatch_command(self) -> str:
+        """Return only the one-shot scheduler mutation."""
+
+        argv = self._sbatch_argv()
         return shlex.join(argv)
 
     def command(self) -> str:
-        """Render the full operation for dry-run display only."""
+        """Render a paste-ready operation for the target login shell."""
 
-        return f"{self.preparation_command()} && {self.sbatch_command()}"
+        log_directory = _dry_run_path(self.log_directory)
+        preparation = (
+            f"mkdir -p {log_directory} && "
+            f"(find {log_directory} -name '*.log' -mtime +30 -delete "
+            "2>/dev/null || true)"
+        )
+
+        argv = self._sbatch_argv()
+        rendered = [shlex.quote(argument) for argument in argv]
+        rendered[argv.index("--output") + 1] = _dry_run_path(self.logfile)
+        if self.chdir:
+            chdir_index = argv.index(f"--chdir={self.chdir}")
+            rendered[chdir_index] = f"--chdir={_dry_run_path(self.chdir)}"
+        return f"{preparation} && {' '.join(rendered)}"
 
 
 class CancellationInspectionStatus(StrEnum):

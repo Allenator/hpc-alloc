@@ -45,7 +45,7 @@ from .models import (
     OperationPhase,
 )
 from .ownership import normalize_host_label, parse_tag, slurm_job_name
-from .output import neutralize_stdout
+from .output import neutralize_stderr, neutralize_stdout
 from .paths import AppPaths
 from .selectors import SelectorKind, canonical_job_selector, parse_selector, unique_job
 from .ssh_config import (
@@ -73,6 +73,25 @@ def _is_job_id(value: str) -> bool:
 
 def info(message: str) -> None:
     print(f"hpc-alloc: {message}", file=sys.stderr, flush=True)
+
+
+def _pipe_aware_info(message: str) -> None:
+    """Emit a diagnostic and neutralize fd 2 if that write proves it broken."""
+
+    try:
+        info(message)
+    except BrokenPipeError:
+        neutralize_stderr()
+        raise
+
+
+def _best_effort_info(message: str) -> None:
+    """Emit a diagnostic without letting a broken output pipe replace policy."""
+
+    try:
+        _pipe_aware_info(message)
+    except BrokenPipeError:
+        pass
 
 
 def machine_host() -> str:
@@ -1082,9 +1101,6 @@ def _submit_job(
             except BaseException:
                 pass
         guidance = _submission_recovery_guidance(operation_id, job_id=job_id)
-        # Guidance must be visible before a journal failure can prevent the
-        # ambiguity marker from being written.
-        info(guidance)
         detail = "submission was interrupted after remote dispatch may have started"
         if job_id is not None:
             detail = (
@@ -1092,6 +1108,10 @@ def _submit_job(
                 "was interrupted"
             )
         _best_effort_mark_submission_ambiguous(ctx, operation_id, detail)
+        # Output is secondary to both recovery journaling and the interrupt.
+        # In particular, a closed stderr must not leave a PREPARED operation
+        # unmarked or replace KeyboardInterrupt with BrokenPipeError.
+        _best_effort_info(guidance)
         raise
 
 
@@ -1517,26 +1537,27 @@ def cmd_run(
     )
     if job is None:
         return 0
-    log_path = _job_log_path(job)
-    info(
-        f"submitted run {cluster}:{job.job_id} ({resources['partition']}, {resources['time']}; "
-        f"{canonical_job_selector(job)})"
-    )
-    if args.detach:
-        info(f"follow with `hpc-alloc logs {cluster}:{job.job_id} -f`")
-        return 0
-    follower = LogFollower(
-        client,
-        job.ref,
-        log_path,
-        tracker=EvidenceTracker(
-            ever_started=job.ever_started,
-            current_node=job.current_node,
-            last_node=job.last_node,
-        ),
-        info=info,
-    )
     try:
+        log_path = _job_log_path(job)
+        _pipe_aware_info(
+            f"submitted run {cluster}:{job.job_id} "
+            f"({resources['partition']}, {resources['time']}; "
+            f"{canonical_job_selector(job)})"
+        )
+        if args.detach:
+            _pipe_aware_info(f"follow with `hpc-alloc logs {cluster}:{job.job_id} -f`")
+            return 0
+        follower = LogFollower(
+            client,
+            job.ref,
+            log_path,
+            tracker=EvidenceTracker(
+                ever_started=job.ever_started,
+                current_node=job.current_node,
+                last_node=job.last_node,
+            ),
+            info=_pipe_aware_info,
+        )
         updated, assessment = _follow_with_reconciliation(
             ctx=ctx,
             paths=paths,
@@ -1546,18 +1567,29 @@ def cmd_run(
         )
     except BrokenPipeError:
         neutralize_stdout()
-        info(f"output pipe closed — cancelling foreground job {cluster}:{job.job_id}")
+        if args.detach:
+            return 141
         try:
             _cancel_record(ctx, client, job)
         except HpcAllocError as exc:
-            info(f"could not confirm cancellation: {exc}")
+            _best_effort_info(
+                f"output pipe closed — could not confirm cancellation of foreground "
+                f"job {cluster}:{job.job_id}: {exc}"
+            )
+        else:
+            _best_effort_info(
+                f"output pipe closed — cancelled foreground job {cluster}:{job.job_id}"
+            )
         return 141
     except KeyboardInterrupt:
-        info(f"cancelling foreground job {cluster}:{job.job_id}")
+        if args.detach:
+            raise
         try:
             _cancel_record(ctx, client, job)
         except HpcAllocError as exc:
-            info(f"could not confirm cancellation: {exc}")
+            _best_effort_info(f"could not confirm cancellation: {exc}")
+        else:
+            _best_effort_info(f"cancelled foreground job {cluster}:{job.job_id}")
         raise
     state = (assessment.terminal_state or "").split()[0].rstrip("+")
     if assessment.exit_code and ":" in assessment.exit_code:
@@ -1771,7 +1803,7 @@ def cmd_logs(
         job.ref,
         log_path,
         tracker=JobMonitor.tracker(job),
-        info=info,
+        info=_pipe_aware_info,
     )
     try:
         _updated, assessment = _follow_with_reconciliation(
@@ -1783,13 +1815,13 @@ def cmd_logs(
         )
     except BrokenPipeError:
         neutralize_stdout()
-        info(
+        _best_effort_info(
             f"output pipe closed — detached; job {job.cluster}:{job.job_id} continues "
             f"(reattach: hpc-alloc logs {job.cluster}:{job.job_id} -f)"
         )
         return 141
     except KeyboardInterrupt:
-        info(
+        _best_effort_info(
             f"detached; job {job.cluster}:{job.job_id} continues "
             f"(reattach: hpc-alloc logs {job.cluster}:{job.job_id} -f)"
         )

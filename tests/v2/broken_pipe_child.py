@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -76,7 +77,10 @@ def run_child(mode: str, marker: Path) -> int:
         ),
         patch("hpc_alloc.streaming.LogFollower", PipeFollower),
     ):
-        if mode == "run":
+        if os.environ.get("HPC_ALLOC_BROKEN_PIPE_GATE") == "1":
+            if sys.stdin.buffer.read(1) != b"1":
+                raise RuntimeError("broken-pipe child did not receive its start signal")
+        if mode.startswith("run"):
             return cmd_run(
                 SimpleNamespace(
                     command=["--", "true"],
@@ -89,13 +93,13 @@ def run_child(mode: str, marker: Path) -> int:
                     constraint=None,
                     chdir=None,
                     dry_run=False,
-                    detach=False,
+                    detach=mode == "run-detach",
                 ),
                 ctx=ctx,
                 paths=paths,
                 entrypoint=Path("/tmp/hpc-alloc"),
             )
-        if mode == "logs":
+        if mode.startswith("logs"):
             return cmd_logs(
                 SimpleNamespace(
                     target=f"grace:@{OPERATION_ID}",

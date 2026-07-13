@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Sequence
 
 from .errors import HpcAllocError
-from .output import neutralize_stdout
+from .output import neutralize_stderr, neutralize_stdout
 
 
 def add_cluster_flag(parser: argparse.ArgumentParser) -> None:
@@ -131,7 +131,10 @@ def main(argv: Sequence[str] | None = None, *, entrypoint: Path | None = None) -
     try:
         return int(dispatch(args, entrypoint=entrypoint or Path(sys.argv[0]).resolve()) or 0)
     except KeyboardInterrupt:
-        print(file=sys.stderr)
+        try:
+            print(file=sys.stderr)
+        except BrokenPipeError:
+            neutralize_stderr()
         return 130
     except BrokenPipeError:
         neutralize_stdout()

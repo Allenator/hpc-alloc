@@ -6,7 +6,7 @@ import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from hpc_alloc.commands import (
     _cancel_record,
@@ -1378,6 +1378,48 @@ host = "secondary.example.edu"
             self.repository.get_operation(OPERATION_ID).phase,
             OperationPhase.AMBIGUOUS,
         )
+        transport_script.assert_complete()
+        client_script.assert_complete()
+
+    def test_cli_interrupt_keeps_exit_130_when_stderr_is_broken(self) -> None:
+        from hpc_alloc.cli import main
+
+        broken_stderr = SimpleNamespace(
+            write=Mock(side_effect=BrokenPipeError()),
+            flush=Mock(),
+        )
+        with (
+            patch("hpc_alloc.commands.dispatch", side_effect=KeyboardInterrupt()),
+            patch("hpc_alloc.cli.sys.stderr", broken_stderr),
+            patch("hpc_alloc.cli.neutralize_stderr") as neutralize,
+        ):
+            result = main(["status"], entrypoint=Path("/tmp/hpc-alloc"))
+
+        self.assertEqual(result, 130)
+        neutralize.assert_called_once_with()
+
+    def test_broken_guidance_cannot_skip_ambiguous_interrupt_journal(self) -> None:
+        transport, transport_script = self.transport()
+        client_script = StrictScript(
+            [
+                ExpectedCall("prepare_submission"),
+                ExpectedCall("submit", result=KeyboardInterrupt()),
+            ]
+        )
+
+        with (
+            patch("hpc_alloc.commands.info", side_effect=BrokenPipeError()),
+            patch("hpc_alloc.commands.neutralize_stderr") as neutralize,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            self.invoke(transport, StrictProxy(client_script))
+
+        self.assertEqual(
+            self.repository.get_operation(OPERATION_ID).phase,
+            OperationPhase.AMBIGUOUS,
+        )
+        self.assertEqual(client_script.count("submit"), 1)
+        neutralize.assert_called_once_with()
         transport_script.assert_complete()
         client_script.assert_complete()
 

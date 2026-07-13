@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shlex
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -592,6 +593,45 @@ class SlurmProtocolTests(unittest.TestCase):
         self.assertNotIn("sbatch", spec.preparation_command())
         self.assertTrue(spec.sbatch_command().startswith("sbatch --parsable"))
         self.assertNotIn("mkdir", spec.sbatch_command())
+
+    def test_dry_run_paths_use_symbolic_home_without_changing_live_commands(self) -> None:
+        spec = SubmissionSpec(
+            operation_id="a" * 32,
+            owner_id="deadbeef1234",
+            owner_host="laptop",
+            kind=JobKind.RUN,
+            logical_name="run",
+            partition="day",
+            walltime="1:00:00",
+            cpus=2,
+            logfile=".hpc-alloc/run.log",
+            wrap="true",
+            chdir="~/project dir/it's;$(touch INJECTED)",
+        )
+
+        live_preparation = spec.preparation_command()
+        live_submission = spec.sbatch_command()
+        dry_run = spec.command()
+
+        self.assertEqual(
+            live_preparation,
+            "mkdir -p .hpc-alloc && "
+            "(find .hpc-alloc -name '*.log' -mtime +30 -delete "
+            "2>/dev/null || true)",
+        )
+        self.assertIn("--output .hpc-alloc/run.log", live_submission)
+        self.assertIn(
+            "--chdir=~/project dir/it's;$(touch INJECTED)",
+            shlex.split(live_submission),
+        )
+        self.assertNotIn("${HOME", live_submission)
+        self.assertIn('mkdir -p "${HOME:?}"/.hpc-alloc', dry_run)
+        self.assertIn('--output "${HOME:?}"/.hpc-alloc/run.log', dry_run)
+        self.assertIn('--chdir="${HOME:?}"', dry_run)
+        self.assertIn(
+            "--chdir=${HOME:?}/project dir/it's;$(touch INJECTED)",
+            shlex.split(dry_run),
+        )
 
 
 if __name__ == "__main__":

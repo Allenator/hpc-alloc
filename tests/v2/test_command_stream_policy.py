@@ -93,6 +93,13 @@ class CommandStreamPolicyTests(unittest.TestCase):
         self.assertEqual(result, 141)
         cancel.assert_called_once()
 
+    def test_broken_pipe_keeps_141_when_cancellation_is_uncertain(self) -> None:
+        result, cancel = self.invoke(
+            BrokenFollower, TransportLost("cancellation reply lost")
+        )
+        self.assertEqual(result, 141)
+        cancel.assert_called_once()
+
     def test_interrupt_still_returns_to_cli_as_interrupt_when_cancel_is_uncertain(self) -> None:
         with self.assertRaises(KeyboardInterrupt):
             self.invoke(InterruptedFollower, TransportLost("reply lost"))
