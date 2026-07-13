@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from hpc_alloc.errors import (
     AuthRequired,
@@ -12,7 +13,7 @@ from hpc_alloc.errors import (
     LocalToolUnavailable,
     TransportLost,
 )
-from hpc_alloc.ssh import AuthMode, RetryPolicy, SshTransport
+from hpc_alloc.ssh import AuthMode, RetryPolicy, SshTransport, ssh_argv
 
 
 def completed(argv: object, rc: int = 0, stdout: str = "", stderr: str = ""):
@@ -24,6 +25,41 @@ class SshTransportTests(unittest.TestCase):
         config = SimpleNamespace(clusters={"grace": object()}, ssh=SimpleNamespace(identity_file=None))
         paths = SimpleNamespace(ssh_dir=root)
         return SshTransport(config, paths, runner=runner)
+
+    def test_ssh_argv_sets_batch_mode_explicitly_for_both_policies(self) -> None:
+        self.assertEqual(
+            ssh_argv("hpc-grace.login"),
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "--",
+                "hpc-grace.login",
+            ],
+        )
+        self.assertEqual(
+            ssh_argv(
+                "hpc-grace.login",
+                "true",
+                batch=False,
+                connect_timeout=30,
+                extra_options=("NumberOfPasswordPrompts=1",),
+            ),
+            [
+                "ssh",
+                "-o",
+                "BatchMode=no",
+                "-o",
+                "NumberOfPasswordPrompts=1",
+                "-o",
+                "ConnectTimeout=30",
+                "--",
+                "hpc-grace.login",
+                "true",
+            ],
+        )
 
     def test_noninteractive_auth_is_typed_and_never_prompts(self) -> None:
         calls: list[list[str]] = []
@@ -40,6 +76,91 @@ class SshTransportTests(unittest.TestCase):
                 transport.bootstrap("grace", AuthMode.NONINTERACTIVE)
         self.assertEqual(len(calls), 2)
         self.assertTrue(any("BatchMode=yes" in call for call in calls))
+
+    def test_interactive_bootstrap_explicitly_disables_batch_mode(self) -> None:
+        calls: list[list[str]] = []
+
+        def runner(argv: list[str], **_kwargs: object):
+            calls.append(argv)
+            if "check" in argv:
+                return completed(argv, 1, stderr="no master")
+            if "BatchMode=yes" in argv:
+                return completed(
+                    argv,
+                    255,
+                    stderr="Permission denied (publickey,keyboard-interactive)",
+                )
+            return completed(argv)
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("hpc_alloc.ssh.can_prompt", return_value=True),
+        ):
+            self.transport(runner, Path(directory)).bootstrap(
+                "grace", AuthMode.INTERACTIVE_BOOTSTRAP
+            )
+
+        self.assertEqual(
+            calls[-1],
+            [
+                "ssh",
+                "-o",
+                "BatchMode=no",
+                "-o",
+                "NumberOfPasswordPrompts=1",
+                "-o",
+                "ConnectTimeout=30",
+                "--",
+                "hpc-grace.login",
+                "true",
+            ],
+        )
+        self.assertEqual(
+            calls[-2],
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "--",
+                "hpc-grace.login",
+                "true",
+            ],
+        )
+
+    def test_push_login_explicitly_disables_batch_mode(self) -> None:
+        calls: list[tuple[list[str], dict[str, object]]] = []
+
+        def runner(argv: list[str], **kwargs: object):
+            calls.append((argv, kwargs))
+            return completed(argv)
+
+        with tempfile.TemporaryDirectory() as directory:
+            self.transport(runner, Path(directory)).push_login("grace", timeout=42)
+
+        self.assertEqual(len(calls), 1)
+        argv, kwargs = calls[0]
+        self.assertEqual(
+            argv,
+            [
+                "ssh",
+                "-o",
+                "BatchMode=no",
+                "-o",
+                "NumberOfPasswordPrompts=1",
+                "-o",
+                "ConnectTimeout=30",
+                "--",
+                "hpc-grace.login",
+                "true",
+            ],
+        )
+        self.assertEqual(kwargs["timeout"], 42)
+        environment = kwargs["env"]
+        self.assertIsInstance(environment, dict)
+        self.assertEqual(environment["SSH_ASKPASS_REQUIRE"], "force")
+        self.assertEqual(environment["HPC_ALLOC_ASKPASS"], "1")
 
     def test_missing_local_ssh_is_not_misclassified_as_reconnectable(self) -> None:
         def runner(_argv: list[str], **_kwargs: object):

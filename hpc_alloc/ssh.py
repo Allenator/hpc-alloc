@@ -81,9 +81,7 @@ def ssh_argv(
 ) -> list[str]:
     """Build every SSH invocation in one place."""
 
-    argv = ["ssh"]
-    if batch:
-        argv += ["-o", "BatchMode=yes"]
+    argv = ["ssh", "-o", f"BatchMode={'yes' if batch else 'no'}"]
     for option in extra_options:
         argv += ["-o", option]
     argv += ["-o", f"ConnectTimeout={connect_timeout}", "--", alias]

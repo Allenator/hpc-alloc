@@ -67,15 +67,42 @@ class SshConfigTests(unittest.TestCase):
                 '[identity]\nnetid = "ab1234"\n'
                 '[cluster.ipv4]\nhost = "[192.0.2.7]"\n'
                 '[cluster.ipv6]\nhost = "[2001:0DB8:0000::7]"\n'
+                '[cluster.scoped]\nhost = "[FE80:0::1%eth 0]"\n'
             )
             config = Config.load(path)
             text = render(config, [], Path(directory) / "known_hosts")
 
         ipv4 = stanza(text, "hpc-ipv4.login")
         ipv6 = stanza(text, "hpc-ipv6.login")
+        scoped = stanza(text, "hpc-scoped.login")
         self.assertIn("HostName 192.0.2.7", ipv4)
         self.assertIn("HostName 2001:0DB8:0000::7", ipv6)
+        self.assertIn('HostName "FE80:0::1%%eth 0"', scoped)
         self.assertNotIn("HostName [", text)
+
+    @unittest.skipUnless(shutil.which("ssh"), "OpenSSH client is unavailable")
+    def test_openssh_accepts_rendered_scoped_ipv6_hostname(self) -> None:
+        config = SimpleNamespace(
+            identity=SimpleNamespace(netid="ab1234"),
+            ssh=SimpleNamespace(identity_file=None),
+            clusters={
+                "scoped": SimpleNamespace(host="fe80::1%eth 0"),
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ssh_config"
+            path.write_text(render(config, [], Path(directory) / "known_hosts"))
+            result = subprocess.run(
+                ["ssh", "-G", "-F", str(path), "hpc-scoped.login"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("percent_expand", result.stderr)
+        self.assertNotIn("unknown key %", result.stderr)
 
     def test_compute_identity_uses_cluster_and_physical_node_not_allocation(self) -> None:
         config = SimpleNamespace(

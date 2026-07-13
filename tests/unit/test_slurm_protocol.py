@@ -6,7 +6,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from hpc_alloc.commands import _recover_submission
-from hpc_alloc.errors import IdentityMismatch, ProtocolViolation, SchedulerUnavailable
+from hpc_alloc.errors import (
+    IdentityMismatch,
+    ProtocolViolation,
+    RemoteCommandFailed,
+    SchedulerUnavailable,
+)
 from hpc_alloc.models import JobKind, JobPhase, JobRecord, JobRef
 from hpc_alloc.ownership import format_tag, slurm_job_name
 from hpc_alloc.slurm import (
@@ -16,6 +21,7 @@ from hpc_alloc.slurm import (
     RawQueueScan,
     SlurmClient,
     SubmissionSpec,
+    _LOG_CHUNK_SIGPIPE_STATUS,
 )
 from hpc_alloc.ssh import RemoteResult, RetryPolicy
 
@@ -137,8 +143,23 @@ class SlurmProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ProtocolViolation, "payload limit"):
             client.read_log_chunk("log", 7, limit=10)
         command = transport.calls[0][1]
-        self.assertIn("tail -c +8 -- log | head -c 10", command)
+        self.assertIn("tail -c +8 -- log; source_rc=$?", command)
+        self.assertIn("| head -c 10", command)
+        self.assertIn('kill -l "$source_rc"', command)
+        self.assertIn(f"exit {_LOG_CHUNK_SIGPIPE_STATUS}", command)
         self.assertIn('[ "$n" -le 10 ]', command)
+
+    def test_log_chunk_accepts_source_sigpipe_only_at_the_byte_cap(self) -> None:
+        client, _transport = self.client(
+            [framed(b"0123456789", rc=_LOG_CHUNK_SIGPIPE_STATUS)]
+        )
+        self.assertEqual(client.read_log_chunk("log", 0, limit=10), b"0123456789")
+
+        client, _transport = self.client(
+            [framed(b"short", rc=_LOG_CHUNK_SIGPIPE_STATUS)]
+        )
+        with self.assertRaisesRegex(RemoteCommandFailed, "SIGPIPE.*byte limit"):
+            client.read_log_chunk("log", 0, limit=10)
 
     def test_log_chunk_limit_validation_is_strict(self) -> None:
         client, transport = self.client([])

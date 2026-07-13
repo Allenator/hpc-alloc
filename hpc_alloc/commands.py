@@ -486,6 +486,10 @@ def _services(ctx: Any, paths: AppPaths, entrypoint: Path, cluster: str | None =
     from .slurm import SlurmClient
     from .ssh import SshTransport
     selected = ctx.config.resolve_cluster(cluster or getattr(ctx, "primary_cluster", None))
+    # A prior projection write may have failed after authoritative config or
+    # lifecycle state committed.  Repair that derived file before OpenSSH can
+    # resolve either a login or allocation alias.
+    _sync_ssh_projection(ctx, paths)
     transport = SshTransport(
         ctx.config,
         paths,

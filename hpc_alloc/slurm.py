@@ -58,6 +58,7 @@ _SACCT_BASE_FIELDS = (
     "Comment%255",
 )
 MAX_LOG_CHUNK_BYTES = 1024 * 1024
+_LOG_CHUNK_SIGPIPE_STATUS = 85
 _MAX_QUEUE_PAYLOAD_BYTES = 32 * 1024 * 1024
 _MAX_QUEUE_FIELD_BYTES = 64 * 1024
 _DRY_RUN_HOME = '"${HOME:?}"'
@@ -1133,19 +1134,56 @@ class SlurmClient:
                 f"log chunk limit must be between 1 and {MAX_LOG_CHUNK_BYTES} bytes"
             )
         quoted = shlex.quote(path)
-        framed = self._framed(
+        status_template = "${TMPDIR:-/tmp}/hpc-alloc-log-chunk.XXXXXX"
+        command = (
             f"[ -r {quoted} ] || exit 1; "
-            f"tail -c +{offset + 1} -- {quoted} | head -c {limit}",
+            f'status_file=$(mktemp "{status_template}") || exit 125; '
+            "trap 'rm -f \"$status_file\"' 0; "
+            "trap 'exit 129' 1; trap 'exit 130' 2; trap 'exit 143' 15; "
+            "{ "
+            f"tail -c +{offset + 1} -- {quoted}; source_rc=$?; "
+            "printf '%s\\n' \"$source_rc\" >\"$status_file\"; "
+            f"}} | head -c {limit}; sink_rc=$?; "
+            '[ "$sink_rc" -eq 0 ] || { '
+            "printf 'log-chunk sink failed with exit %s\\n' \"$sink_rc\" >&2; "
+            "exit 125; }; "
+            'IFS= read -r source_rc <"$status_file" || { '
+            "printf '%s\\n' 'log-chunk source status was unavailable' >&2; "
+            "exit 125; }; "
+            'case "$source_rc" in \'\'|*[!0-9]*) '
+            "printf '%s\\n' 'log-chunk source status was invalid' >&2; "
+            "exit 125;; esac; "
+            '[ "$source_rc" -le 255 ] 2>/dev/null || { '
+            "printf '%s\\n' 'log-chunk source status was invalid' >&2; "
+            "exit 125; }; "
+            '[ "$source_rc" -eq 0 ] && exit 0; '
+            'if [ "$source_rc" -gt 128 ]; then '
+            'signal_name=$(kill -l "$source_rc" 2>/dev/null) || signal_name=; '
+            f'case "$signal_name" in PIPE|SIGPIPE) exit {_LOG_CHUNK_SIGPIPE_STATUS};; esac; '
+            "fi; "
+            "printf 'log-chunk source failed with exit %s\\n' \"$source_rc\" >&2; "
+            "exit 125"
+        )
+        framed = self._framed(
+            command,
             retry=RetryPolicy.SAFE_READ,
             auth=auth,
             max_payload_bytes=limit,
         )
-        if framed.returncode != 0:
-            raise RemoteCommandFailed(f"cannot read log {path!r}: {framed.stderr.strip()}")
         if len(framed.payload) > limit:
             raise ProtocolViolation(
                 f"log chunk exceeded requested limit ({len(framed.payload)} > {limit})"
             )
+        if framed.returncode == _LOG_CHUNK_SIGPIPE_STATUS:
+            if len(framed.payload) == limit:
+                return framed.payload
+            detail = framed.stderr.strip() or (
+                "log source received SIGPIPE before the requested byte limit"
+            )
+            raise RemoteCommandFailed(f"cannot read log {path!r}: {detail}")
+        if framed.returncode != 0:
+            detail = framed.stderr.strip() or f"exit {framed.returncode}"
+            raise RemoteCommandFailed(f"cannot read log {path!r}: {detail}")
         return framed.payload
 
     def tail_log(

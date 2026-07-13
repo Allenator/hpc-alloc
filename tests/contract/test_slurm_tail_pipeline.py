@@ -17,11 +17,21 @@ from hpc_alloc.ssh import RemoteResult
 class LocalShellTransport:
     """Execute generated shell commands with a controllable tail binary."""
 
-    def __init__(self, path: str, *, source: str = "success", sink: str = "success") -> None:
+    def __init__(
+        self,
+        path: str,
+        *,
+        source: str = "success",
+        sink: str = "success",
+        chunk_source: str = "success",
+        chunk_sink: str = "success",
+    ) -> None:
         self.env = os.environ.copy()
         self.env["PATH"] = path
         self.env["HPC_ALLOC_FAKE_TAIL_SOURCE"] = source
         self.env["HPC_ALLOC_FAKE_TAIL_SINK"] = sink
+        self.env["HPC_ALLOC_FAKE_CHUNK_SOURCE"] = chunk_source
+        self.env["HPC_ALLOC_FAKE_CHUNK_SINK"] = chunk_sink
 
     def run(self, _cluster: str, command: str, **kwargs: object) -> RemoteResult:
         result = subprocess.run(
@@ -47,8 +57,9 @@ class TailPipelineContractTests(unittest.TestCase):
         self.log_path.write_bytes(b"first line\nsecond line\n")
 
         real_tail = shutil.which("tail")
-        if real_tail is None:
-            self.skipTest("tail is required for shell protocol contract tests")
+        real_head = shutil.which("head")
+        if real_tail is None or real_head is None:
+            self.skipTest("tail and head are required for shell protocol contract tests")
         fake_tail = self.bin_directory / "tail"
         fake_tail.write_text(
             textwrap.dedent(
@@ -66,10 +77,32 @@ class TailPipelineContractTests(unittest.TestCase):
                             exit 24
                             ;;
                     esac
-                elif [ "$1" = "-c" ] && [ "$HPC_ALLOC_FAKE_TAIL_SINK" = "failure" ]; then
-                    cat >/dev/null
-                    printf 'simulated bounded-tail failure\\n' >&2
-                    exit 25
+                elif [ "$1" = "-c" ]; then
+                    case "$2" in
+                        +*)
+                            case "$HPC_ALLOC_FAKE_CHUNK_SOURCE" in
+                                partial_failure)
+                                    printf 'partial chunk output'
+                                    printf 'simulated chunk source failure\\n' >&2
+                                    exit 23
+                                    ;;
+                                empty_failure)
+                                    printf 'simulated empty chunk failure\\n' >&2
+                                    exit 24
+                                    ;;
+                                full_failure)
+                                    {shlex.quote(real_tail)} "$@"
+                                    printf 'simulated full chunk failure\\n' >&2
+                                    exit 23
+                                    ;;
+                            esac
+                            ;;
+                    esac
+                    if [ "$HPC_ALLOC_FAKE_TAIL_SINK" = "failure" ]; then
+                        cat >/dev/null
+                        printf 'simulated bounded-tail failure\\n' >&2
+                        exit 25
+                    fi
                 fi
                 exec {shlex.quote(real_tail)} "$@"
                 """
@@ -77,14 +110,76 @@ class TailPipelineContractTests(unittest.TestCase):
             encoding="utf-8",
         )
         fake_tail.chmod(0o755)
+        fake_head = self.bin_directory / "head"
+        fake_head.write_text(
+            textwrap.dedent(
+                f"""\
+                #!/bin/sh
+                if [ "$HPC_ALLOC_FAKE_CHUNK_SINK" = "failure" ]; then
+                    cat >/dev/null
+                    printf 'simulated chunk sink failure\\n' >&2
+                    exit 25
+                fi
+                exec {shlex.quote(real_head)} "$@"
+                """
+            ),
+            encoding="utf-8",
+        )
+        fake_head.chmod(0o755)
 
     def tearDown(self) -> None:
         self.directory.cleanup()
 
-    def client(self, *, source: str = "success", sink: str = "success") -> SlurmClient:
+    def client(
+        self,
+        *,
+        source: str = "success",
+        sink: str = "success",
+        chunk_source: str = "success",
+        chunk_sink: str = "success",
+    ) -> SlurmClient:
         path = f"{self.bin_directory}{os.pathsep}{os.environ.get('PATH', '')}"
-        transport = LocalShellTransport(path, source=source, sink=sink)
+        transport = LocalShellTransport(
+            path,
+            source=source,
+            sink=sink,
+            chunk_source=chunk_source,
+            chunk_sink=chunk_sink,
+        )
         return SlurmClient(transport, "local")  # type: ignore[arg-type]
+
+    def test_partial_chunk_source_output_does_not_hide_failure(self) -> None:
+        with self.assertRaisesRegex(RemoteCommandFailed, "simulated chunk source failure"):
+            self.client(chunk_source="partial_failure").read_log_chunk(
+                str(self.log_path), 0, limit=64
+            )
+
+    def test_empty_chunk_source_failure_is_not_successful_eof(self) -> None:
+        with self.assertRaisesRegex(RemoteCommandFailed, "simulated empty chunk failure"):
+            self.client(chunk_source="empty_failure").read_log_chunk(
+                str(self.log_path), 0, limit=64
+            )
+
+    def test_full_chunk_from_a_failed_source_is_still_a_failure(self) -> None:
+        self.log_path.write_bytes(b"x" * 64)
+        with self.assertRaisesRegex(RemoteCommandFailed, "simulated full chunk failure"):
+            self.client(chunk_source="full_failure").read_log_chunk(
+                str(self.log_path), 0, limit=64
+            )
+
+    def test_expected_source_sigpipe_is_accepted_at_the_byte_cap(self) -> None:
+        payload = bytes(range(256)) * 8192
+        self.log_path.write_bytes(payload)
+
+        result = self.client().read_log_chunk(str(self.log_path), 0, limit=1024)
+
+        self.assertEqual(result, payload[:1024])
+
+    def test_chunk_sink_failure_is_preserved(self) -> None:
+        with self.assertRaisesRegex(RemoteCommandFailed, "simulated chunk sink failure"):
+            self.client(chunk_sink="failure").read_log_chunk(
+                str(self.log_path), 0, limit=64
+            )
 
     def test_partial_source_output_does_not_hide_source_failure(self) -> None:
         with self.assertRaisesRegex(RemoteCommandFailed, "simulated source read failure"):

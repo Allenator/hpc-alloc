@@ -1,14 +1,143 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, call, patch
 
-from hpc_alloc.commands import cmd_cancel, cmd_connect, cmd_down, cmd_ssh, cmd_sync
+from hpc_alloc.commands import (
+    _services,
+    _sync_ssh_projection,
+    cmd_cancel,
+    cmd_connect,
+    cmd_down,
+    cmd_ssh,
+    cmd_sync,
+)
+from hpc_alloc.config import Config
 from hpc_alloc.errors import AuthRequired, ConfigInvalid, HostKeyChanged, TransportLost
 from hpc_alloc.models import JobKind
 from hpc_alloc.paths import AppPaths
+
+
+class ServiceProjectionTests(unittest.TestCase):
+    def context(self) -> tuple[AppPaths, object]:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        paths = AppPaths.for_home(Path(directory.name))
+        paths.config_dir.mkdir(parents=True)
+        paths.config_file.write_text(
+            """\
+[identity]
+netid = "ab1234"
+[defaults]
+cluster = "grace"
+[cluster.grace]
+host = "grace.example.edu"
+"""
+        )
+        active = SimpleNamespace(
+            cluster="grace",
+            logical_name="dev",
+            kind=JobKind.ALLOCATION,
+            current_node="node01",
+        )
+        state = SimpleNamespace(
+            list_jobs=Mock(return_value=[active]),
+        )
+        return paths, SimpleNamespace(
+            config=Config.load(paths.config_file),
+            state=state,
+            primary_cluster="grace",
+        )
+
+    def test_services_projects_new_cluster_before_transport_construction(
+        self,
+    ) -> None:
+        paths, context = self.context()
+        _sync_ssh_projection(context, paths)
+        self.assertNotIn("hpc-bouchet.login", paths.managed_ssh_config.read_text())
+        with paths.config_file.open("a", encoding="utf-8") as handle:
+            handle.write('[cluster.bouchet]\nhost = "bouchet.example.edu"\n')
+        context.config = Config.load(paths.config_file)
+        transport = object()
+        client = object()
+
+        def construct_transport(*_args: object, **_kwargs: object) -> object:
+            projection = paths.managed_ssh_config.read_text()
+            self.assertIn("Host hpc-grace.login", projection)
+            self.assertIn("Host hpc-bouchet.login", projection)
+            self.assertIn("    HostName bouchet.example.edu", projection)
+            self.assertIn("Host hpc-grace.dev", projection)
+            self.assertIn("    HostName node01", projection)
+            return transport
+
+        with (
+            patch(
+                "hpc_alloc.ssh.SshTransport",
+                side_effect=construct_transport,
+            ) as transport_constructor,
+            patch(
+                "hpc_alloc.slurm.SlurmClient",
+                return_value=client,
+            ) as client_constructor,
+        ):
+            result = _services(
+                context,
+                paths,
+                Path("/tmp/hpc-alloc"),
+                "bouchet",
+            )
+
+        self.assertEqual(result, (transport, client))
+        transport_constructor.assert_called_once()
+        client_constructor.assert_called_once_with(transport, "bouchet")
+
+    def test_projection_failure_prevents_service_construction(self) -> None:
+        paths, context = self.context()
+        failure = ConfigInvalid("managed SSH projection failed")
+
+        with (
+            patch(
+                "hpc_alloc.commands._sync_ssh_projection",
+                side_effect=failure,
+            ) as project,
+            patch("hpc_alloc.ssh.SshTransport") as transport_constructor,
+            patch("hpc_alloc.slurm.SlurmClient") as client_constructor,
+        ):
+            with self.assertRaises(ConfigInvalid) as raised:
+                _services(
+                    context,
+                    paths,
+                    Path("/tmp/hpc-alloc"),
+                    "grace",
+                )
+
+        self.assertIs(raised.exception, failure)
+        project.assert_called_once_with(context, paths)
+        transport_constructor.assert_not_called()
+        client_constructor.assert_not_called()
+
+    def test_invalid_cluster_is_rejected_before_projection(self) -> None:
+        paths, context = self.context()
+
+        with (
+            patch("hpc_alloc.commands._sync_ssh_projection") as project,
+            patch("hpc_alloc.ssh.SshTransport") as transport_constructor,
+            patch("hpc_alloc.slurm.SlurmClient") as client_constructor,
+        ):
+            with self.assertRaisesRegex(ConfigInvalid, "is not configured"):
+                _services(
+                    context,
+                    paths,
+                    Path("/tmp/hpc-alloc"),
+                    "missing",
+                )
+
+        project.assert_not_called()
+        transport_constructor.assert_not_called()
+        client_constructor.assert_not_called()
 
 
 class CommandSshPolicyTests(unittest.TestCase):

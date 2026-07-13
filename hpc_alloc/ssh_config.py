@@ -52,6 +52,18 @@ def _quoted_value(value: str | Path) -> str:
     return f'"{text}"'
 
 
+def _hostname_value(host: str) -> str:
+    """Serialize one validated host without triggering OpenSSH tokens."""
+
+    if "%" not in host:
+        return host
+    # Hostname expands percent tokens even inside quotes.  A scoped IPv6
+    # literal therefore needs both token escaping and quoting: ``%%`` reaches
+    # the connector as one literal percent, while quotes keep scope IDs that
+    # contain whitespace in a single config argument.
+    return _quoted_value(host.replace("%", "%%"))
+
+
 def atomic_write_600(path: Path, data: str) -> bool:
     """Atomically replace *path*, fsyncing both content and its directory."""
 
@@ -107,7 +119,7 @@ def render(config: object, jobs: Iterable[object], known_hosts: Path) -> str:
     for name, cluster in sorted(clusters.items()):
         lines += [
             f"Host {login_alias(name)}",
-            f"    HostName {cluster.host}",
+            f"    HostName {_hostname_value(cluster.host)}",
             f"    User {netid}",
             *id_lines,
             "    ControlMaster auto",
