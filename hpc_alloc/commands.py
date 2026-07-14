@@ -51,7 +51,13 @@ from .models import (
     OperationKind,
     OperationPhase,
 )
-from .ownership import IDENTIFIER_RE, normalize_host_label, parse_tag, slurm_job_name
+from .ownership import (
+    IDENTIFIER_RE,
+    is_reserved_allocation_name,
+    normalize_host_label,
+    parse_tag,
+    slurm_job_name,
+)
 from .output import neutralize_stderr, neutralize_stdout
 from .paths import AppPaths
 from .retry import PollBackoff, RetryBudget, observation_signature
@@ -546,7 +552,10 @@ def _find_or_create_ssh_key(
     except OSError as exc:
         raise ConfigInvalid(f"cannot prepare {paths.ssh_dir}: {exc}") from exc
     private = paths.ssh_dir / "id_ed25519_hpc_alloc"
-    if private.exists() or private.with_suffix(".pub").exists():
+    # Derive the public path by the same append rule as ``_identity_key_pair``
+    # so there is exactly one private-to-public mapping in the codebase.
+    public = Path(f"{private}.pub")
+    if private.exists() or public.exists():
         raise ConfigInvalid(
             f"incomplete SSH key pair at {private}; repair or remove both key files"
         )
@@ -562,7 +571,7 @@ def _find_or_create_ssh_key(
         raise ConfigInvalid(f"ssh-keygen failed with exit status {exc.returncode}") from exc
     except OSError as exc:
         raise ConfigInvalid(f"cannot execute ssh-keygen: {exc}") from exc
-    return private.with_suffix(".pub"), "~/.ssh/id_ed25519_hpc_alloc"
+    return public, "~/.ssh/id_ed25519_hpc_alloc"
 
 
 def cmd_setup(args: Any, *, paths: AppPaths, entrypoint: Path) -> int:
@@ -1504,13 +1513,8 @@ def _persist_reconciled_assessment(
     source = job
     candidate = assessment
     fresh_tracker = None
-    # Was a parameter every one of the eight call sites passed the same
-    # object it passed as `assessment`, so the alternative it implied never
-    # existed -- while making the CAS retry loop look as though evidence and
-    # candidate could diverge, which anyone changing it had to disprove first.
-    evidence = assessment
-    monotonic_started = bool(evidence.ever_started)
-    monotonic_last_node = evidence.last_node
+    monotonic_started = bool(assessment.ever_started)
+    monotonic_last_node = assessment.last_node
     while True:
         if candidate.uncertain:
             # Operational uncertainty is process-local.  Any successful queue
@@ -1658,11 +1662,7 @@ def cmd_up(
     from .monitor import JobMonitor
     from .ssh import AuthMode
     cluster = ctx.config.resolve_cluster(args.cluster)
-    if (
-        not IDENTIFIER_RE.fullmatch(args.name)
-        or args.name.isdigit()
-        or args.name in {"login", "run"}
-    ):
+    if not IDENTIFIER_RE.fullmatch(args.name) or is_reserved_allocation_name(args.name):
         raise ConfigInvalid(f"invalid or reserved allocation name {args.name!r}")
     if args.wait_timeout < 0:
         raise ConfigInvalid("--wait-timeout must be non-negative")

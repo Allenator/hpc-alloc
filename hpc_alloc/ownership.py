@@ -35,6 +35,22 @@ COMPUTE_NODE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,252}\Z")
 
 OPERATION_RE = re.compile(r"[0-9a-f]{32}\Z")
 
+# Logical allocation names that can never be user-chosen.  This must stay in
+# lockstep with ``ssh_config.login_alias``, which builds ``hpc-<cluster>.login``:
+# a "login" allocation would collide with that alias.  "run" is the fixed
+# logical name reserved for RUN jobs.
+RESERVED_ALLOCATION_NAMES = frozenset({"login", "run"})
+
+
+def is_reserved_allocation_name(name: str) -> bool:
+    """True for names an allocation may not use: reserved words or bare digits.
+
+    A purely numeric name is refused because it is indistinguishable from a
+    numeric scheduler job ID at the CLI boundary.
+    """
+
+    return name.isdigit() or name in RESERVED_ALLOCATION_NAMES
+
 
 def normalize_host_label(raw_hostname: str) -> str:
     """Return a deterministic ownership-tag label for a system hostname.

@@ -45,6 +45,7 @@ from .ownership import (
     COMPUTE_NODE_RE,
     IDENTIFIER_RE,
     OPERATION_RE,
+    is_reserved_allocation_name,
     parse_tag,
     slurm_job_name as build_slurm_job_name,
 )
@@ -556,9 +557,7 @@ class StateRepository:
             raise StateConflict("operation_id must be 32 lowercase hexadecimal characters")
         if IDENTIFIER_RE.fullmatch(cluster) is None:
             raise StateConflict("cluster is not a valid identifier")
-        if kind is JobKind.ALLOCATION and (
-            logical_name.isdigit() or logical_name in {"login", "run"}
-        ):
+        if kind is JobKind.ALLOCATION and is_reserved_allocation_name(logical_name):
             raise StateConflict(f"allocation name {logical_name!r} is reserved or ambiguous")
         if kind is JobKind.RUN and logical_name != "run":
             raise StateConflict("run jobs must use the logical name 'run'")
@@ -1940,10 +1939,7 @@ class StateRepository:
                 )
                 or (
                     kind is JobKind.ALLOCATION
-                    and (
-                        row["logical_name"].isdigit()
-                        or row["logical_name"] in {"login", "run"}
-                    )
+                    and is_reserved_allocation_name(row["logical_name"])
                 )
                 or (kind is JobKind.RUN and row["logical_name"] != "run")
             ):

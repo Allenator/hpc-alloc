@@ -198,15 +198,21 @@ class SubmissionSpec:
             self.logical_name,
         )
 
-    def preparation_command(self) -> str:
-        """Return idempotent remote setup that never invokes ``sbatch``."""
-
-        log_directory = shlex.quote(self.log_directory)
+    def _preparation(self, quote: Callable[[str], str]) -> str:
+        # Single source for the retention window and predicate so the dry-run
+        # rendering and the real setup can never diverge; only the quoting
+        # differs between them.
+        log_directory = quote(self.log_directory)
         return (
             f"mkdir -p {log_directory} && "
             f"(find {log_directory} -name '*.log' -mtime +30 -delete "
             "2>/dev/null || true)"
         )
+
+    def preparation_command(self) -> str:
+        """Return idempotent remote setup that never invokes ``sbatch``."""
+
+        return self._preparation(shlex.quote)
 
     def _sbatch_argv(self) -> list[str]:
         argv = [
@@ -242,12 +248,7 @@ class SubmissionSpec:
     def command(self) -> str:
         """Render a paste-ready operation for the target login shell."""
 
-        log_directory = _dry_run_path(self.log_directory)
-        preparation = (
-            f"mkdir -p {log_directory} && "
-            f"(find {log_directory} -name '*.log' -mtime +30 -delete "
-            "2>/dev/null || true)"
-        )
+        preparation = self._preparation(_dry_run_path)
 
         argv = self._sbatch_argv()
         rendered = [shlex.quote(argument) for argument in argv]
