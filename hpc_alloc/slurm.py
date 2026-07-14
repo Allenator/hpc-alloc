@@ -30,7 +30,7 @@ from .errors import (
 )
 from .models import JobKind, JobRef
 from .ownership import format_tag, slurm_job_name
-from .ssh import AuthMode, RemoteResult, RetryPolicy, SshTransport
+from .ssh import AuthMode, RetryPolicy, SshTransport
 
 
 FINAL_STATES = frozenset(

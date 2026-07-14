@@ -27,6 +27,7 @@ from .ssh_config import (
     ComputeMasterRetirement,
     compute_control_socket_prefix,
     login_alias,
+    managed_compute_endpoints,
 )
 
 
@@ -282,9 +283,9 @@ def retire_compute_masters(
 class SshTransport:
     """Multiplexed SSH transport for configured login aliases.
 
-    ``state_repository`` is optional and used only to discover active compute
-    aliases during healing.  Callers can instead provide ``alias_provider``;
-    neither is consulted while a repository transaction is active.
+    Compute aliases are read from the managed SSH projection (see
+    :meth:`compute_endpoints`), which is the single source of truth for which
+    allocations currently own an alias and a ControlMaster.
     """
 
     def __init__(
@@ -293,8 +294,6 @@ class SshTransport:
         paths: object,
         *,
         entrypoint: Path | None = None,
-        state_repository: object | None = None,
-        alias_provider: Callable[[str], Iterable[str]] | None = None,
         info: Callable[[str], None] | None = None,
         runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
         environ: Mapping[str, str] | None = None,
@@ -302,8 +301,6 @@ class SshTransport:
         self.config = config
         self.paths = paths
         self.entrypoint = (entrypoint or Path(sys.argv[0])).resolve()
-        self.state_repository = state_repository
-        self.alias_provider = alias_provider
         self.info = info or (lambda _message: None)
         self._runner = runner
         self._environ = dict(os.environ if environ is None else environ)
@@ -416,19 +413,25 @@ class SshTransport:
                 except OSError:
                     pass
 
+    def compute_endpoints(self, cluster: str) -> dict[str, str]:
+        """The cluster's published compute aliases, mapped to their nodes.
+
+        Read from the managed SSH projection rather than re-derived from durable
+        state.  That file is what OpenSSH actually resolves, and it is the only
+        place the node leases are applied that keep a suspended or
+        terminal-candidate seat reachable after the repository nulls its
+        current_node.  Re-deriving the set from current_node produced a smaller,
+        disagreeing one -- so `connect --reset` closed zero compute masters and
+        still reported that it had closed them.
+        """
+
+        managed = getattr(self.paths, "managed_ssh_config", None)
+        if managed is None:
+            return {}
+        return managed_compute_endpoints(Path(managed), cluster)
+
     def _compute_aliases(self, cluster: str) -> tuple[str, ...]:
-        if self.alias_provider is not None:
-            return tuple(self.alias_provider(cluster))
-        repository = self.state_repository
-        if repository is None:
-            return ()
-        # Foundation repositories expose snapshots outside a transaction.  Be
-        # deliberately duck-typed so transport does not depend on persistence.
-        for method_name in ("active_aliases", "compute_aliases"):
-            method = getattr(repository, method_name, None)
-            if method is not None:
-                return tuple(method(cluster))
-        return ()
+        return tuple(sorted(self.compute_endpoints(cluster)))
 
     def heal(self, cluster: str, aliases: Iterable[str] | None = None) -> None:
         for alias in aliases if aliases is not None else self._compute_aliases(cluster):

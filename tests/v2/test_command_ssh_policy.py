@@ -396,6 +396,18 @@ class CommandSshPolicyTests(unittest.TestCase):
             if alias == "hpc-grace.offline":
                 raise TransportLost("network unavailable")
 
+        # The aliases come from the managed projection -- the same set `heal`
+        # retires and the same set OpenSSH can resolve -- not from a second
+        # derivation over current_node, which nulls out for every non-ACTIVE
+        # phase and so hid exactly the leased seats a user runs `connect` to
+        # ask about.
+        endpoints = Mock(
+            return_value={
+                "hpc-grace.bad": "node01",
+                "hpc-grace.good": "node02",
+                "hpc-grace.offline": "node03",
+            }
+        )
         transport = SimpleNamespace(
             bootstrap=Mock(),
             run=Mock(
@@ -406,30 +418,11 @@ class CommandSshPolicyTests(unittest.TestCase):
                 )
             ),
             require_node=Mock(side_effect=require_node),
+            compute_endpoints=endpoints,
         )
-        jobs = [
-            SimpleNamespace(
-                cluster="grace",
-                kind=JobKind.ALLOCATION,
-                logical_name="bad",
-                current_node="node01",
-            ),
-            SimpleNamespace(
-                cluster="grace",
-                kind=JobKind.ALLOCATION,
-                logical_name="good",
-                current_node="node02",
-            ),
-            SimpleNamespace(
-                cluster="grace",
-                kind=JobKind.ALLOCATION,
-                logical_name="offline",
-                current_node="node03",
-            ),
-        ]
         context = SimpleNamespace(
             config=SimpleNamespace(resolve_cluster=lambda _cluster: "grace"),
-            state=SimpleNamespace(list_jobs=Mock(return_value=jobs)),
+            state=SimpleNamespace(list_jobs=Mock(return_value=[])),
         )
 
         with (
@@ -456,7 +449,7 @@ class CommandSshPolicyTests(unittest.TestCase):
         report.assert_any_call("node node01 ('bad'): host-key")
         report.assert_any_call("node node02 ('good'): ok")
         report.assert_any_call("node node03 ('offline'): network")
-        context.state.list_jobs.assert_called_once_with(include_final=False)
+        endpoints.assert_called_once_with("grace")
 
     def test_cmd_down_all_stops_on_access_failure_after_projecting_prior_changes(self) -> None:
         for failure in (

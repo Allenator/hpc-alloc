@@ -176,6 +176,43 @@ def _managed_compute_stanzas(text: str) -> dict[str, str]:
     return stanzas
 
 
+def managed_compute_endpoints(
+    managed_path: Path, cluster: str | None = None
+) -> dict[str, str]:
+    """The compute aliases the projection publishes, and the node each points at.
+
+    This is the single source of truth for "which allocations currently own a
+    compute alias, and therefore a ControlMaster".  The managed file *is* the
+    projection: it is the file OpenSSH consults, and :func:`render` is the only
+    place that decides which allocations get a Host stanza -- including the node
+    leases that keep a suspended or scheduler-terminal-candidate seat reachable
+    after the repository has already nulled its ``current_node``.
+
+    Deriving this set anywhere else -- most naturally from ``JobRecord``'s
+    ``current_node``, which the repository nulls for every non-ACTIVE phase --
+    yields a strictly smaller set that disagrees with what OpenSSH can actually
+    resolve.  Healing then closed zero compute masters while announcing that it
+    had closed them, and the per-node health check silently skipped hosts the
+    user could still reach.
+    """
+
+    try:
+        text = managed_path.read_text()
+    except (OSError, UnicodeError):
+        # No readable projection means no managed aliases -- which is exactly
+        # what OpenSSH would conclude from the same file.
+        return {}
+    endpoints: dict[str, str] = {}
+    for alias, stanza in _managed_compute_stanzas(text).items():
+        match = _MANAGED_ALLOCATION_ALIAS.fullmatch(alias)
+        if match is None:
+            continue
+        if cluster is not None and match.group(1) != cluster:
+            continue
+        endpoints[alias] = _managed_stanza_hostname(stanza)
+    return endpoints
+
+
 def _managed_stanza_hostname(stanza: str) -> str:
     """Return the HostName from a stanza already validated above."""
 

@@ -674,18 +674,16 @@ def _services(ctx: Any, paths: AppPaths, entrypoint: Path, cluster: str | None =
     # connect`, routes through here too and would fail identically forever.  The
     # call is idempotent and does not rewrite an Include that is already present.
     ensure_include(paths.user_ssh_config)
+    # The transport reads its compute aliases straight from the projection it
+    # just synchronized above.  That file is what OpenSSH resolves and the only
+    # place the node leases are applied, so it is the single source of truth for
+    # which allocations own an alias and a ControlMaster.  Re-deriving the set
+    # here from JobRecord.current_node -- which the repository nulls for every
+    # non-ACTIVE phase -- produced a smaller, disagreeing set.
     transport = SshTransport(
         ctx.config,
         paths,
         entrypoint=entrypoint,
-        state_repository=ctx.state,
-        alias_provider=lambda name: (
-            allocation_alias(job.cluster, job.logical_name)
-            for job in ctx.state.list_jobs(include_final=False)
-            if job.cluster == name
-            and job.kind == JobKind.ALLOCATION
-            and job.current_node
-        ),
         info=info,
     )
     return transport, SlurmClient(transport, selected)
@@ -806,21 +804,24 @@ def cmd_connect(
         raise HpcAllocError(result.stderr.strip() or f"hostname failed on {cluster}")
     info(f"login OK: {result.stdout_text.strip()}")
     host_key_failure: HostKeyChanged | None = None
-    for job in ctx.state.list_jobs(include_final=False):
-        if job.cluster != cluster or job.kind != JobKind.ALLOCATION or not job.current_node:
-            continue
-        alias = allocation_alias(job.cluster, job.logical_name)
+    # Health-check exactly the aliases the projection published -- the same set
+    # `heal` retires.  Deriving it from current_node instead silently skipped
+    # every seat whose node is held under a lease (a suspended allocation, a
+    # scheduler terminal candidate), which are precisely the ones a user runs
+    # `connect` to ask about.
+    for alias, node in sorted(transport.compute_endpoints(cluster).items()):
+        name = alias.rpartition(".")[2]
         try:
             transport.require_node(alias)
         except HostKeyChanged as exc:
-            info(f"node {job.current_node} ({job.logical_name!r}): host-key")
+            info(f"node {node} ({name!r}): host-key")
             host_key_failure = host_key_failure or exc
         except AuthRequired:
-            info(f"node {job.current_node} ({job.logical_name!r}): auth")
+            info(f"node {node} ({name!r}): auth")
         except TransportLost:
-            info(f"node {job.current_node} ({job.logical_name!r}): network")
+            info(f"node {node} ({name!r}): network")
         else:
-            info(f"node {job.current_node} ({job.logical_name!r}): ok")
+            info(f"node {node} ({name!r}): ok")
     if host_key_failure is not None:
         raise host_key_failure
     return 0

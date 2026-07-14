@@ -15,6 +15,7 @@ from hpc_alloc.config import Config
 from hpc_alloc.errors import ConfigInvalid
 from hpc_alloc.models import EvidenceProvenance, JobKind, JobPhase
 from hpc_alloc.ownership import format_tag, slurm_job_name
+from hpc_alloc.ssh import SshTransport
 from hpc_alloc.ssh_config import (
     ComputeMasterRetirement,
     allocation_alias,
@@ -512,6 +513,47 @@ class SshConfigTests(unittest.TestCase):
             )
 
         return sync, managed_path
+
+    def test_the_transport_reads_its_compute_aliases_from_the_projection(self) -> None:
+        """One source of truth for which allocations own a ControlMaster.
+
+        A suspended allocation still holds its node and keeps its alias through a
+        node lease -- but the repository nulls current_node for every non-ACTIVE
+        phase.  The transport used to re-derive its alias set from current_node,
+        so it missed exactly those seats: `connect --reset` closed zero compute
+        masters and still announced that it had closed them, and `connect`'s
+        health check silently skipped a host the user could still reach.
+
+        The projection is what OpenSSH resolves, so the projection decides.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            job = self.allocation("dev", "node01")
+            sync, managed_path = self.projection(root, [job])
+            sync()
+
+            # Exactly what the repository stores for a suspended seat: no node,
+            # yet the alias is still published under its lease.
+            job.phase = JobPhase.STARTED_INACTIVE
+            job.current_node = None
+            sync()
+            self.assertIn("Host hpc-grace.dev", managed_path.read_text())
+
+            transport = SshTransport(
+                SimpleNamespace(
+                    clusters={"grace": object()},
+                    ssh=SimpleNamespace(identity_file=None),
+                ),
+                SimpleNamespace(ssh_dir=root, managed_ssh_config=managed_path),
+                runner=lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 0, "", ""),
+            )
+
+            self.assertEqual(
+                transport.compute_endpoints("grace"), {"hpc-grace.dev": "node01"}
+            )
+            # A different cluster's projection is not this cluster's business.
+            self.assertEqual(transport.compute_endpoints("other"), {})
 
     def test_started_inactive_allocation_keeps_its_alias_and_master(self) -> None:
         """A SUSPENDED / STOPPED / COMPLETING allocation still owns its node.
