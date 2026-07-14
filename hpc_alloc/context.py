@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .config import ClusterConfig, Config
@@ -17,6 +17,26 @@ IMPLICIT_CLUSTER_COMMANDS = frozenset(
 )
 
 
+class SessionState:
+    """Mutable scratch shared by the helpers within one CLI invocation.
+
+    RuntimeContext is deliberately frozen, but a few things are worth doing
+    exactly once per process rather than once per helper call.  They live here.
+    """
+
+    __slots__ = ("ssh_projection_repaired",)
+
+    def __init__(self) -> None:
+        # The managed SSH projection is derived from config and durable state.
+        # Repairing it is idempotent recovery, not a post-mutation write -- the
+        # commands that change state re-sync it explicitly -- so once per
+        # invocation is enough.  It used to run on every _services() call: once
+        # per cluster inside `status`, twice inside `up` and `run`, each time
+        # re-parsing the TOML, re-reading the jobs table on a fresh SQLite
+        # connection, and re-rendering the managed file under an exclusive lock.
+        self.ssh_projection_repaired = False
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimeContext:
     paths: AppPaths
@@ -25,6 +45,7 @@ class RuntimeContext:
     cluster_name: str | None = None
     cluster: ClusterConfig | None = None
     config_error: ConfigInvalid | None = None
+    session: SessionState = field(default_factory=SessionState)
 
     @property
     def primary_cluster(self) -> str | None:

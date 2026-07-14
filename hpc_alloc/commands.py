@@ -724,14 +724,23 @@ def _services(ctx: Any, paths: AppPaths, entrypoint: Path, cluster: str | None =
     # A prior projection write may have failed after authoritative config or
     # lifecycle state committed.  Repair that derived file before OpenSSH can
     # resolve either a login or allocation alias.
-    _sync_ssh_projection(ctx, paths)
-    # The Include is exactly as derived, and exactly as repairable, as the file
-    # it points at -- and without it OpenSSH sees no managed Host block at all,
-    # so every alias becomes an unresolvable hostname and the command dies at
-    # exit 3 ("check the VPN").  The remedy the docs then prescribe, `hpc-alloc
-    # connect`, routes through here too and would fail identically forever.  The
-    # call is idempotent and does not rewrite an Include that is already present.
-    ensure_include(paths.user_ssh_config)
+    #
+    # The Include is exactly as derived, and exactly as repairable, as the file it
+    # points at -- and without it OpenSSH sees no managed Host block at all, so
+    # every alias becomes an unresolvable hostname and the command dies at exit 3
+    # ("check the VPN").  The remedy the docs then prescribe, `hpc-alloc connect`,
+    # routes through here too and would fail identically forever.
+    #
+    # This is idempotent recovery, not a post-mutation write -- commands that
+    # change state re-sync the projection explicitly -- so it is done once per
+    # invocation rather than on every call.  `status` calls _services once per
+    # cluster, and `up`/`run` call it twice.
+    session = getattr(ctx, "session", None)
+    if session is None or not session.ssh_projection_repaired:
+        _sync_ssh_projection(ctx, paths)
+        ensure_include(paths.user_ssh_config)
+        if session is not None:
+            session.ssh_projection_repaired = True
     # The transport reads its compute aliases straight from the projection it
     # just synchronized above.  That file is what OpenSSH resolves and the only
     # place the node leases are applied, so it is the single source of truth for
@@ -1065,6 +1074,15 @@ def _reconcile_status(
             continue
         client = clients[job.cluster]
         try:
+            # Deliberately a targeted, strict observation per managed job, even
+            # though the broad scan above already carried a row for it.  `scan` is
+            # tolerant and documented for discovery and recovery only; managed
+            # lifecycle state is the strict path's business, and the freshness and
+            # identity guarantees it gives are worth one round trip per job.  The
+            # N+1 here is real but small -- a handful of queries -- and collapsing
+            # it means feeding the evidence tracker its first observation from a
+            # different source, which is precisely the machinery every subtle bug
+            # in this file has come from.
             assessment = JobMonitor(client).assess(
                 job, auth=AuthMode.NONINTERACTIVE
             ).assessment
@@ -2372,7 +2390,17 @@ def cmd_why(
     else:
         transport, client = _services(ctx, paths, entrypoint, job.cluster)
         transport.bootstrap(job.cluster, AuthMode.INTERACTIVE_BOOTSTRAP)
-        assessment = JobMonitor(client).assess(job, auth=AuthMode.NONINTERACTIVE).assessment
+        # Ask for why's display-only timing columns on the assessment's own
+        # accounting read, so the record it fetches is the record why needs.  It
+        # used to run the whole retry ladder a second time -- the heaviest query
+        # the tool makes, and the slowest -- for a record that could not have
+        # changed in the twenty lines since.
+        observed = JobMonitor(client).assess(
+            job,
+            auth=AuthMode.NONINTERACTIVE,
+            extra_fields=("Elapsed", "Timelimit"),
+        )
+        assessment = observed.assessment
         job, assessment, _tracker = _persist_reconciled_assessment(
             ctx=ctx,
             paths=paths,
@@ -2391,13 +2419,20 @@ def cmd_why(
             FinalSource.CONFIRMED_QUEUE,
             FinalSource.ACCOUNTING,
         }:
+            # Reuse the record the assessment already fetched.  Only fall back to
+            # a fresh ladder when it found none -- either because it short-circuits
+            # on a durably-accounting final without consulting the scheduler at
+            # all, or because slurmdbd had not caught up yet and a retry may now
+            # succeed.
+            record = observed.record
             try:
-                record = client.final(
-                    job.ref,
-                    attempts=(0, 2, 2),
-                    auth=AuthMode.NONINTERACTIVE,
-                    extra_fields=("Elapsed", "Timelimit"),
-                )
+                if record is None:
+                    record = client.final(
+                        job.ref,
+                        attempts=(0, 2, 2),
+                        auth=AuthMode.NONINTERACTIVE,
+                        extra_fields=("Elapsed", "Timelimit"),
+                    )
             except (AuthRequired, HostKeyChanged):
                 raise
             except HpcAllocError:

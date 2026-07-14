@@ -412,20 +412,17 @@ host = "grace.example.edu"
         self.assertEqual(stored.terminal_state, "FAILED")
         self.assertEqual(stored.exit_code, "7:0")
         self.assertEqual(client.observations, 1)
-        self.assertEqual(len(client.final_calls), 2)
+        # One accounting query, not two.  `why` now asks for its display-only
+        # columns on the assessment's own read, so the record that assessment
+        # fetches is the record `why` needs.  It used to run the entire retry
+        # ladder a second time -- the heaviest and slowest query the tool makes --
+        # for a record that could not have changed in the twenty lines between.
+        self.assertEqual(len(client.final_calls), 1)
         self.assertEqual(client.final_calls[0][0], queued.ref)
-        self.assertNotIn("extra_fields", client.final_calls[0][1])
         self.assertEqual(
-            client.final_calls[1],
-            (
-                queued.ref,
-                {
-                    "attempts": (0, 2, 2),
-                    "auth": AuthMode.NONINTERACTIVE,
-                    "extra_fields": ("Elapsed", "Timelimit"),
-                },
-            ),
+            client.final_calls[0][1]["extra_fields"], ("Elapsed", "Timelimit")
         )
+        self.assertEqual(client.final_calls[0][1]["auth"], AuthMode.NONINTERACTIVE)
         self.assertEqual(projection.call_count, 1)
 
     def test_why_omits_stale_timing_that_disagrees_with_accounting_verdict(
@@ -658,7 +655,13 @@ host = "grace.example.edu"
 
             def final(self, *_args: object, **kwargs: object):
                 self.final_calls.append(kwargs)
-                return record if kwargs.get("extra_fields") else None
+                # Delayed accounting: slurmdbd has not caught up on the first
+                # read, and the record appears on the retry.  Keyed on *when* the
+                # call happens, not on which columns it asks for -- `why` now
+                # requests its display columns on the assessment's own read, so
+                # keying on extra_fields would have handed the record over
+                # immediately and stopped exercising the retry at all.
+                return record if len(self.final_calls) > 1 else None
 
             def tail_log(self, _path: str, _lines: int) -> bytes:
                 return b"failed output\n"

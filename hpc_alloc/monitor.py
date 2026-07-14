@@ -29,6 +29,11 @@ from .ssh import AuthMode
 class MonitorResult:
     assessment: JobAssessment
     accounting_checked: bool = False
+    # The accounting record this assessment consulted, if it consulted one.
+    # `why` needs the same record for its own display, and was fetching it a
+    # second time -- an entire retry ladder, the heaviest query the tool makes,
+    # for a record whose content could not have changed in between.
+    record: AccountingRecord | None = None
 
 
 def break_lifecycle_evidence(tracker: EvidenceTracker, exc: HpcAllocError) -> JobAssessment:
@@ -96,20 +101,28 @@ class JobMonitor:
         auth: AuthMode = AuthMode.NONINTERACTIVE,
         confirm: bool = True,
         tracker: EvidenceTracker | None = None,
+        extra_fields: tuple[str, ...] = (),
     ) -> MonitorResult:
         if job.ref is None:
             return MonitorResult((tracker or self.tracker(job)).assessment)
         tracker = tracker or self.tracker(job)
         accounting_checked = False
+        consulted: AccountingRecord | None = None
 
         def exact_final(attempts: tuple[float, ...]) -> AccountingRecord | None:
-            nonlocal accounting_checked
+            nonlocal accounting_checked, consulted
             accounting_checked = True
+            # Only ask for the display-only columns when a caller wants them, so
+            # the ordinary monitoring query keeps its exact shape.
+            options: dict[str, object] = {"attempts": attempts, "auth": auth}
+            if extra_fields:
+                options["extra_fields"] = extra_fields
             try:
-                return self.client.final(job.ref, attempts=attempts, auth=auth)
+                consulted = self.client.final(job.ref, **options)
             except HpcAllocError as exc:
                 break_lifecycle_evidence(tracker, exc)
                 raise
+            return consulted
 
         if job.phase is JobPhase.FINAL:
             if job.final_source is not FinalSource.CONFIRMED_QUEUE:
@@ -117,9 +130,11 @@ class JobMonitor:
             record = exact_final((0,))
             if record is not None:
                 return MonitorResult(
-                    tracker.accept(EvidenceEvent.final(record)), accounting_checked
+                    tracker.accept(EvidenceEvent.final(record)),
+                    accounting_checked,
+                    consulted,
                 )
-            return MonitorResult(tracker.assessment, accounting_checked)
+            return MonitorResult(tracker.assessment, accounting_checked, consulted)
         row, assessment = accept_observation(
             tracker,
             lambda: self.client.observe(job.ref, auth=auth),
@@ -128,7 +143,7 @@ class JobMonitor:
             record = exact_final((0, 2, 2))
             if record is not None:
                 assessment = tracker.accept(EvidenceEvent.final(record))
-            return MonitorResult(assessment, accounting_checked)
+            return MonitorResult(assessment, accounting_checked, consulted)
         if assessment.phase == AssessmentPhase.TERMINAL_CANDIDATE:
             # A NODE_FAIL / PREEMPTED candidate must not be finalized by an
             # accounting read taken in this same cycle: that read describes the
@@ -140,7 +155,9 @@ class JobMonitor:
                 record = exact_final((0,))
                 if record is not None:
                     return MonitorResult(
-                        tracker.accept(EvidenceEvent.final(record)), accounting_checked
+                        tracker.accept(EvidenceEvent.final(record)),
+                        accounting_checked,
+                        consulted,
                     )
             if confirm:
                 self._sleep(self.confirmation_delay)
@@ -152,8 +169,8 @@ class JobMonitor:
                     record = exact_final((0, 2, 2))
                     if record is not None:
                         assessment = tracker.accept(EvidenceEvent.final(record))
-                    return MonitorResult(assessment, accounting_checked)
-        return MonitorResult(assessment, accounting_checked)
+                    return MonitorResult(assessment, accounting_checked, consulted)
+        return MonitorResult(assessment, accounting_checked, consulted)
 
 
 def persist_assessment(repository: object, job: JobRecord, assessment: JobAssessment) -> JobRecord:
