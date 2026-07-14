@@ -83,16 +83,26 @@ def build_parser() -> argparse.ArgumentParser:
     add_cluster_flag(cancel)
 
     down = sub.add_parser("down", help="cancel one or all managed allocations")
-    down.add_argument("target", nargs="?", help="name, @operation, or cluster-qualified form")
+    down.add_argument(
+        "target",
+        nargs="?",
+        help="name, job ID, @operation, or cluster-qualified selector",
+    )
     down.add_argument("--all", action="store_true")
     add_cluster_flag(down)
 
     ssh = sub.add_parser("ssh", help="open a shell or run a command on an allocation")
-    ssh.add_argument("args", nargs=argparse.REMAINDER, metavar="[NAME|@OPERATION] [-- CMD...]")
+    ssh.add_argument(
+        "args",
+        nargs=argparse.REMAINDER,
+        metavar="[NAME|JOBID|@OPERATION] [-- CMD...]",
+    )
     add_cluster_flag(ssh)
 
     sync = sub.add_parser("sync", help="rsync files to or from an allocation")
-    sync.add_argument("target", help="name, @operation, or cluster-qualified form")
+    sync.add_argument(
+        "target", help="name, job ID, @operation, or cluster-qualified selector"
+    )
     sync.add_argument("src")
     sync.add_argument("dst")
     sync.add_argument("--pull", action="store_true")

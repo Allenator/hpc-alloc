@@ -413,12 +413,14 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("usage: hpc-alloc", result.stdout)
 
-    def test_target_command_help_documents_durable_operation_selectors(self) -> None:
+    def test_target_command_help_documents_numeric_and_operation_selectors(self) -> None:
         for command in ("why", "logs", "cancel", "down", "ssh", "sync"):
             with self.subTest(command=command):
                 result = self.run_cli(command, "--help")
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("@operation", result.stdout.lower())
+                help_text = result.stdout.lower()
+                self.assertRegex(help_text, r"\bjob ?id\b")
+                self.assertIn("@operation", help_text)
 
 
 if __name__ == "__main__":

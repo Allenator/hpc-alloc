@@ -43,8 +43,8 @@ host = "bouchet.ycrc.yale.edu"
 # mem = "16G"
 # idle_timeout = 30
 
-# Additional clusters use the section name as the --cluster value. Qualify
-# ambiguous selectors as cluster:name or cluster:jobid.
+# Additional clusters use the section name as the --cluster value. Names and
+# job IDs are convenience selectors; resolve ambiguity with cluster:@operation_id.
 #
 # [cluster.grace]
 # host = "grace.ycrc.yale.edu"

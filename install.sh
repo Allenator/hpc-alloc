@@ -40,6 +40,12 @@ runtime_modules=(
   hpc_alloc.streaming
 )
 
+skill_files=(
+  skill/SKILL.md
+  skill/references/command-contracts.md
+  skill/references/recovery-and-lifecycle.md
+)
+
 if [[ ! -f "$here/hpc_alloc/__init__.py" ]]; then
   echo "hpc-alloc installation is incomplete: $here/hpc_alloc is missing" >&2
   exit 1
@@ -48,10 +54,12 @@ if [[ ! -f "$here/hpc-alloc" ]]; then
   echo "hpc-alloc installation is incomplete: $here/hpc-alloc is missing" >&2
   exit 1
 fi
-if [[ ! -f "$here/skill/SKILL.md" ]]; then
-  echo "hpc-alloc installation is incomplete: $here/skill/SKILL.md is missing" >&2
-  exit 1
-fi
+for source in "${skill_files[@]}"; do
+  if [[ ! -f "$here/$source" ]]; then
+    echo "hpc-alloc installation is incomplete: $here/$source is missing" >&2
+    exit 1
+  fi
+done
 if ! python3 -I -B -c '
 import importlib
 import pathlib
