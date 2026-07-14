@@ -53,7 +53,7 @@ from .models import (
 from .ownership import normalize_host_label, parse_tag, slurm_job_name
 from .output import neutralize_stderr, neutralize_stdout
 from .paths import AppPaths
-from .retry import RetryBudget
+from .retry import PollBackoff, RetryBudget
 from .selectors import SelectorKind, canonical_job_selector, parse_selector, unique_job
 from .ssh_config import (
     allocation_alias,
@@ -1614,6 +1614,10 @@ def cmd_up(
         monitor = JobMonitor(client)
         started = time.monotonic()
         budget = RetryBudget(info=info)
+        # A fixed 5s poll meant a job that queued for the default 30 minutes made
+        # 360 controller queries, every one of them learning the same thing.  Back
+        # off while nothing changes; any movement drops straight back to the floor.
+        backoff = PollBackoff()
         while True:
             try:
                 result = monitor.assess(job, auth=AuthMode.NONINTERACTIVE)
@@ -1653,7 +1657,15 @@ def cmd_up(
             if elapsed >= args.wait_timeout:
                 info(f"leaving job queued; inspect it with `hpc-alloc status`")
                 return 0
-            time.sleep(5)
+            time.sleep(
+                backoff.interval(
+                    (
+                        assessment.phase,
+                        assessment.scheduler_state,
+                        assessment.current_node,
+                    )
+                )
+            )
     except KeyboardInterrupt:
         _report_up_interrupt(ctx, job)
         raise

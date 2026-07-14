@@ -20,7 +20,7 @@ from .lifecycle import (
 )
 from .models import FinalSource, JobRef
 from .monitor import accept_observation, break_lifecycle_evidence
-from .retry import RetryBudget
+from .retry import PollBackoff, RetryBudget
 from .slurm import MAX_LOG_CHUNK_BYTES, LogSizeStatus, QueueRow, SlurmClient
 
 
@@ -28,6 +28,22 @@ AssessmentPublisher = Callable[
     [JobAssessment],
     tuple[JobAssessment, EvidenceTracker | None],
 ]
+
+
+def _observation_signature(assessment: JobAssessment) -> tuple[object, ...]:
+    """What counts as the job's scheduler-visible situation having changed.
+
+    Any difference collapses the observation interval back to its floor, so the
+    loop polls hardest exactly when the job is moving -- getting a node, starting,
+    requeueing, dying -- and coasts when it is simply running.
+    """
+
+    return (
+        assessment.phase,
+        assessment.scheduler_state,
+        assessment.current_node,
+        assessment.terminal_evidence,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,13 +87,13 @@ class LogFollower:
         info: Callable[[str], None] | None = None,
         sleeper: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
-        active_interval: float = 3,
-        queued_interval: float = 5,
+        log_interval: float = 3,
         note_interval: float = 30,
         final_attempts: tuple[float, ...] = (0, 2, 2, 3, 4, 5, 7, 7),
         drain_attempts: int = 3,
         drain_retry_delay: float = 2,
         retry_budget: RetryBudget | None = None,
+        backoff: PollBackoff | None = None,
     ) -> None:
         self.client = client
         self.ref = ref
@@ -88,9 +104,9 @@ class LogFollower:
         self.info = info or (lambda _message: None)
         self._sleep = sleeper
         self._clock = clock
-        self.active_interval = active_interval
-        self.queued_interval = queued_interval
+        self.log_interval = log_interval
         self.note_interval = note_interval
+        self.backoff = backoff or PollBackoff()
         self.final_attempts = final_attempts
         self.drain_attempts = drain_attempts
         self.drain_retry_delay = drain_retry_delay
@@ -227,16 +243,26 @@ class LogFollower:
                     publish_assessment,
                 )
         self._state_note(assessment)
-        if not assessment.log_eligible:
-            return PollResult(assessment)
+        count, restarted, status = self._read_log()
+        return PollResult(
+            assessment=assessment,
+            bytes_written=count,
+            log_restarted=restarted,
+            log_status=status,
+        )
 
+    def _read_log(self) -> tuple[int, bool, LogSizeStatus | None]:
+        """Stream whatever the job has newly written.  Touches no scheduler."""
+
+        if not self.tracker.assessment.log_eligible:
+            return 0, False, None
         try:
             size = self.client.log_size(self.log_path)
         except HpcAllocError as exc:
             break_lifecycle_evidence(self.tracker, exc)
             raise
         if size.status != LogSizeStatus.AVAILABLE:
-            return PollResult(assessment, log_status=size.status)
+            return 0, False, size.status
         assert size.size is not None
 
         restarted = size.size < self.offset
@@ -250,12 +276,21 @@ class LogFollower:
         except HpcAllocError as exc:
             break_lifecycle_evidence(self.tracker, exc)
             raise
-        return PollResult(
-            assessment=assessment,
-            bytes_written=count,
-            log_restarted=restarted,
-            log_status=LogSizeStatus.AVAILABLE,
-        )
+        return count, restarted, LogSizeStatus.AVAILABLE
+
+    def stream_once(self) -> int:
+        """Read newly written log bytes without consulting the scheduler.
+
+        The log is a file on a shared filesystem; the scheduler is a shared
+        controller under real load from every user on the cluster.  Bundling both
+        into one poll forced the cheap read and the expensive query to share a
+        cadence, so keeping the stream responsive meant querying the scheduler
+        every few seconds for the entire life of the job -- thousands of times,
+        almost always to be told what we already knew.  They are separate
+        concerns and now run on separate clocks.
+        """
+
+        return self._read_log()[0]
 
     def drain(self) -> bool:
         """Read the log to EOF after finality; report whether that succeeded.
@@ -316,21 +351,33 @@ class LogFollower:
                 log_complete=complete,
             )
 
+        assessment = seeded
+        observe_due = self._clock()
         while True:
             try:
-                result = self.poll_once(publish_assessment=publish_assessment)
+                if self._clock() >= observe_due:
+                    # Scheduler tick: the expensive one.  It also streams, since
+                    # we are here anyway.
+                    assessment = self.poll_once(
+                        publish_assessment=publish_assessment
+                    ).assessment
+                    observe_due = self._clock() + self.backoff.interval(
+                        _observation_signature(assessment)
+                    )
+                else:
+                    # Log tick: a file read, no scheduler query.
+                    self.stream_once()
             except HpcAllocError as exc:
-                # A slurmctld restart, a VPN blip, or a closed laptop lid used to
-                # abort the whole stream while the GPU job kept running.  Ride it
-                # out within the budget; absorb() re-raises anything that is not
-                # transient (auth, host key) or that outlives its patience.  A
-                # broken observation already cleared the tracker's death
+                # A controller restart, a VPN blip, or a closed laptop lid used
+                # to abort the whole stream while the GPU job kept running.  Ride
+                # it out within the budget; absorb() re-raises anything that is
+                # not transient (auth, host key) or that outlives its patience.
+                # A broken observation already cleared the tracker's death
                 # candidate, so evidence from before the gap cannot combine with
                 # evidence after it.
                 self.retry_budget.absorb(exc)
                 continue
             self.retry_budget.reset()
-            assessment = result.assessment
             if assessment.final:
                 complete = self.drain() if drain else True
                 return FollowOutcome(
@@ -340,8 +387,19 @@ class LogFollower:
                     bytes_written=self.total_bytes_written,
                     log_complete=complete,
                 )
-            delay = self.active_interval if assessment.ever_started else self.queued_interval
-            self._sleep(delay)
+            self._sleep(self._next_tick(assessment, observe_due))
+
+    def _next_tick(self, assessment: JobAssessment, observe_due: float) -> float:
+        """How long to sleep before the next unit of work."""
+
+        remaining = max(0.0, observe_due - self._clock())
+        if not assessment.log_eligible:
+            # Nothing has been written yet -- the job has not started -- so the
+            # scheduler alone sets the pace.
+            return remaining
+        # Stream on a steady, responsive cadence, but never sleep past the next
+        # scheduler observation.
+        return min(self.log_interval, remaining)
 
 
 __all__ = ["AssessmentPublisher", "FollowOutcome", "LogFollower", "PollResult"]

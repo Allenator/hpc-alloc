@@ -10,9 +10,56 @@ from hpc_alloc.errors import (
     SchedulerUnavailable,
     TransportLost,
 )
-from hpc_alloc.retry import RetryBudget
+from hpc_alloc.retry import PollBackoff, RetryBudget
 
 from .fakes import VirtualClock
+
+
+class PollBackoffTests(unittest.TestCase):
+    def test_a_steady_job_is_polled_less_and_less_often(self) -> None:
+        """Almost every observation of a long-running job learns nothing.
+
+        A fixed few-second poll made a four-hour run issue thousands of
+        scheduler queries, all of which reported the same thing.
+        """
+
+        backoff = PollBackoff(minimum=5, maximum=30)
+        steady = ("ACTIVE", "RUNNING", "node01")
+
+        intervals = [backoff.interval(steady) for _ in range(6)]
+
+        self.assertEqual(intervals, [5, 10, 20, 30, 30, 30])
+
+    def test_any_change_drops_straight_back_to_the_floor(self) -> None:
+        """The loop must be most responsive exactly when the job is moving."""
+
+        backoff = PollBackoff(minimum=5, maximum=30)
+        pending = ("QUEUED", "PENDING", None)
+
+        for _ in range(4):
+            backoff.interval(pending)
+        self.assertEqual(backoff.interval(pending), 30)
+
+        # The job got a node: poll hard again.
+        self.assertEqual(backoff.interval(("ACTIVE", "RUNNING", "node01")), 5)
+
+    def test_a_fast_start_is_still_noticed_fast(self) -> None:
+        """Backoff is self-correcting: it has no time to grow on a quick job.
+
+        This is what makes a ceiling affordable at all -- the latency it adds
+        lands only on jobs that have already been waiting a long time, where it
+        is proportionally negligible.
+        """
+
+        backoff = PollBackoff(minimum=5, maximum=30)
+        self.assertEqual(backoff.interval(("QUEUED", "PENDING", None)), 5)
+        self.assertEqual(backoff.interval(("ACTIVE", "RUNNING", "node01")), 5)
+
+    def test_the_floor_and_ceiling_must_be_coherent(self) -> None:
+        with self.assertRaises(ValueError):
+            PollBackoff(minimum=0, maximum=30)
+        with self.assertRaises(ValueError):
+            PollBackoff(minimum=30, maximum=5)
 
 
 class RetryBudgetTests(unittest.TestCase):

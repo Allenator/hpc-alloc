@@ -946,6 +946,75 @@ class StreamingTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), first)
         script.assert_complete()
 
+    def test_the_log_and_the_scheduler_run_on_separate_clocks(self) -> None:
+        """The stream stays responsive without hammering the controller.
+
+        poll_once used to bundle a scheduler query and a log read into one
+        cadence, so keeping the stream snappy (3s) meant querying the scheduler
+        3s apart for the entire life of the job -- ~1200 queries an hour, on a
+        controller shared with the whole cluster, almost all of them reporting
+        the same thing.  The log is a file read; the scheduler is not.  They now
+        keep separate time: the log every `log_interval`, the scheduler on a
+        backoff that widens while nothing changes.
+        """
+
+        clock = VirtualClock()
+        running = row("RUNNING", node="node01")
+        completed = AccountingRecord(
+            job_id=self.ref.job_id,
+            state="COMPLETED",
+            exit_code="0:0",
+            job_name=self.ref.slurm_job_name,
+            comment=self.ref.slurm_comment,
+        )
+
+        class Client:
+            """Counts calls; the job runs steadily, then ends."""
+
+            def __init__(self) -> None:
+                self.observations = 0
+                self.log_reads = 0
+
+            def observe(self, _ref, **_kwargs):
+                self.observations += 1
+                # Run steadily for the first several observations, then vanish
+                # twice so the two-observation rule can finalize it.
+                return running if self.observations <= 8 else None
+
+            def final(self, _ref, **_kwargs):
+                return completed if self.observations > 9 else None
+
+            def log_size(self, _path, **_kwargs):
+                self.log_reads += 1
+                return LogSizeResult.available(0)
+
+            def read_log_chunk(self, *_args, **_kwargs):  # pragma: no cover
+                raise AssertionError("the log is empty")
+
+        client = Client()
+        follower = LogFollower(
+            client,  # type: ignore[arg-type]
+            self.ref,
+            LOG_PATH,
+            tracker=EvidenceTracker(ever_started=True),
+            output=io.BytesIO(),
+            sleeper=clock.sleep,
+            clock=clock.monotonic,
+        )
+
+        outcome = follower.follow()
+
+        self.assertTrue(outcome.assessment.final)
+        # The job's situation never changed while it ran, so the scheduler
+        # interval widened 5 -> 10 -> 20 -> 30 and the observations became rare,
+        # while the log kept being read every 3s throughout.
+        self.assertLess(
+            client.observations,
+            client.log_reads,
+            "the scheduler was polled as often as the log",
+        )
+        self.assertGreater(clock.now, 60, "the job ran for a meaningful stretch")
+
     def test_follow_rides_out_a_transient_scheduler_failure(self) -> None:
         """A controller restart mid-stream must not kill the stream.
 
@@ -978,6 +1047,9 @@ class StreamingTests(unittest.TestCase):
                 ExpectedCall(
                     "final", result=None, args=(self.ref,), kwargs={"attempts": (0,)}
                 ),
+                ExpectedCall("log_size", result=LogSizeResult.available(0), args=(LOG_PATH,)),
+                # A log tick between the two observations: the stream keeps its
+                # own cadence and does not touch the scheduler.
                 ExpectedCall("log_size", result=LogSizeResult.available(0), args=(LOG_PATH,)),
                 # Absent twice: confirmed departure, then accounting refines it.
                 ExpectedCall("observe", result=None, args=(self.ref,)),

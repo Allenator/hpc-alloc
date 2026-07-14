@@ -1,4 +1,11 @@
-"""Bounded patience for transient scheduler and transport failures.
+"""Pacing and patience for the polling loops.
+
+Two separate concerns live here.  :class:`RetryBudget` decides how long to keep
+waiting when an observation *fails*.  :class:`PollBackoff` decides how long to
+wait between observations that *succeed*.  They are deliberately distinct: a
+loop can be patient with errors while still being a good citizen on the wire.
+
+Bounded patience for transient scheduler and transport failures.
 
 v1 wrapped both of its polling loops in bounded retries: roughly two minutes of
 patience for scheduler errors, and a ten-minute reconnect window for transport
@@ -102,9 +109,72 @@ class RetryBudget:
         self._sleep(min(self._interval, remaining))
 
 
+# Polling the scheduler is this tool's dominant load on a shared controller.
+# The floor keeps a fast-moving job responsive; the ceiling keeps a long-lived
+# one from making thousands of queries that all learn the same thing.
+POLL_MIN_INTERVAL_SECONDS = 5.0
+POLL_MAX_INTERVAL_SECONDS = 30.0
+
+_UNOBSERVED = object()
+
+
+class PollBackoff:
+    """Widen the gap between scheduler observations while nothing changes.
+
+    Polling the scheduler every few seconds was the tool's dominant load on a
+    shared Slurm controller: a four-hour run made thousands of observations, and
+    almost every one of them learned nothing at all -- the job was still running,
+    exactly as it had been on the previous poll.
+
+    Exponential backoff is self-correcting in the right direction here.  A job
+    that starts, or ends, quickly is still noticed quickly, because the interval
+    has had no time to grow.  Only a job that has been sitting in one state for a
+    long while is polled slowly -- and there the added latency is proportionally
+    negligible: thirty seconds on top of a twenty-minute queue wait.
+
+    Any observed change drops the interval straight back to the floor, so the
+    loop is at its most responsive exactly when something is happening.
+    """
+
+    def __init__(
+        self,
+        *,
+        minimum: float = POLL_MIN_INTERVAL_SECONDS,
+        maximum: float = POLL_MAX_INTERVAL_SECONDS,
+    ) -> None:
+        if minimum <= 0 or maximum < minimum:
+            raise ValueError("poll backoff needs 0 < minimum <= maximum")
+        self._minimum = minimum
+        self._maximum = maximum
+        self._interval = minimum
+        self._signature: object = _UNOBSERVED
+
+    def interval(self, signature: object) -> float:
+        """How long to wait before observing again.
+
+        ``signature`` summarizes what the observation just saw.  When it differs
+        from the previous one -- the job moved, got a node, changed state -- the
+        interval collapses back to the floor.
+        """
+
+        if signature != self._signature:
+            self._signature = signature
+            self._interval = self._minimum
+            return self._interval
+        self._interval = min(self._interval * 2, self._maximum)
+        return self._interval
+
+    def reset(self) -> None:
+        self._interval = self._minimum
+        self._signature = _UNOBSERVED
+
+
 __all__ = [
+    "POLL_MAX_INTERVAL_SECONDS",
+    "POLL_MIN_INTERVAL_SECONDS",
     "RETRY_INTERVAL_SECONDS",
     "SCHEDULER_PATIENCE_SECONDS",
     "TRANSPORT_PATIENCE_SECONDS",
+    "PollBackoff",
     "RetryBudget",
 ]
