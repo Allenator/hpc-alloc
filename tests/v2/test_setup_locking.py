@@ -359,6 +359,112 @@ class SetupScopeSafetyTests(unittest.TestCase):
         repository.snapshot_setup_scope_blockers.return_value = (jobs, operations)
         return repository
 
+    def write_key_pair(self, path: Path) -> None:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.write_text("PRIVATE\n")
+        path.with_name(path.name + ".pub").write_text("ssh-ed25519 AAAA test\n")
+
+    def test_force_keeps_the_configured_key_and_never_repoints_it(self) -> None:
+        """`--force` repairs a NetID typo.  It must not silently re-key.
+
+        The key probe knows only four hard-coded filenames, so a key named
+        anything else -- `~/.ssh/id_yale`, the one actually registered with the
+        cluster -- was invisible to it.  `setup --force --netid X`, the documented
+        repair, therefore repointed the config at whichever standard-named key
+        happened to exist; and because the managed config emits
+        `IdentitiesOnly yes`, OpenSSH then offered only that wrong key, so every
+        later command failed to authenticate with no way to see why.
+        """
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        home = Path(directory.name)
+        paths = AppPaths.for_home(home)
+
+        # The key registered with the cluster ...
+        self.write_key_pair(home / ".ssh" / "id_yale")
+        # ... alongside a standard-named one the probe would otherwise prefer.
+        self.write_key_pair(home / ".ssh" / "id_ed25519")
+
+        paths.config_dir.mkdir(parents=True)
+        paths.config_file.write_text(
+            '[identity]\nnetid = "ab1111"\n'
+            '[ssh]\nidentity_file = "~/.ssh/id_yale"\n'
+            '[defaults]\ncluster = "grace"\n'
+            '[cluster.grace]\nhost = "grace.example.edu"\n'
+        )
+
+        with patch("hpc_alloc.commands.info"), patch("builtins.print"):
+            cmd_setup(
+                self.args(netid="ab1234"),
+                paths=paths,
+                entrypoint=Path("/tmp/hpc-alloc"),
+            )
+
+        rewritten = paths.config_file.read_text()
+        self.assertIn('identity_file = "~/.ssh/id_yale"', rewritten)
+        self.assertNotIn("id_ed25519", rewritten)
+        # The typo it was actually run to fix did get fixed.
+        self.assertIn('netid = "ab1234"', rewritten)
+
+    def test_an_explicit_identity_file_is_how_you_re_key(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        home = Path(directory.name)
+        paths = AppPaths.for_home(home)
+
+        self.write_key_pair(home / ".ssh" / "id_yale")
+        self.write_key_pair(home / ".ssh" / "id_new")
+        paths.config_dir.mkdir(parents=True)
+        paths.config_file.write_text(
+            '[identity]\nnetid = "ab1234"\n'
+            '[ssh]\nidentity_file = "~/.ssh/id_yale"\n'
+            '[defaults]\ncluster = "grace"\n'
+            '[cluster.grace]\nhost = "grace.example.edu"\n'
+        )
+
+        with patch("hpc_alloc.commands.info"), patch("builtins.print"):
+            cmd_setup(
+                self.args(identity_file="~/.ssh/id_new"),
+                paths=paths,
+                entrypoint=Path("/tmp/hpc-alloc"),
+            )
+
+        self.assertIn('identity_file = "~/.ssh/id_new"', paths.config_file.read_text())
+
+    def test_a_vanished_configured_key_fails_loudly_and_substitutes_nothing(self) -> None:
+        """Falling back silently is worse than failing.
+
+        The substitute key is not registered with the cluster, so the tool would
+        still not authenticate -- but the user would have no idea their key had
+        been swapped out from under them.
+        """
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        home = Path(directory.name)
+        paths = AppPaths.for_home(home)
+
+        self.write_key_pair(home / ".ssh" / "id_ed25519")
+        paths.config_dir.mkdir(parents=True)
+        paths.config_file.write_text(
+            '[identity]\nnetid = "ab1234"\n'
+            '[ssh]\nidentity_file = "~/.ssh/id_gone"\n'
+            '[defaults]\ncluster = "grace"\n'
+            '[cluster.grace]\nhost = "grace.example.edu"\n'
+        )
+
+        with patch("hpc_alloc.commands.info"), patch("builtins.print"):
+            with self.assertRaisesRegex(ConfigInvalid, "id_gone"):
+                cmd_setup(
+                    self.args(),
+                    paths=paths,
+                    entrypoint=Path("/tmp/hpc-alloc"),
+                )
+
+        # The configured key still stands; nothing was quietly substituted.
+        self.assertIn('identity_file = "~/.ssh/id_gone"', paths.config_file.read_text())
+
     def test_invalid_candidate_does_not_create_application_files(self) -> None:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)

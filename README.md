@@ -76,10 +76,10 @@ Use `up --dry-run` or `run --dry-run` to print a paste-ready submission command 
 
 | Command | Purpose |
 |---|---|
-| `setup [--netid NETID] [--cluster NAME] [--host HOST] [--force]` | Create the v2 config, state database, key material, and managed SSH include. Existing config requires `--force`. |
+| `setup [--netid NETID] [--cluster NAME] [--host HOST] [--identity-file PATH] [--force]` | Create the v2 config, state database, key material, and managed SSH include. Existing config requires `--force`. `--force` never re-keys: an `identity_file` already in the config is kept, because the key it names is the one registered with the cluster. Change it deliberately with `--identity-file`; if a configured key has vanished from disk, setup fails rather than silently substituting one that the cluster will reject. |
 | `config [--cluster NAME] [--json]` | Validate config and show the effective resource values without contacting a cluster. |
 | `connect [--cluster NAME] [--reset] [--push]` | Establish or heal the login master and health-check known allocation nodes. |
-| `up [--name NAME] [--cluster NAME] [resources] [--idle-timeout MIN] [--no-wait] [--wait-timeout SEC]` | Submit a persistent sleeper allocation. The default waits for a node; `--no-wait` returns after durable submission acknowledgement without observing the scheduler state. |
+| `up [--name NAME] [--cluster NAME] [resources] [--idle-timeout MIN] [--no-wait] [--wait-timeout SEC]` | Submit a persistent sleeper allocation. The default waits for a node and exits 0 once one is ready; if the wait expires with the job still queued it exits 4, and the job stays submitted and tracked. `--no-wait` returns after durable submission acknowledgement without observing the scheduler state. |
 | `run [--cluster NAME] [resources] [--chdir DIR] [--detach] -- CMD...` | Submit a command. Foreground mode follows output and returns the accounting exit status or the documented final-state fallback. |
 | `status [--json]` | Reconcile locally journaled jobs and classify v2-tagged queue rows across all configured clusters. |
 | `why [TARGET] [--cluster NAME] [--json]` | Explain a queued, running, uncertain, or final job selected by name, job ID, or `@operation`. |
@@ -224,6 +224,8 @@ Foreground and follow behavior is intentionally command-specific:
 - A foreground `run` returns the batch command's accounting exit code when available. Without an accounting exit code, it returns 0 for `COMPLETED` and 1 for another final state; it also forces a nonzero result for a non-`COMPLETED` state even if accounting reports status 0.
 
 Progress and recovery notices go to stderr. JSON stdout remains machine-only. Argparse usage failures, including missing required arguments and invalid typed values, print usage and exit 2 before command dispatch; post-parse configuration, validation, scheduler, protocol, and other hpc-alloc application failures normally use exit 1. Exit 2 and exit 3 are contextual rather than globally reserved: a foreground batch command may itself return either status, while `ssh` and `sync` can return delegated OpenSSH or rsync statuses. Typed authentication, host-key, and transport failures use exit 3, and a possibly dispatched cancellation may surface its recovery guidance through a transport-class failure. Interpret these statuses together with the invoked command and stderr.
+
+`up` uses exit 4 for "submitted, not ready yet": its wait expired while the allocation was still queued. This is neither success nor failure, and it is an ordinary outcome on a busy GPU partition. The job remains submitted, durable, and tracked, so it must not be resubmitted — wait for it with `status`, follow it with `logs -f`, or release it with `down`.
 
 ## JSON contracts
 

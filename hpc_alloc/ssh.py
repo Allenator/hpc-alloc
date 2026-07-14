@@ -399,19 +399,54 @@ class SshTransport:
         )
 
     def sweep_dead_sockets(self) -> None:
+        """Remove control sockets whose master is gone -- and only those.
+
+        retire_compute_masters, a few lines above, validates every control path
+        before touching it: a real socket, owned by this user.  This did not.  It
+        unlinked whatever the glob returned the moment `ssh -O check` failed,
+        with no validation and no second look.
+
+        That leaves a window.  Between the check and the unlink, another
+        hpc-alloc process can authenticate and install a brand-new *live* master
+        at the same %C-derived path.  Deleting its socket orphans an
+        authenticated connection: the master lingers for its whole ControlPersist
+        with nobody able to reach it, and every later command spawns yet another
+        one -- which on a Duo-gated cluster means another push, for each.
+
+        Re-checking the inode between the check and the unlink closes the window:
+        a replacement master is a new socket, so its identity differs and it is
+        left alone.
+        """
+
         ssh_dir = Path(getattr(self.paths, "ssh_dir"))
         for socket in ssh_dir.glob("hpc-alloc-*"):
+            try:
+                before = socket.lstat()
+            except OSError:
+                continue
+            if not stat.S_ISSOCK(before.st_mode) or before.st_uid != os.geteuid():
+                # Not a control socket, or not ours.  Never unlink it.
+                continue
             result = self._run(
                 ["ssh", "-S", str(socket), "-O", "check", "unused"],
                 capture_output=True,
                 text=True,
                 stdin=subprocess.DEVNULL,
             )
-            if result.returncode != 0:
-                try:
-                    socket.unlink()
-                except OSError:
-                    pass
+            if result.returncode == 0:
+                continue
+            try:
+                after = socket.lstat()
+            except OSError:
+                continue
+            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                # A live master took this path while we were checking the dead
+                # one.  It is not the socket we proved was dead.
+                continue
+            try:
+                socket.unlink()
+            except OSError:
+                pass
 
     def compute_endpoints(self, cluster: str) -> dict[str, str]:
         """The cluster's published compute aliases, mapped to their nodes.

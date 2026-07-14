@@ -13,9 +13,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from hpc_alloc.errors import (
+    HpcAllocError,
     JobIdReused,
     LifecycleRevisionConflict,
     StateConflict,
+    StateIntegrityViolation,
     StateInvalid,
     TransportLost,
 )
@@ -43,6 +45,45 @@ class StateRepositoryTests(unittest.TestCase):
         ).initialize()
         self.owner = self.repo.get_or_create_machine_id("laptop")
         self.operation_id = "a" * 32
+
+    def test_an_unanticipated_constraint_violation_is_typed_not_a_traceback(self) -> None:
+        """A CHECK nobody expected to fire must not escape as a raw sqlite error.
+
+        transaction() re-raised sqlite3.IntegrityError unchanged.  Only two of the
+        fourteen writers catch it, so a constraint violation from any of the other
+        twelve sailed straight past cli.main's `except HpcAllocError` and printed a
+        Python traceback -- breaking the very no-traceback contract that the whole
+        typed-error boundary exists to uphold.
+        """
+
+        with self.assertRaises(StateIntegrityViolation) as raised:
+            with self.repo.transaction() as connection:
+                # phase=FINAL with no final_source violates the jobs CHECK.
+                connection.execute(
+                    """INSERT INTO jobs(
+                           operation_id, cluster, logical_name, kind, owner_id,
+                           slurm_job_name, slurm_comment, phase, resources_json,
+                           created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        "f" * 32, "grace", "dev", "allocation", self.owner,
+                        "n", "c", "FINAL", "{}", "2026-07-14T00:00:00Z",
+                        "2026-07-14T00:00:00Z",
+                    ),
+                )
+
+        # Reaches the CLI boundary as a typed failure with an exit code ...
+        self.assertIsInstance(raised.exception, HpcAllocError)
+        self.assertEqual(raised.exception.exit_code, 1)
+        # ... while remaining a sqlite3.IntegrityError, so the two writers that
+        # inspect the violated index to raise a friendlier conflict still catch it.
+        self.assertIsInstance(raised.exception, sqlite3.IntegrityError)
+
+        # And that friendlier mapping is intact: a duplicate live allocation name
+        # is still reported in the tool's own words, not the database's.
+        self.reserve(operation_id="a" * 32)
+        with self.assertRaisesRegex(StateConflict, "already has a non-final job"):
+            self.reserve(operation_id="b" * 32)
 
     def reserve(self, *, operation_id: str | None = None, name: str = "dev"):
         operation_id = operation_id or self.operation_id

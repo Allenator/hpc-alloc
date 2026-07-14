@@ -41,6 +41,10 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--cluster", default="bouchet", help="cluster name")
     setup.add_argument("--host", help="login host (default: <cluster>.ycrc.yale.edu)")
     setup.add_argument("--force", action="store_true", help="replace the v2 config")
+    setup.add_argument(
+        "--identity-file",
+        help="SSH private key to authenticate with (default: keep the configured one)",
+    )
 
     config = sub.add_parser("config", help="show validated effective configuration")
     add_cluster_flag(config)

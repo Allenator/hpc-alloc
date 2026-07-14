@@ -24,6 +24,7 @@ from typing import Any, Callable, Iterator
 
 from .config import Config
 from .errors import (
+    EXIT_SUBMITTED_NOT_READY,
     AmbiguousSubmission,
     AuthRequired,
     ConfigInvalid,
@@ -471,7 +472,53 @@ def _validate_setup_scope(
             )
 
 
-def _existing_ssh_key(paths: AppPaths) -> tuple[Path, str] | None:
+def _identity_key_pair(paths: AppPaths, identity_file: str) -> tuple[Path, Path]:
+    """Map a configured ``identity_file`` to its (private, public) key paths."""
+
+    if identity_file.startswith("~/"):
+        private = paths.home / identity_file[2:]
+    else:
+        private = Path(identity_file)
+    return private, Path(f"{private}.pub")
+
+
+def _pinned_ssh_key(paths: AppPaths, identity_file: str) -> tuple[Path, str]:
+    """Resolve an explicitly chosen key, refusing to silently substitute another.
+
+    ``IdentitiesOnly yes`` means the configured key is the *only* one OpenSSH
+    will offer, so quietly falling back to a different one does not degrade
+    gracefully -- it produces an authentication failure the user cannot diagnose,
+    against a cluster where the original key is the one actually registered.
+    """
+
+    private, public = _identity_key_pair(paths, identity_file)
+    if private.is_file() and public.is_file():
+        return public, identity_file
+    raise ConfigInvalid(
+        f"SSH key {identity_file} is missing its "
+        f"{'private' if public.is_file() else 'public'} half "
+        f"(expected {private} and {public}); restore it, or choose another key "
+        "with `hpc-alloc setup --force --identity-file PATH`"
+    )
+
+
+def _existing_ssh_key(
+    paths: AppPaths, preferred: str | None = None
+) -> tuple[Path, str] | None:
+    """Choose the key setup should authenticate with.
+
+    An explicit ``--identity-file``, or the key already recorded in the config,
+    always wins over the standard-name probe below.  The probe only knows four
+    hard-coded filenames, so a key named anything else -- ``~/.ssh/id_yale``,
+    say, which is the one actually registered with the cluster -- was invisible
+    to it: `setup --force`, the documented way to fix a NetID typo, silently
+    repointed the config at whichever standard-named key happened to exist, and
+    because ``IdentitiesOnly yes`` offers only that key, every later command
+    failed to authenticate with no way to see why.
+    """
+
+    if preferred is not None:
+        return _pinned_ssh_key(paths, preferred)
     for filename in (
         "id_ed25519_hpc_alloc.pub",
         "id_ed25519.pub",
@@ -485,8 +532,10 @@ def _existing_ssh_key(paths: AppPaths) -> tuple[Path, str] | None:
     return None
 
 
-def _find_or_create_ssh_key(paths: AppPaths) -> tuple[Path, str]:
-    existing = _existing_ssh_key(paths)
+def _find_or_create_ssh_key(
+    paths: AppPaths, preferred: str | None = None
+) -> tuple[Path, str]:
+    existing = _existing_ssh_key(paths, preferred)
     if existing is not None:
         return existing
     try:
@@ -573,7 +622,16 @@ def cmd_setup(args: Any, *, paths: AppPaths, entrypoint: Path) -> int:
 
         # Key choice is authoritative only under the same exclusive lock that
         # serializes other setup invocations.
-        existing_key = _existing_ssh_key(paths)
+        #
+        # `--force` exists to repair a NetID or host mistake.  Re-keying is a far
+        # more consequential act -- the key has to be registered with the cluster
+        # before it works -- so it must be asked for explicitly, never arrive as a
+        # side effect of fixing a typo.  An existing configured key therefore
+        # wins over the standard-name probe.
+        preferred_identity = getattr(args, "identity_file", None) or (
+            prior.ssh.identity_file if prior is not None else None
+        )
+        existing_key = _existing_ssh_key(paths, preferred_identity)
         planned_identity = (
             existing_key[1] if existing_key else "~/.ssh/id_ed25519_hpc_alloc"
         )
@@ -585,7 +643,7 @@ def cmd_setup(args: Any, *, paths: AppPaths, entrypoint: Path) -> int:
         )
         _validate_setup_scope(prior, committed_candidate, jobs, operations)
 
-        public_key, identity_file = _find_or_create_ssh_key(paths)
+        public_key, identity_file = _find_or_create_ssh_key(paths, preferred_identity)
         if identity_file != planned_identity:
             raise StateConflict("SSH key selection changed during setup; rerun setup")
         try:
@@ -1655,8 +1713,13 @@ def cmd_up(
                 f"(waited {elapsed}s)"
             )
             if elapsed >= args.wait_timeout:
-                info(f"leaving job queued; inspect it with `hpc-alloc status`")
-                return 0
+                info(
+                    f"job {job.job_id} is still queued after {elapsed}s; it remains "
+                    f"submitted and tracked — do not resubmit. Wait for it with "
+                    f"`hpc-alloc status` or `hpc-alloc logs {cluster}:{job.job_id} -f`, "
+                    f"or release it with `hpc-alloc down {args.name}`"
+                )
+                return EXIT_SUBMITTED_NOT_READY
             time.sleep(
                 backoff.interval(
                     (

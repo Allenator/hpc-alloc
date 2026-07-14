@@ -26,6 +26,7 @@ from .errors import (
     LifecycleRevisionConflict,
     RecordNotFound,
     StateConflict,
+    StateIntegrityViolation,
     StateInvalid,
 )
 from .models import (
@@ -460,12 +461,17 @@ class StateRepository:
                 connection.execute("COMMIT")
             except sqlite3.Error as exc:
                 raise StateInvalid(f"cannot commit state transaction: {exc}", path=self.path) from exc
-        except sqlite3.IntegrityError:
+        except sqlite3.IntegrityError as exc:
             try:
                 connection.execute("ROLLBACK")
             except sqlite3.Error:
                 pass
-            raise
+            # Re-raised as a type that is *both* a sqlite3.IntegrityError and an
+            # HpcAllocError, preserving the original message.  Writers that
+            # inspect the violated index to produce a friendlier conflict keep
+            # catching it exactly as before; a violation nobody anticipated now
+            # reaches the CLI as a typed failure rather than a raw traceback.
+            raise StateIntegrityViolation(str(exc)) from exc
         except sqlite3.Error as exc:
             try:
                 connection.execute("ROLLBACK")
@@ -637,6 +643,17 @@ class StateRepository:
                 )
             if operation_phase is not OperationPhase.ACKNOWLEDGED:
                 job = self._require_job_row(connection, operation_id)
+                # This is the one job write that does not go through
+                # _update_job_row, so it carries no transition check of its own.
+                # Without this precondition it would force phase='QUEUED' onto
+                # *any* row -- including a FINAL one, whose final_source and
+                # finalized_at it would leave behind, violating the jobs CHECK
+                # and failing as a database error rather than a legible one.
+                if JobPhase(job["phase"]) is not JobPhase.SUBMITTING:
+                    raise StateConflict(
+                        f"submission {operation_id} cannot be acknowledged: its job "
+                        f"is already {job['phase']}, not SUBMITTING"
+                    )
                 job_now = self._next_job_timestamp(now, job["updated_at"])
                 connection.execute(
                     """UPDATE jobs SET job_id = ?, phase = ?, updated_at = ?

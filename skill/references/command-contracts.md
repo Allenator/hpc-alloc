@@ -6,10 +6,10 @@ Use this reference to choose exact invocations and interpret public CLI results.
 
 | Command | Contract |
 |---|---|
-| `hpc-alloc setup --netid NETID [--cluster C] [--host HOST] [--force]` | Validate and write the authoritative v2 configuration, initialize state, find or create key material, and install the managed SSH include. Require `--force` to replace an existing config. |
+| `hpc-alloc setup --netid NETID [--cluster C] [--host HOST] [--identity-file PATH] [--force]` | Validate and write the authoritative v2 configuration, initialize state, find or create key material, and install the managed SSH include. Require `--force` to replace an existing config. `--force` repairs a NetID or host mistake and never re-keys: a configured `identity_file` is preserved, since that key is the one registered with the cluster. Re-key only with an explicit `--identity-file`. |
 | `hpc-alloc config [--cluster C] [--json]` | Validate configuration and report effective resource values without cluster access. |
 | `hpc-alloc connect [--cluster C] [--reset] [--push]` | Establish or heal login masters and health-check known allocation nodes; use `--push` only after warning the user about one Duo push. |
-| `hpc-alloc up [--name N] [resources] [--idle-timeout MIN] [--no-wait] [--wait-timeout SEC]` | Submit a persistent sleeper allocation. Wait for an active node unless `--no-wait` returns immediately after durable submission acknowledgement or the wait timeout expires. |
+| `hpc-alloc up [--name N] [resources] [--idle-timeout MIN] [--no-wait] [--wait-timeout SEC]` | Submit a persistent sleeper allocation. Wait for an active node unless `--no-wait` returns immediately after durable submission acknowledgement. Exit 0 means a node is ready; exit 4 means the wait expired with the job still queued — it is submitted and tracked, so wait rather than resubmit. |
 | `hpc-alloc run [resources] [--chdir DIR] [--detach] -- CMD...` | Submit a finite batch command. Follow its operation-scoped log in foreground mode or return after acknowledged submission with `--detach`. |
 | `hpc-alloc status [--json]` | Reconcile locally journaled jobs and classify v2-tagged queue rows across every configured cluster. |
 | `hpc-alloc why [TARGET] [--cluster C] [--json]` | Diagnose the selected queued, active, inactive, uncertain, or final job and persist any applicable delayed accounting evidence. |
@@ -69,6 +69,8 @@ Treat JSON stdout as the stable machine surface and do not parse display text.
 ## Exit, stream, and signal policy
 
 Treat argparse usage failures, including missing required arguments and invalid typed values, as exit 2; they print usage and occur before command dispatch. Interpret a post-parse hpc-alloc validation, scheduler, protocol, or application failure as exit 1. Interpret typed authentication, host-key, or transport failures as exit 3, but inspect stderr and command context because exit statuses can be passed through.
+
+Interpret exit 4 from `up` as "submitted, not ready yet": the wait expired while the allocation was still queued. This is neither success nor failure. The job is submitted, durable, and tracked, so never resubmit it — poll `hpc-alloc status`, follow it with `hpc-alloc logs CLUSTER:JOBID -f`, or release it with `hpc-alloc down NAME`. On a busy GPU partition this is an ordinary outcome, not an error.
 
 Let foreground `run` return the numeric batch exit status when exact accounting provides it. When confirmed queue finality has no accounting exit status, return 0 for `COMPLETED` and 1 otherwise; coerce any non-`COMPLETED` final state with numeric status 0 to 1.
 

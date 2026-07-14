@@ -17,6 +17,7 @@ from hpc_alloc.commands import (
 )
 from hpc_alloc.config import Config
 from hpc_alloc.errors import (
+    EXIT_SUBMITTED_NOT_READY,
     HpcAllocError,
     LifecycleRevisionConflict,
     SchedulerUnavailable,
@@ -471,6 +472,81 @@ class CommandStreamPolicyTests(unittest.TestCase):
         self.assertIs(raised.exception, interrupt)
         persist.assert_called_once()
         self.assertIn("was not cancelled and may remain queued or running", stderr.getvalue())
+
+    def test_up_that_times_out_still_queued_is_neither_success_nor_failure(self) -> None:
+        """`up` used to return 0 when its wait expired with the job still queued.
+
+        On a busy GPU partition that is a routine outcome, not an edge case -- and
+        0 told an agent the seat was ready, so it would `ssh` into a queued
+        allocation, or resubmit.  Exit 1 would be just as wrong: nothing failed.
+        The job is submitted, durable and healthy; it is simply still waiting, and
+        the only correct next action is to keep waiting.  That is a third outcome
+        and it gets its own code, so an agent can branch without parsing prose.
+        """
+
+        job = SimpleNamespace(
+            ref=object(),
+            cluster="grace",
+            job_id="12345",
+            operation_id="b" * 32,
+            phase=JobPhase.QUEUED,
+        )
+        context = self.context()
+        context.state = SimpleNamespace(get_job=Mock(return_value=job))
+        resources = {
+            "partition": "day",
+            "time": "1:00:00",
+            "cpus": 2,
+            "mem": None,
+            "gpus": None,
+            "constraint": None,
+            "chdir": None,
+            "idle_timeout": None,
+        }
+        assessment = SimpleNamespace(
+            phase=JobPhase.QUEUED,
+            current_node=None,
+            final=False,
+            scheduler_state="PENDING",
+        )
+
+        with (
+            patch("hpc_alloc.commands._resource_values", return_value=resources),
+            patch("hpc_alloc.commands._submit_job", return_value=job),
+            patch(
+                "hpc_alloc.commands._services",
+                return_value=(SimpleNamespace(), object()),
+            ),
+            patch(
+                "hpc_alloc.monitor.JobMonitor",
+                return_value=SimpleNamespace(
+                    assess=Mock(return_value=SimpleNamespace(assessment=assessment))
+                ),
+            ),
+            patch(
+                "hpc_alloc.commands._persist_reconciled_assessment",
+                return_value=(job, assessment, None),
+            ),
+            patch("hpc_alloc.commands.info") as report,
+        ):
+            status = cmd_up(
+                SimpleNamespace(
+                    cluster=None,
+                    name="dev",
+                    wait_timeout=0,  # the wait is already over
+                    dry_run=False,
+                    no_wait=False,
+                ),
+                ctx=context,
+                paths=AppPaths.for_home(Path("/tmp/hpc-alloc-policy-test")),
+                entrypoint=Path("/tmp/hpc-alloc"),
+            )
+
+        self.assertEqual(status, EXIT_SUBMITTED_NOT_READY)
+        self.assertNotEqual(status, 0)
+        # And the message must leave no doubt about the one dangerous action.
+        message = " ".join(str(call.args[0]) for call in report.call_args_list)
+        self.assertIn("do not resubmit", message)
 
     def test_run_exit_code_comes_from_reconciled_final_authority(self) -> None:
         job = self.job()

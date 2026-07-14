@@ -34,6 +34,66 @@ def completed(argv: object, rc: int = 0, stdout: str = "", stderr: str = ""):
 
 
 class SshTransportTests(unittest.TestCase):
+    def live_socket(self, path: Path):
+        """Bind a real AF_UNIX socket and keep it alive for the test."""
+
+        import socket as socket_module
+
+        endpoint = socket_module.socket(socket_module.AF_UNIX, socket_module.SOCK_STREAM)
+        endpoint.bind(str(path))
+        self.addCleanup(endpoint.close)
+        return endpoint
+
+    def test_the_socket_sweep_only_unlinks_a_socket_it_proved_was_dead(self) -> None:
+        """The sweep unlinked whatever the glob returned, unvalidated.
+
+        retire_compute_masters, a few lines above it, carefully checks that a
+        control path is a real socket owned by this user before touching it.  The
+        sweep did neither -- and it re-checked nothing between the `-O check` and
+        the unlink.  That window matters: another hpc-alloc process can
+        authenticate and install a brand-new *live* master at the same %C-derived
+        path in between, and deleting its socket orphans an authenticated
+        connection for its whole ControlPersist while every later command spawns
+        another master -- another Duo push each, on a gated cluster.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dead = root / "hpc-alloc-dead"
+            alive = root / "hpc-alloc-alive"
+            replaced = root / "hpc-alloc-replaced"
+            regular = root / "hpc-alloc-not-a-socket"
+
+            self.live_socket(dead)
+            self.live_socket(alive)
+            self.live_socket(replaced)
+            regular.write_text("this is a plain file, not a control socket\n")
+
+            def runner(argv: list[str], **_kwargs: object):
+                path = Path(argv[argv.index("-S") + 1])
+                if path == alive:
+                    return completed(argv)  # master answers: still live
+                if path == replaced:
+                    # The master dies, and a *new* one takes the same path
+                    # before we get to the unlink.
+                    replaced.unlink()
+                    self.live_socket(replaced)
+                    return completed(argv, 255)
+                return completed(argv, 255)  # dead
+
+            transport = self.transport(runner, root)
+            transport.sweep_dead_sockets()
+
+            self.assertFalse(dead.exists(), "a proven-dead socket was left behind")
+            self.assertTrue(alive.exists(), "a live master's socket was unlinked")
+            self.assertTrue(
+                replaced.exists(),
+                "a live master that replaced the dead one was unlinked (TOCTOU)",
+            )
+            self.assertTrue(
+                regular.exists(), "a non-socket file in ~/.ssh was unlinked"
+            )
+
     def test_a_stalled_node_probe_does_not_retire_a_live_master(self) -> None:
         """A probe timeout means the node is slow, not that its master is dead.
 
