@@ -106,6 +106,11 @@ _ACTIVE = frozenset({"RUNNING", "RESIZING", "SIGNALING"})
 _QUEUED = frozenset({"PENDING", "CONFIGURING", "RESV_DEL_HOLD"})
 _STARTED_INACTIVE = frozenset({"SUSPENDED", "STOPPED", "COMPLETING", "STAGE_OUT"})
 _REQUEUEING = frozenset({"REQUEUED", "REQUEUE_FED", "REQUEUE_HOLD", "SPECIAL_EXIT"})
+# The only non-final states a landed cancellation can be observed draining
+# through: a running job cancelled successfully passes RUNNING -> COMPLETING ->
+# terminal, or lingers in a stage-out epilog.  Observing any OTHER non-final
+# state proves a cancellation never arrived.
+_CANCELLATION_DRAINING = frozenset({"COMPLETING", "STAGE_OUT"})
 _PROVES_STARTED = _ACTIVE | _STARTED_INACTIVE | _REQUEUEING | frozenset(
     {
         "COMPLETED",
@@ -407,6 +412,19 @@ def awaits_requeue_confirmation(assessment: JobAssessment) -> bool:
     )
 
 
+def proves_cancellation_did_not_land(assessment: JobAssessment) -> bool:
+    """True when a read-only observation shows the job in a state a landed
+    cancellation could not have produced -- so an ambiguous cancellation whose
+    reply was lost definitely never arrived, and its guard can be released for
+    an idempotent retry.  Final and uncertain assessments return False (handled
+    by their own paths); a job still draining ({COMPLETING, STAGE_OUT}) also
+    returns False, because that IS consistent with a cancellation that landed."""
+
+    if assessment.final or assessment.uncertain:
+        return False
+    return state_code(assessment.scheduler_state or "") not in _CANCELLATION_DRAINING
+
+
 __all__ = [
     "AssessmentPhase",
     "EvidenceEvent",
@@ -414,5 +432,6 @@ __all__ = [
     "EvidenceTracker",
     "JobAssessment",
     "awaits_requeue_confirmation",
+    "proves_cancellation_did_not_land",
     "state_code",
 ]

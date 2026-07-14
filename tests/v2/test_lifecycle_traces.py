@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import unittest
 
-from hpc_alloc.lifecycle import AssessmentPhase, EvidenceEvent, EvidenceTracker
+from hpc_alloc.lifecycle import (
+    AssessmentPhase,
+    EvidenceEvent,
+    EvidenceTracker,
+    proves_cancellation_did_not_land,
+)
 from hpc_alloc.models import FinalSource, JobPhase
 from hpc_alloc.slurm import FINAL_STATES, AccountingRecord, QueueRow
 
@@ -358,6 +363,37 @@ class LifecycleTraceTests(unittest.TestCase):
         self.assertEqual(upgraded.final_source, FinalSource.ACCOUNTING)
         self.assertEqual(upgraded.terminal_state, "COMPLETED")
         self.assertEqual(upgraded.exit_code, "0:0")
+
+    def test_only_draining_states_hold_an_ambiguous_cancellation(self) -> None:
+        """The read-only classifier that decides whether to release the guard.
+
+        A landed cancellation can only be observed draining (COMPLETING /
+        STAGE_OUT); every other non-final live state proves it never arrived.
+        Final and uncertain assessments are handled by their own paths and must
+        never release the guard from here.
+        """
+
+        for state in ("RUNNING", "PENDING", "SUSPENDED", "STOPPED"):
+            assessment = EvidenceTracker().accept(EvidenceEvent.queue(row(state, node="node01")))
+            self.assertTrue(
+                proves_cancellation_did_not_land(assessment),
+                msg=f"{state} is plainly alive and not draining",
+            )
+
+        for state in ("COMPLETING", "STAGE_OUT"):
+            assessment = EvidenceTracker().accept(EvidenceEvent.queue(row(state, node="node01")))
+            self.assertFalse(
+                proves_cancellation_did_not_land(assessment),
+                msg=f"{state} is consistent with a cancellation that landed",
+            )
+
+        final = EvidenceTracker().accept(EvidenceEvent.final(final_record("COMPLETED", "0:0")))
+        self.assertTrue(final.final)
+        self.assertFalse(proves_cancellation_did_not_land(final))
+
+        uncertain = EvidenceTracker().accept(EvidenceEvent.transport_lost())
+        self.assertTrue(uncertain.uncertain)
+        self.assertFalse(proves_cancellation_did_not_land(uncertain))
 
 
 if __name__ == "__main__":

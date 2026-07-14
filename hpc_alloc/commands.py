@@ -2843,7 +2843,7 @@ def _recover_cancel(ctx: Any, client: Any | None, operation: Any, job: Any) -> b
     """Reconcile a cancellation using local phase and read-only evidence only."""
 
     from .errors import ProtocolViolation
-    from .lifecycle import AssessmentPhase
+    from .lifecycle import proves_cancellation_did_not_land
     from .monitor import JobMonitor
     from .ssh import AuthMode
 
@@ -2880,24 +2880,18 @@ def _recover_cancel(ctx: Any, client: Any | None, operation: Any, job: Any) -> b
             confirm=True,
         ).assessment
         observed = assessment.scheduler_state or assessment.phase.value
-        # Only a job observed unambiguously alive and NOT dying proves the
-        # cancellation never took effect: a landed cancellation moves a job
-        # toward a terminal state, so ACTIVE (RUNNING) or QUEUED (PENDING) means
-        # it never arrived, and the guard can be released for an explicit retry.
-        #
-        # Every other non-final observation is consistent with a cancellation
-        # that DID land: STARTED_INACTIVE covers COMPLETING and STAGE_OUT --
-        # exactly the states a cancelled RUNNING job drains through -- while
-        # REQUEUEING and TERMINAL_CANDIDATE are transitional or already a death
-        # candidate, and UNCERTAIN is no observation at all.  Releasing the guard
-        # on any of those would permit a second cancellation and, worse, record
-        # one that succeeded as FAILED -- the exact false history the operation
-        # journal exists to prevent -- so they stay ambiguous and wait for a
-        # conclusive terminal or a return to plainly-alive.
-        proves_cancellation_missed = assessment.phase in {
-            AssessmentPhase.ACTIVE,
-            AssessmentPhase.QUEUED,
-        }
+        # A landed cancellation moves a job toward a terminal state, so the only
+        # non-final states it can be observed in are the draining ones
+        # (COMPLETING, STAGE_OUT).  Observing any other non-final live state --
+        # RUNNING, PENDING, SUSPENDED, STOPPED, a requeue state -- therefore
+        # proves the cancellation never arrived, and the guard can be released
+        # for an idempotent retry.  Holding only on the small draining set (and
+        # on uncertainty, which is no observation at all) is strictly safer than
+        # an "alive" whitelist: mislabelling a genuine drain state as alive would
+        # record a cancellation that succeeded as FAILED and permit a second one
+        # -- the exact false history the operation journal exists to prevent.
+        # The classification itself lives in the lifecycle layer.
+        proves_cancellation_missed = proves_cancellation_did_not_land(assessment)
         if not proves_cancellation_missed and not assessment.final:
             ctx.state.mark_cancel_ambiguous(
                 operation.operation_id,

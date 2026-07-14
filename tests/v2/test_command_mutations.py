@@ -3276,6 +3276,61 @@ host = "secondary.example.edu"
         with self.assertRaisesRegex(StateConflict, "pending cancellation"):
             self.repository.begin_cancel(OPERATION_ID, operation_id="d" * 32)
 
+    def test_recovery_releases_a_suspended_allocation(self) -> None:
+        """A SUSPENDED (or STOPPED) allocation is alive and not draining.
+
+        Both map to AssessmentPhase.STARTED_INACTIVE, so the old ACTIVE/QUEUED
+        whitelist held them AMBIGUOUS forever -- a live GPU allocation that
+        merely suspended could never be released through the CLI.  A landed
+        cancellation cannot produce SUSPENDED, so it proves the cancellation
+        never arrived: the guard must be released for an idempotent retry.
+        """
+
+        job = self.acknowledged_job()
+        assert job.ref is not None
+        self.repository.update_job(OPERATION_ID, phase=JobPhase.ACTIVE, ever_started=True, current_node="node01")
+        cancel = self.repository.begin_cancel(OPERATION_ID, operation_id="c" * 32)
+        self.repository.mark_cancel_dispatching(cancel.operation_id)
+        self.repository.mark_cancel_ambiguous(cancel.operation_id, "transport lost after dispatch")
+
+        suspended = QueueRow(
+            job_id=job.job_id or "",
+            state="SUSPENDED",
+            node="node01",
+            reason="None",
+            time_left="1:00:00",
+            partition="day",
+            name=job.slurm_job_name,
+            submitted_at="2026-07-10T11:00:00",
+            comment=job.slurm_comment,
+        )
+        # SUSPENDED is a plainly-alive, non-draining observation, so the monitor
+        # settles on the first read; scripting a second (as the draining test
+        # does) is harmless because it is never consumed.
+        script = StrictScript(
+            [
+                ExpectedCall("observe", result=suspended, args=(job.ref,), kwargs={"auth": AuthMode.NONINTERACTIVE}),
+                ExpectedCall("observe", result=suspended, args=(job.ref,), kwargs={"auth": AuthMode.NONINTERACTIVE}),
+            ]
+        )
+        operation = self.repository.get_operation(cancel.operation_id)
+        with patch("hpc_alloc.commands.info"):
+            self.assertTrue(
+                _recover_cancel(self.context, StrictProxy(script), operation, job)
+            )
+
+        # The guard is released (FAILED), and a fresh cancellation can now be
+        # dispatched without the "pending cancellation" conflict.
+        self.assertEqual(
+            self.repository.get_operation(cancel.operation_id).phase,
+            OperationPhase.FAILED,
+        )
+        retried = self.repository.begin_cancel(OPERATION_ID, operation_id="d" * 32)
+        self.assertEqual(retried.phase, OperationPhase.CANCEL_PENDING)
+
+        # Recovery is read-only about the job itself: its row keeps its phase.
+        self.assertEqual(self.repository.get_job(OPERATION_ID).phase, JobPhase.ACTIVE)
+
     def test_an_ambiguous_cancellation_does_not_wedge_the_seat_forever(self) -> None:
         """The full wedge, end to end.
 
