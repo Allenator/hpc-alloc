@@ -23,7 +23,7 @@ from hpc_alloc.slurm import (
     SubmissionSpec,
     _LOG_CHUNK_SIGPIPE_STATUS,
 )
-from hpc_alloc.ssh import RemoteResult, RetryPolicy
+from hpc_alloc.ssh import AuthMode, RemoteResult, RetryPolicy
 
 
 NONCE = "fixed"
@@ -183,10 +183,16 @@ class SlurmProtocolTests(unittest.TestCase):
         self.assertLess(command.index(source), command.index(sink))
         self.assertIn(f'[ "$n" -le {MAX_LOG_CHUNK_BYTES} ]', command)
 
-    def test_nonzero_scheduler_status_is_typed_not_empty_snapshot(self) -> None:
+    # These four exercise the queue protocol's strictest guarantees.  They used to
+    # drive them through `snapshot()`, a compatibility shim that production never
+    # called -- so the tightest rules in the scheduler adapter were being proven
+    # against a door nobody opens.  They now go through `scan()` and `observe()`,
+    # the entry points that actually run.
+
+    def test_nonzero_scheduler_status_is_typed_not_an_empty_queue(self) -> None:
         client, _transport = self.client([framed(b"", rc=1)])
         with self.assertRaises(SchedulerUnavailable):
-            client.snapshot()
+            client.scan()
 
     def test_only_framed_command_stderr_is_reported(self) -> None:
         client, _transport = self.client(
@@ -200,7 +206,7 @@ class SlurmProtocolTests(unittest.TestCase):
             ]
         )
         with self.assertRaises(SchedulerUnavailable) as raised:
-            client.snapshot()
+            client.scan()
         self.assertIn("scheduler failed: \ufffd", str(raised.exception))
         self.assertNotIn("site startup warning", str(raised.exception))
 
@@ -216,38 +222,44 @@ class SlurmProtocolTests(unittest.TestCase):
                 )
             ]
         )
-        snapshot = client.snapshot(["123"])
-        self.assertEqual(dict(snapshot.rows), {})
+        self.assertIsNone(client.observe("123"))
         self.assertIn(" -j 123 ", transport.calls[0][1])
 
     def test_invalid_job_normalization_rejects_every_broader_shape(self) -> None:
         exact_error = "slurm_load_jobs error: Invalid job id specified\n"
-        cases = (
-            ("unfiltered", None, framed(b"", rc=1, stderr=exact_error)),
-            ("multiple IDs", ["123", "124"], framed(b"", rc=1, stderr=exact_error)),
-            ("output bearing", ["123"], framed(b"\n", rc=1, stderr=exact_error)),
-            ("wrong rc", ["123"], framed(b"", rc=2, stderr=exact_error)),
+        # A single targeted query is the only shape allowed to normalize "invalid
+        # job id" into absence.  Everything else must stay a typed failure.
+        targeted = (
+            ("output bearing", framed(b"\n", rc=1, stderr=exact_error)),
+            ("wrong rc", framed(b"", rc=2, stderr=exact_error)),
             (
                 "different error",
-                ["123"],
                 framed(b"", rc=1, stderr="slurm_load_jobs error: Socket timed out\n"),
             ),
-            (
-                "extra stderr",
-                ["123"],
-                framed(b"", rc=1, stderr="warning\n" + exact_error),
-            ),
-            (
-                "extra trailing line",
-                ["123"],
-                framed(b"", rc=1, stderr=exact_error + "\n"),
-            ),
+            ("extra stderr", framed(b"", rc=1, stderr="warning\n" + exact_error)),
+            ("extra trailing line", framed(b"", rc=1, stderr=exact_error + "\n")),
         )
-        for label, selected, reply in cases:
+        for label, reply in targeted:
             with self.subTest(label=label):
                 client, _transport = self.client([reply])
                 with self.assertRaises(SchedulerUnavailable):
-                    client.snapshot(selected)
+                    client.observe("123")
+
+        with self.subTest(label="unfiltered"):
+            client, _transport = self.client(
+                [framed(b"", rc=1, stderr=exact_error)]
+            )
+            with self.assertRaises(SchedulerUnavailable):
+                client.scan()
+
+        with self.subTest(label="multiple IDs"):
+            # No public entry point selects several job IDs at once, so this
+            # drives the primitive directly to keep the guard covered.
+            client, _transport = self.client(
+                [framed(b"", rc=1, stderr=exact_error)]
+            )
+            with self.assertRaises(SchedulerUnavailable):
+                client._raw_queue(["123", "124"], auth=AuthMode.NONINTERACTIVE)
 
     def test_broad_scan_preserves_valid_arrays_and_multi_node_expressions(self) -> None:
         delimiter = f"__HPC_{NONCE}__"

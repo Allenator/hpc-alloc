@@ -10,9 +10,9 @@ from pathlib import Path
 from typing import Any, ClassVar, Mapping
 
 from .errors import ConfigInvalid
+from .ownership import IDENTIFIER_RE
 
 
-_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$")
 _NETID = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{1,63}$")
 _PARTITION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _SLURM_TIME = re.compile(
@@ -199,7 +199,7 @@ class Config:
         defaults_raw = _table(raw.get("defaults", {}), "defaults", config_path)
         _reject_unknown(defaults_raw, cls.RESOURCE_KEYS | {"cluster"}, "defaults", config_path)
         default_cluster = _string(defaults_raw, "cluster", "defaults", config_path)
-        if default_cluster is not None and not _IDENTIFIER.fullmatch(default_cluster):
+        if default_cluster is not None and not IDENTIFIER_RE.fullmatch(default_cluster):
             raise ConfigInvalid("[defaults].cluster is not a valid cluster name", path=config_path)
         defaults_values = cls._resource_values(defaults_raw, "defaults", config_path)
         defaults = DefaultsConfig(cluster=default_cluster, **defaults_values)
@@ -209,7 +209,7 @@ class Config:
             raise ConfigInvalid("at least one [cluster.NAME] table is required", path=config_path)
         clusters: dict[str, ClusterConfig] = {}
         for name, value in cluster_tables.items():
-            if not isinstance(name, str) or not _IDENTIFIER.fullmatch(name):
+            if not isinstance(name, str) or not IDENTIFIER_RE.fullmatch(name):
                 raise ConfigInvalid(f"cluster name {name!r} is invalid", path=config_path)
             section = f"cluster.{name}"
             table = _table(value, section, config_path)

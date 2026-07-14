@@ -100,7 +100,14 @@ class JobRecord:
     slurm_job_name: str
     slurm_comment: str
     phase: JobPhase
-    resources: dict[str, Any] = field(default_factory=dict)
+    # Excluded from the generated __hash__, not from ==.  frozen+slots makes
+    # dataclasses synthesize a __hash__, so this type advertises itself as
+    # hashable exactly like its siblings -- but a dict field made that hash raise
+    # TypeError, so the first set(jobs) or {job: alias} (the natural way to dedupe
+    # the multi-cluster job lists built here) blew up with an *untyped* error that
+    # escapes the CLI's error boundary.  Equal records have equal resources, so
+    # equal records still hash equal: the hash/eq contract holds.
+    resources: dict[str, Any] = field(default_factory=dict, hash=False)
     job_id: str | None = None
     ever_started: bool = False
     current_node: str | None = None

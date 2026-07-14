@@ -13,6 +13,7 @@ from typing import Callable, Iterable, Mapping
 
 from .errors import ConfigInvalid
 from .locking import configuration_scope_lock
+from .ownership import COMPUTE_NODE_RE, IDENTIFIER_PATTERN
 from .models import (
     EvidenceProvenance,
     JobKind,
@@ -24,10 +25,12 @@ from .models import (
 
 INCLUDE_LINE = "Include ~/.config/hpc-alloc/ssh_config"
 _MANAGED_HEADER = "# Managed by hpc-alloc v2 — regenerated; do not edit."
-_COMPUTE_NODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,252}\Z")
+# Built from the shared identifier grammar rather than restating it: an alias is
+# exactly "hpc-<cluster>.<name>", so if the grammar for either widens and this
+# regex does not, every projected stanza silently stops being recognized -- and
+# compute-master retirement and node leasing quietly stop working, with no error.
 _MANAGED_ALLOCATION_ALIAS = re.compile(
-    r"hpc-([A-Za-z0-9][A-Za-z0-9_-]{0,62})\."
-    r"([A-Za-z0-9][A-Za-z0-9_-]{0,62})\Z"
+    rf"hpc-({IDENTIFIER_PATTERN})\.({IDENTIFIER_PATTERN})\Z"
 )
 _CONTROL_CLUSTER_DIGEST_LENGTH = 8
 _SCHEDULER_TERMINAL_PROVENANCE = frozenset(
@@ -152,7 +155,7 @@ def _managed_compute_stanzas(text: str) -> dict[str, str]:
             or set(directives) - allowed
             or not required.issubset(directives)
             or not identity_shape
-            or _COMPUTE_NODE.fullmatch(node) is None
+            or COMPUTE_NODE_RE.fullmatch(node) is None
             or directives["HostKeyAlias"]
             != compute_host_key_alias(cluster, node)
             or directives["ProxyJump"] != login_alias(cluster)
@@ -550,7 +553,7 @@ def render(
             node = None
         if not node:
             continue
-        if _COMPUTE_NODE.fullmatch(node) is None:
+        if COMPUTE_NODE_RE.fullmatch(node) is None:
             raise ConfigInvalid(f"unsafe compute-node name in state: {node!r}")
         lines += [
             f"Host {alias}",

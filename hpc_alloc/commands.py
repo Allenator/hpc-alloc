@@ -51,7 +51,7 @@ from .models import (
     OperationKind,
     OperationPhase,
 )
-from .ownership import normalize_host_label, parse_tag, slurm_job_name
+from .ownership import IDENTIFIER_RE, normalize_host_label, parse_tag, slurm_job_name
 from .output import neutralize_stderr, neutralize_stdout
 from .paths import AppPaths
 from .retry import PollBackoff, RetryBudget
@@ -70,17 +70,12 @@ DEFAULT_TIME = "4:00:00"
 DEFAULT_CPUS = 2
 DEFAULT_GPU_IDLE_MINUTES = 30
 REMOTE_LOG_DIR = ".hpc-alloc"
-NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}\Z")
 # Characters a remote POSIX shell cannot expand, split on, or execute.  A leading
 # `~` is deliberately allowed: the documented `hpc-alloc sync … '~/project'` form
 # relies on the remote shell expanding it.
 _REMOTE_SYNC_PATH = re.compile(r"[A-Za-z0-9_@%+=:,./~-]+")
 GPU_RE = re.compile(r"(?:[A-Za-z0-9][A-Za-z0-9_.-]*:)?[1-9][0-9]*\Z")
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
-
-
-def _is_job_id(value: str) -> bool:
-    return re.fullmatch(r"[0-9]+", value) is not None
 
 
 def info(message: str) -> None:
@@ -573,7 +568,7 @@ def cmd_setup(args: Any, *, paths: AppPaths, entrypoint: Path) -> int:
     if not netid:
         raise ConfigInvalid("NetID required: hpc-alloc setup --netid YOUR_NETID")
     cluster = args.cluster
-    if not NAME_RE.fullmatch(cluster):
+    if not IDENTIFIER_RE.fullmatch(cluster):
         raise ConfigInvalid(f"invalid cluster name {cluster!r}")
     host = args.host or f"{cluster}.ycrc.yale.edu"
 
@@ -1092,7 +1087,6 @@ def _reconcile_status(
                 client=client,
                 job=job,
                 assessment=assessment,
-                monotonic_evidence=assessment,
                 synchronize_projection=False,
             )
         except HostKeyChanged:
@@ -1320,7 +1314,7 @@ def _submit_job(
     from .slurm import SubmissionSpec
     from .ssh import AuthMode
 
-    if not NAME_RE.fullmatch(logical_name):
+    if not IDENTIFIER_RE.fullmatch(logical_name):
         raise ConfigInvalid(f"invalid logical name {logical_name!r}")
     operation_id = uuid.uuid4().hex
     logfile = logfile_template.format(operation_id=operation_id)
@@ -1485,7 +1479,6 @@ def _persist_reconciled_assessment(
     client: Any,
     job: Any,
     assessment: Any,
-    monotonic_evidence: Any | None = None,
     synchronize_projection: bool = True,
     skip_unchanged_projection: bool = False,
     checkpoint_reconciliation_observations: bool = False,
@@ -1504,7 +1497,11 @@ def _persist_reconciled_assessment(
     source = job
     candidate = assessment
     fresh_tracker = None
-    evidence = monotonic_evidence or assessment
+    # Was a parameter every one of the eight call sites passed the same
+    # object it passed as `assessment`, so the alternative it implied never
+    # existed -- while making the CAS retry loop look as though evidence and
+    # candidate could diverge, which anyone changing it had to disprove first.
+    evidence = assessment
     monotonic_started = bool(evidence.ever_started)
     monotonic_last_node = evidence.last_node
     while True:
@@ -1621,7 +1618,6 @@ def _follow_with_reconciliation(
             client=client,
             job=source,
             assessment=assessment,
-            monotonic_evidence=assessment,
             skip_unchanged_projection=True,
             checkpoint_reconciliation_observations=True,
         )
@@ -1656,7 +1652,7 @@ def cmd_up(
     from .ssh import AuthMode
     cluster = ctx.config.resolve_cluster(args.cluster)
     if (
-        not NAME_RE.fullmatch(args.name)
+        not IDENTIFIER_RE.fullmatch(args.name)
         or args.name.isdigit()
         or args.name in {"login", "run"}
     ):
@@ -1711,7 +1707,6 @@ def cmd_up(
                 client=client,
                 job=job,
                 assessment=assessment,
-                monotonic_evidence=assessment,
             )
             if assessment.phase == AssessmentPhase.ACTIVE and assessment.current_node:
                 alias = allocation_alias(cluster, args.name)
@@ -2300,7 +2295,6 @@ def cmd_logs(
                 client=client,
                 job=job,
                 assessment=assessment,
-                monotonic_evidence=assessment,
             )
         except SchedulerUnavailable:
             job = ctx.state.get_job(job.operation_id)
@@ -2407,7 +2401,6 @@ def cmd_why(
             client=client,
             job=job,
             assessment=assessment,
-            monotonic_evidence=assessment,
         )
 
         # A queue-derived final may predate slurmdbd, while an accounting final
@@ -2451,7 +2444,6 @@ def cmd_why(
                         client=client,
                         job=job,
                         assessment=enriched,
-                        monotonic_evidence=enriched,
                     )
                 if (
                     assessment.final
@@ -2569,7 +2561,6 @@ def _active_allocation(
         client=client,
         job=job,
         assessment=assessment,
-        monotonic_evidence=assessment,
     )
     if assessment.phase != AssessmentPhase.ACTIVE or not assessment.current_node:
         raise HpcAllocError(
@@ -2726,7 +2717,6 @@ def _recover_submission(ctx: Any, client: Any, operation: Any, job: Any) -> bool
                 client=client,
                 job=adopted,
                 assessment=assessment,
-                monotonic_evidence=assessment,
                 synchronize_projection=False,
             )
         info(f"recovered accounting job {operation.cluster}:{adopted.job_id}")

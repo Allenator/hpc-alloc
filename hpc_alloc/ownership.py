@@ -1,4 +1,19 @@
-"""Strong v2 Slurm job identity encoding."""
+"""Strong v2 Slurm job identity encoding, and the name grammars it rests on.
+
+The grammars live here, in the one module with no internal imports, because
+every layer needs them and they must agree exactly.  They used to be written out
+separately in four and three places respectively, which is not a style problem:
+each copy is a gate, and the gates raise different errors.
+
+Widening only the ingest copy of the node grammar -- the natural change, to
+accept a node-list expression -- would make the scheduler adapter happily return
+a row that the repository then refuses to store and the SSH projection then
+refuses to render, bricking `status`, `logs` and `down` for a user whose
+allocation is still running.  Loosening only the CLI's copy of the identifier
+grammar would let a name through that `format_tag` rejects with a bare
+ValueError -- not an HpcAllocError, so it escapes the CLI boundary as a
+traceback.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +23,16 @@ from dataclasses import dataclass
 
 
 TAG_PREFIX = "hpc-alloc:v2:"
-IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}\Z")
+# A cluster name, an allocation's logical name, an ownership-tag field.  Also
+# becomes an SSH alias and a TOML section header, so it stays conservative.
+IDENTIFIER_PATTERN = r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}"
+IDENTIFIER_RE = re.compile(IDENTIFIER_PATTERN + r"\Z")
+
+# A compute-node name as the scheduler reports it, as the repository stores it,
+# and as the SSH projection renders it -- necessarily the same grammar in all
+# three, since a value that clears one gate must clear the others.
+COMPUTE_NODE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,252}\Z")
+
 OPERATION_RE = re.compile(r"[0-9a-f]{32}\Z")
 
 

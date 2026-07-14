@@ -42,6 +42,7 @@ from .models import (
     UNRESOLVED_OPERATION_PHASES,
 )
 from .ownership import (
+    COMPUTE_NODE_RE,
     IDENTIFIER_RE,
     OPERATION_RE,
     parse_tag,
@@ -93,7 +94,6 @@ _SCHEMA_COLUMNS = {
     },
     "cluster_cache": {"cluster", "cache_key", "value_json", "updated_at", "expires_at"},
 }
-_NODE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,252}\Z")
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 _UNSET = object()
 _LOCAL_FINAL_SOURCES = frozenset({FinalSource.SUBMIT_FAILED, FinalSource.ABANDONED})
@@ -1725,7 +1725,7 @@ class StateRepository:
             ):
                 raise StateConflict(f"{field_name} must be printable text")
         for field_name, value in (("current_node", current_node), ("last_node", last_node)):
-            if value is not _UNSET and value is not None and _NODE_NAME.fullmatch(value) is None:
+            if value is not _UNSET and value is not None and COMPUTE_NODE_RE.fullmatch(value) is None:
                 raise StateConflict(f"{field_name} is not a safe compute-node name")
 
     def _prepare_lifecycle_evidence(
@@ -1883,7 +1883,7 @@ class StateRepository:
             ):
                 raise TypeError
             if any(
-                row[key] is not None and _NODE_NAME.fullmatch(row[key]) is None
+                row[key] is not None and COMPUTE_NODE_RE.fullmatch(row[key]) is None
                 for key in ("current_node", "last_node")
             ):
                 raise TypeError

@@ -60,7 +60,6 @@ class FollowOutcome:
     observed_terminal_state: str | None
     final_log_offset: int
     bytes_written: int
-    detach_reason: str | None = None
     # False when the final drain could not read the log to EOF, so the streamed
     # output is knowingly incomplete.  Callers must surface this: it is the
     # difference between "the job printed nothing more" and "we failed to read

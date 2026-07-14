@@ -29,7 +29,7 @@ from .errors import (
     SchedulerUnavailable,
 )
 from .models import JobKind, JobRef
-from .ownership import format_tag, slurm_job_name
+from .ownership import COMPUTE_NODE_RE, format_tag, slurm_job_name
 from .ssh import AuthMode, RetryPolicy, SshTransport
 
 
@@ -134,28 +134,9 @@ class RawQueueScan:
 
     rows: tuple[RawQueueRow, ...]
     remote_time: str | None = None
-    ignored_lines: int = 0
 
     def items(self):
         return ((row.job_id, row) for row in self.rows)
-
-
-@dataclass(frozen=True, slots=True)
-class QueueSnapshot:
-    rows: Mapping[str, QueueRow]
-    remote_time: str | None = None
-
-    def get(self, job_id: str, default: QueueRow | None = None) -> QueueRow | None:
-        return self.rows.get(str(job_id), default)
-
-    def __contains__(self, job_id: object) -> bool:
-        return str(job_id) in self.rows
-
-    def __iter__(self):
-        return iter(self.rows)
-
-    def items(self):
-        return self.rows.items()
 
 
 @dataclass(frozen=True, slots=True)
@@ -341,7 +322,7 @@ def _queue_node(raw: str) -> str | None:
     value = raw.strip()
     if not value or value.lower() in {"(null)", "none", "n/a"}:
         return None
-    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,252}", value) is None:
+    if COMPUTE_NODE_RE.fullmatch(value) is None:
         raise ProtocolViolation(f"squeue returned an invalid compute-node name {value!r}")
     return value
 
@@ -604,39 +585,14 @@ class SlurmClient:
 
         return self._raw_queue(None, auth=auth)
 
-    def snapshot(
-        self,
-        job_ids: Iterable[str | int] | None = None,
-        *,
-        auth: AuthMode = AuthMode.NONINTERACTIVE,
-    ) -> QueueSnapshot:
-        """Compatibility strict snapshot; broad callers should use :meth:`scan`."""
-
-        selected_ids = None if job_ids is None else [_job_id(item) for item in job_ids]
-        if selected_ids == []:
-            return QueueSnapshot({})
-        raw = self._raw_queue(selected_ids, auth=auth)
-        if raw.ignored_lines:
-            raise ProtocolViolation("squeue returned rows with the wrong field count")
-        rows: dict[str, QueueRow] = {}
-        for candidate in raw.rows:
-            row = _strict_queue_row(candidate)
-            if row.job_id in rows:
-                raise ProtocolViolation(f"squeue returned duplicate job ID {row.job_id}")
-            rows[row.job_id] = row
-        return QueueSnapshot(rows, raw.remote_time)
-
     def observe(
         self,
         ref: JobRef | str | int,
         *,
         auth: AuthMode = AuthMode.NONINTERACTIVE,
-        verify_live: bool = True,
     ) -> QueueRow | None:
         job_id = _job_id(ref)
         raw = self._raw_queue((job_id,), auth=auth)
-        if raw.ignored_lines:
-            raise ProtocolViolation("targeted squeue returned rows with the wrong field count")
         unexpected = [candidate.job_id for candidate in raw.rows if candidate.job_id != job_id]
         if unexpected:
             raise ProtocolViolation(
@@ -646,7 +602,11 @@ class SlurmClient:
         if len(candidates) > 1:
             raise ProtocolViolation(f"targeted squeue returned duplicate job ID {job_id}")
         row = _strict_queue_row(candidates[0]) if candidates else None
-        if row is not None and isinstance(ref, JobRef) and verify_live:
+        if row is not None and isinstance(ref, JobRef):
+            # Always.  This was behind a `verify_live` switch that nothing ever
+            # set, and whose only possible effect was to disable the recycled-ID
+            # check -- so the sole reason to reach for it would be to silence an
+            # IdentityMismatch that is telling the truth.
             self.verify_live_identity(ref, row.name, row.comment)
         return row
 
@@ -1296,7 +1256,6 @@ __all__ = [
     "LogSizeResult",
     "LogSizeStatus",
     "QueueRow",
-    "QueueSnapshot",
     "RawQueueRow",
     "RawQueueScan",
     "SlurmClient",

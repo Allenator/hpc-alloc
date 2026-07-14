@@ -50,7 +50,6 @@ from hpc_alloc.slurm import (
     CancellationResult,
     CancellationStatus,
     QueueRow,
-    QueueSnapshot,
     RawQueueRow,
     RawQueueScan,
     SubmissionResult,
