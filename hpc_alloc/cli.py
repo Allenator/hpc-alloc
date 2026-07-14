@@ -159,7 +159,17 @@ def main(argv: Sequence[str] | None = None, *, entrypoint: Path | None = None) -
 
     from .commands import dispatch
 
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    # argparse.REMAINDER is never "required", so an omitted `-- CMD` slipped past
+    # the parser and failed later as an application error (exit 1).  A missing
+    # required argument is a usage failure: it belongs to the parser, and the
+    # contract says usage failures exit 2.  An agent that reads exit 1 goes
+    # looking for a cluster or config fault that is not there.
+    if args.command_name == "run" and not [
+        word for word in args.command if word != "--"
+    ]:
+        parser.error("the following arguments are required: -- CMD")
     _install_interrupt_signals()
     try:
         return int(dispatch(args, entrypoint=entrypoint or Path(sys.argv[0]).resolve()) or 0)

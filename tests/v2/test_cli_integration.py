@@ -49,6 +49,23 @@ class CliIntegrationTests(unittest.TestCase):
         }
         self.environment.pop("FORCE_COLOR", None)
 
+    def test_run_without_a_command_is_a_usage_failure(self) -> None:
+        """A missing required argument belongs to the parser, and exits 2.
+
+        argparse.REMAINDER is never "required", so an omitted `-- CMD` slipped
+        past the parser and failed later as an application error (exit 1) -- which
+        the contract reserves for validation, scheduler and protocol faults.  An
+        agent reading exit 1 goes hunting for a cluster or config problem that
+        does not exist.
+        """
+
+        result = self.run_cli("run", "--detach")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("usage: hpc-alloc", result.stderr)
+        self.assertIn("-- CMD", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_sighup_is_routed_through_the_interrupt_path_like_sigterm(self) -> None:
         """A closed terminal delivers SIGHUP to the foreground process group.
 

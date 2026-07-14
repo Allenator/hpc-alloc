@@ -59,6 +59,8 @@ Use these assessment phases as policy authority:
 - Treat `FINAL` as durable terminal authority with `ACCOUNTING`, `CONFIRMED_QUEUE`, `SUBMIT_FAILED`, or `ABANDONED` provenance.
 - Treat `UNCERTAIN` as process-local observation failure that must not overwrite prior successful durable evidence or authorize cleanup.
 
+`status --json` and `why --json` may also report the durable phase `SUBMITTING`, which is not an assessment phase: it means the submission has no acknowledged Slurm job ID yet, so there is nothing to assess. A real job may nevertheless be running on the cluster. Never treat it as "nothing was submitted" and never resubmit; reconcile the printed `hpc-alloc recover OPERATION_ID` first, exactly as for any unresolved operation.
+
 Map recognized Slurm queue states consistently:
 
 - Classify `RUNNING`, `RESIZING`, and `SIGNALING` as `ACTIVE`.
@@ -77,6 +79,12 @@ Keep `COMPLETING` and every other started-inactive state log-eligible. Permit a 
 Treat `why` start estimates, priority output, and reservation listings as optional enrichment after an identity-checked core assessment. Omit ordinary scheduler or remote-command enrichment failures, but propagate authentication and host-key failures. Persist applicable delayed accounting before rendering; keep elapsed time and time limit as output-only data and drop them if reconciliation makes the accounting record stale.
 
 Treat `SUBMIT_FAILED` and `ABANDONED` as local final verdicts that may lack a Slurm job ID. Let `why @operation` diagnose them without cluster access, and let `logs @operation` fail locally because no managed remote log is confirmed. Reserve recovery guidance for a genuinely unresolved submission.
+
+## Expect patience, not immediacy
+
+The polling commands ride out transient failures instead of failing on them. A scheduler hiccup is retried for up to two minutes and a dropped transport for up to ten, so `up`, `run`, and `logs -f` survive a controller restart, a VPN renegotiation, or a closed laptop lid rather than aborting while the job keeps running. A command that takes longer than expected is usually waiting on purpose; read its stderr, which says what it is retrying and for how long. Only an authentication or host-key failure is raised immediately, because time cannot heal it.
+
+Observations of a steady job also widen over time — up to thirty seconds between scheduler queries — while log streaming keeps its own faster cadence. A job that changes state is noticed promptly, because any change collapses the interval back to its floor. Do not infer from a few seconds of silence that a command has hung or that a job has stalled.
 
 ## Interpret status identity classes
 
