@@ -3223,6 +3223,59 @@ host = "secondary.example.edu"
             resources=self.resources,
         )
 
+    def test_recovery_does_not_release_a_draining_cancellation(self) -> None:
+        """A COMPLETING job is consistent with a cancellation that DID land.
+
+        The wedge fix released the guard whenever recovery observed the job "not
+        final".  But COMPLETING and STAGE_OUT are exactly the states a
+        successfully-cancelled RUNNING job drains through -- so a delivered
+        cancellation whose reply was merely lost would be recorded as FAILED and
+        a second one permitted, the precise false history the operation journal
+        exists to prevent.  Only ACTIVE or QUEUED -- plainly alive and not dying
+        -- may release the guard.
+        """
+
+        job = self.acknowledged_job()
+        assert job.ref is not None
+        self.repository.update_job(OPERATION_ID, phase=JobPhase.ACTIVE, ever_started=True, current_node="node01")
+        cancel = self.repository.begin_cancel(OPERATION_ID, operation_id="c" * 32)
+        self.repository.mark_cancel_dispatching(cancel.operation_id)
+        self.repository.mark_cancel_ambiguous(cancel.operation_id, "transport lost after dispatch")
+
+        draining = QueueRow(
+            job_id=job.job_id or "",
+            state="COMPLETING",
+            node="node01",
+            reason="None",
+            time_left="0:00:30",
+            partition="day",
+            name=job.slurm_job_name,
+            submitted_at="2026-07-10T11:00:00",
+            comment=job.slurm_comment,
+        )
+        # A COMPLETING candidate needs a second observation to confirm, so the
+        # monitor observes twice; both show it still draining.
+        script = StrictScript(
+            [
+                ExpectedCall("observe", result=draining, args=(job.ref,), kwargs={"auth": AuthMode.NONINTERACTIVE}),
+                ExpectedCall("observe", result=draining, args=(job.ref,), kwargs={"auth": AuthMode.NONINTERACTIVE}),
+            ]
+        )
+        operation = self.repository.get_operation(cancel.operation_id)
+        with patch("hpc_alloc.commands.info"):
+            self.assertFalse(
+                _recover_cancel(self.context, StrictProxy(script), operation, job)
+            )
+
+        # The guard is held, not released: a second cancellation cannot be
+        # dispatched while the first may have landed.
+        self.assertEqual(
+            self.repository.get_operation(cancel.operation_id).phase,
+            OperationPhase.AMBIGUOUS,
+        )
+        with self.assertRaisesRegex(StateConflict, "pending cancellation"):
+            self.repository.begin_cancel(OPERATION_ID, operation_id="d" * 32)
+
     def test_an_ambiguous_cancellation_does_not_wedge_the_seat_forever(self) -> None:
         """The full wedge, end to end.
 

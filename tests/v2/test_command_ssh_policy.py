@@ -245,6 +245,12 @@ class CommandSshPolicyTests(unittest.TestCase):
             "~/$(id -un)",
             "~/`whoami`",
             "~/results;rm -rf ~",
+            # A leading '-' is read by rsync itself as an option, and a leading
+            # ':' as daemon syntax (host::module) -- both escape the host:path
+            # form before the remote shell is ever reached.
+            "-del",
+            "--delete",
+            ":module/path",
         ):
             with self.subTest(path=hostile):
                 args = SimpleNamespace(

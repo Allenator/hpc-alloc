@@ -314,6 +314,15 @@ class LogFollower:
                 self._sleep(self.drain_retry_delay)
             try:
                 size = self.client.log_size(self.log_path)
+                if size.status is LogSizeStatus.MISSING and self.offset == 0:
+                    # No output file at finality, and nothing was ever streamed:
+                    # the job produced no output (cancelled or failed before it
+                    # wrote a byte).  That is a complete, empty result -- not a
+                    # truncated read -- so it must not warn that output was lost.
+                    # A job that did write still has its file here; if we had been
+                    # streaming (offset > 0) and it has now vanished, that is a
+                    # genuine shortfall and falls through to the retry/warn path.
+                    return True
                 if size.status is not LogSizeStatus.AVAILABLE or size.size is None:
                     continue
                 if size.size < self.offset:

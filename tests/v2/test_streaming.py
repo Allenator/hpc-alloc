@@ -1079,6 +1079,41 @@ class StreamingTests(unittest.TestCase):
         self.assertIn(15, clock.sleeps)
         script.assert_complete()
 
+    def test_drain_of_a_never_started_job_is_complete_not_truncated(self) -> None:
+        """A job that produced no output must not warn that output was lost.
+
+        A run cancelled or failed while still PENDING never creates its log file,
+        yet it can reach finality via accounting (so it is log-eligible).  drain's
+        retry loop saw MISSING on every attempt and returned False, making `run`
+        warn that the output above might be truncated -- for a job that emitted
+        nothing at all.
+        """
+
+        output = io.BytesIO()
+        script = StrictScript(
+            [
+                ExpectedCall(
+                    "log_size",
+                    result=LogSizeResult(LogSizeStatus.MISSING),
+                    args=(LOG_PATH,),
+                ),
+            ]
+        )
+        # Log-eligible via a queue-confirmed final (a job can finalize without
+        # ever being observed active), but never started and nothing streamed.
+        tracker = EvidenceTracker(
+            ever_started=False,
+            phase=AssessmentPhase.FINAL,
+            terminal_state="CANCELLED",
+            final_source=FinalSource.CONFIRMED_QUEUE,
+        )
+        follower = self.follower(script, tracker=tracker, output=output)
+
+        self.assertTrue(follower.drain())
+        self.assertEqual(output.getvalue(), b"")
+        self.assertEqual(follower.offset, 0)
+        script.assert_complete()
+
     def test_drain_retries_a_transient_failure_instead_of_truncating(self) -> None:
         """One transient ssh or shared-filesystem error must not lose the tail.
 

@@ -73,7 +73,14 @@ REMOTE_LOG_DIR = ".hpc-alloc"
 # Characters a remote POSIX shell cannot expand, split on, or execute.  A leading
 # `~` is deliberately allowed: the documented `hpc-alloc sync … '~/project'` form
 # relies on the remote shell expanding it.
-_REMOTE_SYNC_PATH = re.compile(r"[A-Za-z0-9_@%+=:,./~-]+")
+#
+# The first character is further restricted: rsync itself, before the remote
+# shell is ever reached, reads a leading `-` as an option (so `-del` becomes
+# flags, and `--delete` then targets rsync's default directory) and a leading `:`
+# as daemon syntax (`alias::module`, a different protocol and a different delete
+# scope).  Both escape the intended `host:path` form entirely, so neither may
+# start the path.
+_REMOTE_SYNC_PATH = re.compile(r"[A-Za-z0-9_@%+=,./~][A-Za-z0-9_@%+=:,./~-]*")
 GPU_RE = re.compile(r"(?:[A-Za-z0-9][A-Za-z0-9_.-]*:)?[1-9][0-9]*\Z")
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -2831,6 +2838,7 @@ def _recover_cancel(ctx: Any, client: Any | None, operation: Any, job: Any) -> b
     """Reconcile a cancellation using local phase and read-only evidence only."""
 
     from .errors import ProtocolViolation
+    from .lifecycle import AssessmentPhase
     from .monitor import JobMonitor
     from .ssh import AuthMode
 
@@ -2867,20 +2875,32 @@ def _recover_cancel(ctx: Any, client: Any | None, operation: Any, job: Any) -> b
             confirm=True,
         ).assessment
         observed = assessment.scheduler_state or assessment.phase.value
-        if assessment.uncertain:
-            # No usable observation at all.  The cancellation must stay guarded:
-            # releasing it on uncertainty could let a retry dispatch a second
-            # mutation while the first may still have been delivered.
+        # Only a job observed unambiguously alive and NOT dying proves the
+        # cancellation never took effect: a landed cancellation moves a job
+        # toward a terminal state, so ACTIVE (RUNNING) or QUEUED (PENDING) means
+        # it never arrived, and the guard can be released for an explicit retry.
+        #
+        # Every other non-final observation is consistent with a cancellation
+        # that DID land: STARTED_INACTIVE covers COMPLETING and STAGE_OUT --
+        # exactly the states a cancelled RUNNING job drains through -- while
+        # REQUEUEING and TERMINAL_CANDIDATE are transitional or already a death
+        # candidate, and UNCERTAIN is no observation at all.  Releasing the guard
+        # on any of those would permit a second cancellation and, worse, record
+        # one that succeeded as FAILED -- the exact false history the operation
+        # journal exists to prevent -- so they stay ambiguous and wait for a
+        # conclusive terminal or a return to plainly-alive.
+        proves_cancellation_missed = assessment.phase in {
+            AssessmentPhase.ACTIVE,
+            AssessmentPhase.QUEUED,
+        }
+        if not proves_cancellation_missed and not assessment.final:
             ctx.state.mark_cancel_ambiguous(
                 operation.operation_id,
                 f"read-only recovery remains inconclusive ({observed})",
             )
             return False
         if not assessment.final:
-            # The job was positively observed still alive, which proves the
-            # ambiguous cancellation never took effect -- cancelling terminates a
-            # job, it does not requeue one.  Resolving the operation as failed
-            # releases the one-pending-cancel index so an explicit retry can
+            # Releasing the one-pending-cancel index so an explicit retry can
             # dispatch a fresh, freshly-guarded cancellation.  Unlike a
             # submission, a repeated cancellation is idempotent, so the extreme
             # conservatism the submit path needs is not warranted here.
