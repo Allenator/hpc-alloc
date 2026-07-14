@@ -54,7 +54,7 @@ from .models import (
 from .ownership import IDENTIFIER_RE, normalize_host_label, parse_tag, slurm_job_name
 from .output import neutralize_stderr, neutralize_stdout
 from .paths import AppPaths
-from .retry import PollBackoff, RetryBudget
+from .retry import PollBackoff, RetryBudget, observation_signature
 from .selectors import SelectorKind, canonical_job_selector, parse_selector, unique_job
 from .ssh_config import (
     allocation_alias,
@@ -1714,6 +1714,15 @@ def cmd_up(
                 client=client,
                 job=job,
                 assessment=assessment,
+                # While the job is PENDING nothing about the projection can
+                # change (it has no node yet), so re-rendering the managed SSH
+                # file under an exclusive lock on every poll -- config re-parse,
+                # jobs-table scan, file read-render-compare, tens of times per
+                # wait -- is pure waste that also contends with any concurrent
+                # `status`.  The gate still syncs the one poll that matters, when
+                # a node appears and the row actually changes.  The streaming
+                # loop already passes this.
+                skip_unchanged_projection=True,
             )
             if assessment.phase == AssessmentPhase.ACTIVE and assessment.current_node:
                 alias = allocation_alias(cluster, args.name)
@@ -1742,11 +1751,7 @@ def cmd_up(
                 return EXIT_SUBMITTED_NOT_READY
             time.sleep(
                 backoff.interval(
-                    (
-                        assessment.phase,
-                        assessment.scheduler_state,
-                        assessment.current_node,
-                    )
+                    observation_signature(assessment)
                 )
             )
     except KeyboardInterrupt:

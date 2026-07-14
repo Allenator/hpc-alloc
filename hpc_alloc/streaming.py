@@ -20,7 +20,7 @@ from .lifecycle import (
 )
 from .models import FinalSource, JobRef
 from .monitor import accept_observation, break_lifecycle_evidence
-from .retry import PollBackoff, RetryBudget
+from .retry import PollBackoff, RetryBudget, observation_signature
 from .slurm import MAX_LOG_CHUNK_BYTES, LogSizeStatus, QueueRow, SlurmClient
 
 
@@ -28,22 +28,6 @@ AssessmentPublisher = Callable[
     [JobAssessment],
     tuple[JobAssessment, EvidenceTracker | None],
 ]
-
-
-def _observation_signature(assessment: JobAssessment) -> tuple[object, ...]:
-    """What counts as the job's scheduler-visible situation having changed.
-
-    Any difference collapses the observation interval back to its floor, so the
-    loop polls hardest exactly when the job is moving -- getting a node, starting,
-    requeueing, dying -- and coasts when it is simply running.
-    """
-
-    return (
-        assessment.phase,
-        assessment.scheduler_state,
-        assessment.current_node,
-        assessment.terminal_evidence,
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,7 +354,7 @@ class LogFollower:
                         publish_assessment=publish_assessment
                     ).assessment
                     observe_due = self._clock() + self.backoff.interval(
-                        _observation_signature(assessment)
+                        observation_signature(assessment)
                     )
                 else:
                     # Log tick: a file read, no scheduler query.

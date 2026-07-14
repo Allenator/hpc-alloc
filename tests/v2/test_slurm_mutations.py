@@ -568,6 +568,61 @@ class SlurmMutationTests(unittest.TestCase):
                     )
                 script.assert_complete()
 
+    def test_requeue_eligible_accounting_defers_and_cancels_the_requeued_instance(self) -> None:
+        """A single NODE_FAIL/PREEMPTED record must NOT resolve a cancellation.
+
+        Those states are requeued under the same job ID, so a record seen on the
+        first observation may be the reaped failed attempt.  inspect_cancel is a
+        two-observation loop, so it must require the second look -- otherwise it
+        returns ALREADY_FINAL, `_cancel_record_owned` resolves the operation FINAL
+        and never issues the mutation, and the requeued instance runs on
+        untracked (the exact reap awaits_requeue_confirmation defends the queue
+        and streaming paths from).  On the second look the job is back in the
+        queue, so the cancellation proceeds against the live instance.
+        """
+
+        sleeps: list[float] = []
+        nodefail = f"{self.ref.job_id}|NODE_FAIL|1:0|{self.job_name}|{self.comment}\n"
+        script = StrictScript(
+            [
+                ExpectedCall("run", result=framed(empty_queue_payload())),
+                ExpectedCall("run", result=framed(nodefail)),
+                # Requeued: the same job ID is back in the queue.
+                ExpectedCall(
+                    "run", result=framed(queue_payload(self.ref, self.comment))
+                ),
+            ]
+        )
+        client = SlurmClient(
+            StrictProxy(script),  # type: ignore[arg-type]
+            self.ref.cluster,
+            sleeper=sleeps.append,
+            token_factory=lambda _size: NONCE,
+        )
+        result = client.inspect_cancel(self.ref)
+        self.assertEqual(result.status, CancellationInspectionStatus.READY)
+        self.assertEqual(sleeps, [3])
+        script.assert_complete()
+
+    def test_requeue_eligible_accounting_still_finalizes_when_truly_dead(self) -> None:
+        """A NODE_FAIL seen on BOTH observations is a genuine death: no requeue
+        happened, so the cancellation resolves as already-final rather than
+        issuing a pointless mutation."""
+
+        nodefail = f"{self.ref.job_id}|NODE_FAIL|1:0|{self.job_name}|{self.comment}\n"
+        script = StrictScript(
+            [
+                ExpectedCall("run", result=framed(empty_queue_payload())),
+                ExpectedCall("run", result=framed(nodefail)),
+                ExpectedCall("run", result=framed(empty_queue_payload())),
+                ExpectedCall("run", result=framed(nodefail)),
+            ]
+        )
+        result = self.client(script).inspect_cancel(self.ref)
+        self.assertEqual(result.status, CancellationInspectionStatus.ALREADY_FINAL)
+        self.assertIsNotNone(result.final_record)
+        script.assert_complete()
+
     def test_final_accounting_after_second_absence_short_circuits(self) -> None:
         final = (
             f"{self.ref.job_id}|COMPLETED|0:0|{self.job_name}|{self.comment}\n"

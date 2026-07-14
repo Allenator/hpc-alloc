@@ -413,9 +413,13 @@ class SshTransport:
         with nobody able to reach it, and every later command spawns yet another
         one -- which on a Duo-gated cluster means another push, for each.
 
-        Re-checking the inode between the check and the unlink closes the window:
-        a replacement master is a new socket, so its identity differs and it is
-        left alone.
+        Re-checking the (dev, inode) between the check and the unlink narrows the
+        window sharply: a replacement master is almost always a new socket, so its
+        identity differs and it is left alone.  The unlink is still by path, so a
+        precise inode-number reuse in the microsecond gap could defeat the
+        compare -- but the only cost then is one orphaned master and a repeat
+        auth, never a lost or duplicated job, so a fuller fdatasync-style guard is
+        not worth its complexity here.
         """
 
         ssh_dir = Path(getattr(self.paths, "ssh_dir"))

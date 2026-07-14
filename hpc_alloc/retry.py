@@ -23,7 +23,7 @@ module restores the missing budgets in one place so both loops share them.
 from __future__ import annotations
 
 import time
-from typing import Callable
+from typing import Any, Callable
 
 from .errors import HpcAllocError, SchedulerUnavailable, TransportLost
 
@@ -118,6 +118,26 @@ POLL_MAX_INTERVAL_SECONDS = 30.0
 _UNOBSERVED = object()
 
 
+def observation_signature(assessment: Any) -> tuple[object, ...]:
+    """What counts, for :class:`PollBackoff`, as the job's situation changing.
+
+    Any difference collapses the poll interval back to its floor, so a loop polls
+    hardest exactly when the job is moving -- getting a node, starting,
+    requeueing, dying -- and coasts when it is simply running.  Both polling
+    loops (the `run`/`logs -f` follower and `up`'s wait) share this one
+    definition; they used to hand-roll it separately and had already drifted --
+    one omitted ``terminal_evidence``, so it missed a job entering a death
+    candidate.
+    """
+
+    return (
+        assessment.phase,
+        assessment.scheduler_state,
+        assessment.current_node,
+        assessment.terminal_evidence,
+    )
+
+
 class PollBackoff:
     """Widen the gap between scheduler observations while nothing changes.
 
@@ -176,5 +196,6 @@ __all__ = [
     "SCHEDULER_PATIENCE_SECONDS",
     "TRANSPORT_PATIENCE_SECONDS",
     "PollBackoff",
+    "observation_signature",
     "RetryBudget",
 ]

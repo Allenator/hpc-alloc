@@ -433,6 +433,7 @@ class CommandStreamPolicyTests(unittest.TestCase):
             current_node=None,
             final=False,
             scheduler_state="PENDING",
+            terminal_evidence=0,
         )
         stderr = io.StringIO()
         with (
@@ -508,6 +509,7 @@ class CommandStreamPolicyTests(unittest.TestCase):
             current_node=None,
             final=False,
             scheduler_state="PENDING",
+            terminal_evidence=0,
         )
 
         with (

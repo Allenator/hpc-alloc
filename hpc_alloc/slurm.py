@@ -966,6 +966,21 @@ class SlurmClient:
                     str(exc),
                 )
             if record is not None:
+                # A NODE_FAIL or PREEMPTED record on the FIRST look may be the
+                # reaped failed attempt of a job Slurm is requeueing under the
+                # same ID.  Accepting it here resolves the cancellation as
+                # already-final and never issues the mutation, so the requeued
+                # instance runs on untracked -- the exact single-observation reap
+                # the queue and streaming paths defer via
+                # awaits_requeue_confirmation.  This loop is that same
+                # two-observation rule, so require the second observation for a
+                # requeue-eligible state: it either sees the requeued instance
+                # back in the queue (-> READY, and it gets cancelled) or confirms
+                # the death.  A genuinely terminal state (COMPLETED, CANCELLED,
+                # ...) still resolves on the first look.
+                if observation == 0 and record.state_code in REQUEUE_ELIGIBLE_FINAL:
+                    self._sleep(confirmation_delay)
+                    continue
                 return CancellationInspection(
                     CancellationInspectionStatus.ALREADY_FINAL,
                     f"job ended as {record.state}",
