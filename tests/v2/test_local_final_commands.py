@@ -13,8 +13,10 @@ from hpc_alloc.commands import cmd_logs, cmd_why
 from hpc_alloc.config import Config
 from hpc_alloc.errors import (
     AuthRequired,
+    ConfigInvalid,
     HostKeyChanged,
     ProtocolViolation,
+    RemoteCommandFailed,
     SchedulerUnavailable,
     StateConflict,
 )
@@ -990,6 +992,215 @@ host = "grace.example.edu"
         payload = json.loads(stdout.getvalue())
         self.assertEqual(payload["status"], JobPhase.QUEUED.value)
         self.assertEqual(payload["diagnosis"], "queue contention (Priority)")
+
+    def _pending_why_payload(
+        self,
+        *,
+        reason: str,
+        estimate: str | BaseException = "N/A",
+        priority: str | BaseException = "",
+        reservations: str | BaseException = "",
+    ) -> dict[str, object]:
+        job = self.state.get_job(RECYCLED_ID)
+
+        def value(result: str | BaseException) -> str:
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+        class Transport:
+            def bootstrap(self, *_args: object, **_kwargs: object) -> None:
+                return None
+
+        class Client:
+            def observe(self, *_args: object, **_kwargs: object) -> QueueRow:
+                return QueueRow(
+                    job_id=job.job_id or "",
+                    state="PENDING",
+                    node=None,
+                    reason=reason,
+                    time_left="1:00:00",
+                    partition="cpu",
+                    name=job.slurm_job_name,
+                    submitted_at="2026-07-12T12:00:00",
+                    comment=job.slurm_comment,
+                )
+
+            def estimated_start(self, *_args: object, **_kwargs: object) -> str:
+                return value(estimate)
+
+            def priority(self, *_args: object, **_kwargs: object) -> str:
+                return value(priority)
+
+            def reservations(self, *_args: object, **_kwargs: object) -> str:
+                return value(reservations)
+
+        stdout = io.StringIO()
+        with (
+            patch(
+                "hpc_alloc.commands._services",
+                return_value=(Transport(), Client()),
+            ),
+            redirect_stdout(stdout),
+        ):
+            result = cmd_why(
+                SimpleNamespace(
+                    target=f"grace:@{RECYCLED_ID}",
+                    cluster=None,
+                    json=True,
+                ),
+                ctx=self.context,
+                paths=self.paths,
+                entrypoint=Path("/tmp/hpc-alloc"),
+            )
+
+        self.assertEqual(result, 0)
+        return json.loads(stdout.getvalue())
+
+    def test_why_omits_only_failed_optional_pending_enrichment(self) -> None:
+        payload = self._pending_why_payload(
+            reason="Priority",
+            estimate=RemoteCommandFailed("squeue --start lost the job"),
+            priority="priority detail",
+        )
+        self.assertEqual(payload["diagnosis"], "queue contention (Priority)")
+        self.assertEqual(payload["detail"], ["priority detail"])
+
+        payload = self._pending_why_payload(
+            reason="Priority",
+            estimate="2026-07-14T09:00:00",
+            priority=SchedulerUnavailable("sprio unavailable"),
+        )
+        self.assertEqual(payload["diagnosis"], "queue contention (Priority)")
+        self.assertEqual(
+            payload["detail"],
+            ["estimated start: 2026-07-14T09:00:00"],
+        )
+
+        payload = self._pending_why_payload(
+            reason="Reservation",
+            reservations=RemoteCommandFailed("reservation query failed"),
+        )
+        self.assertIn("nodes are reserved", str(payload["diagnosis"]))
+        self.assertEqual(payload["detail"], [])
+
+    def test_why_optional_pending_enrichment_preserves_access_failures(self) -> None:
+        failures = (
+            (
+                "Priority",
+                {"estimate": AuthRequired("Duo required")},
+            ),
+            (
+                "Reservation",
+                {"reservations": HostKeyChanged("host key changed")},
+            ),
+        )
+        for reason, kwargs in failures:
+            failure = next(iter(kwargs.values()))
+            assert isinstance(failure, BaseException)
+            with self.subTest(failure=type(failure).__name__):
+                with self.assertRaises(type(failure)) as raised:
+                    self._pending_why_payload(reason=reason, **kwargs)
+                self.assertIs(raised.exception, failure)
+
+    def test_qualified_local_history_survives_cluster_removal(self) -> None:
+        self.paths.config_file.write_text(
+            """\
+[identity]
+netid = "ab1234"
+[defaults]
+cluster = "beta"
+[cluster.beta]
+host = "beta.example.edu"
+"""
+        )
+        self.config = Config.load(self.paths.config_file)
+        self.context = SimpleNamespace(config=self.config, state=self.state)
+
+        for operation_id in (SUBMIT_FAILED_ID, ABANDONED_ID):
+            with self.subTest(operation_id=operation_id):
+                result, stdout, _stderr = self.invoke_why(
+                    operation_id,
+                    json_output=True,
+                )
+                self.assertEqual(result, 0)
+                payload = json.loads(stdout)
+                self.assertEqual(
+                    payload["selector"],
+                    f"grace:@{operation_id}",
+                )
+
+                with (
+                    patch(
+                        "hpc_alloc.commands._services",
+                        side_effect=self._no_remote,
+                    ),
+                    self.assertRaisesRegex(StateConflict, "no managed log"),
+                ):
+                    cmd_logs(
+                        SimpleNamespace(
+                            target=f"grace:@{operation_id}",
+                            cluster=None,
+                            lines=10,
+                            follow=False,
+                        ),
+                        ctx=self.context,
+                        paths=self.paths,
+                        entrypoint=Path("/tmp/hpc-alloc"),
+                    )
+
+    def test_removed_cluster_history_never_falls_back_to_current_cluster(self) -> None:
+        self.paths.config_file.write_text(
+            """\
+[identity]
+netid = "ab1234"
+[defaults]
+cluster = "beta"
+[cluster.beta]
+host = "beta.example.edu"
+"""
+        )
+        self.config = Config.load(self.paths.config_file)
+        self.context = SimpleNamespace(config=self.config, state=self.state)
+        clusters: list[str] = []
+
+        def services(
+            _ctx: object,
+            _paths: object,
+            _entrypoint: object,
+            cluster: str,
+        ) -> object:
+            clusters.append(cluster)
+            raise ConfigInvalid(f"cluster {cluster!r} is not configured")
+
+        with (
+            patch("hpc_alloc.commands._services", side_effect=services),
+            self.assertRaisesRegex(ConfigInvalid, "grace"),
+        ):
+            cmd_why(
+                SimpleNamespace(
+                    target=f"grace:@{HISTORICAL_ID}",
+                    cluster=None,
+                    json=True,
+                ),
+                ctx=self.context,
+                paths=self.paths,
+                entrypoint=Path("/tmp/hpc-alloc"),
+            )
+
+        self.assertEqual(clusters, ["grace"])
+
+        with self.assertRaisesRegex(ConfigInvalid, "grace"):
+            cmd_why(
+                SimpleNamespace(
+                    target="grace:@" + "f" * 32,
+                    cluster=None,
+                    json=True,
+                ),
+                ctx=self.context,
+                paths=self.paths,
+                entrypoint=Path("/tmp/hpc-alloc"),
+            )
 
 
 if __name__ == "__main__":

@@ -30,6 +30,9 @@ from .ssh_config import (
 )
 
 
+_MASTER_RETIREMENT_TIMEOUT_SECONDS = 10
+
+
 class AuthMode(StrEnum):
     """Whether a call may establish an interactive login session."""
 
@@ -122,6 +125,7 @@ def _effective_compute_control_path(
             capture_output=True,
             text=True,
             check=False,
+            timeout=_MASTER_RETIREMENT_TIMEOUT_SECONDS,
         )
     except Exception as exc:
         return False, None, f"could not inspect obsolete SSH alias {alias}: {exc}"
@@ -232,6 +236,7 @@ def retire_compute_masters(
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=_MASTER_RETIREMENT_TIMEOUT_SECONDS,
             )
         except Exception as exc:
             warnings.append(f"could not retire obsolete SSH control socket {path}: {exc}")

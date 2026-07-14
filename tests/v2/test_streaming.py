@@ -647,6 +647,62 @@ class StreamingTests(unittest.TestCase):
         self.assertTrue(any("re-streaming from the top" in note for note in notes))
         script.assert_complete()
 
+    def test_special_exit_requeue_preserves_stream_progress_and_can_run_again(self) -> None:
+        output = io.BytesIO()
+        script = StrictScript(
+            [
+                ExpectedCall(
+                    "observe",
+                    result=row("SPECIAL_EXIT", node="node01"),
+                    args=(self.ref,),
+                ),
+                ExpectedCall("log_size", result=LogSizeResult.available(4), args=(LOG_PATH,)),
+                ExpectedCall(
+                    "read_log_chunk",
+                    result=b"old\n",
+                    args=(LOG_PATH, 0),
+                    kwargs={"limit": 4},
+                ),
+                ExpectedCall(
+                    "observe",
+                    result=row("PENDING", reason="Held"),
+                    args=(self.ref,),
+                ),
+                ExpectedCall("log_size", result=LogSizeResult.available(4), args=(LOG_PATH,)),
+                ExpectedCall(
+                    "observe",
+                    result=row("RUNNING", node="node02"),
+                    args=(self.ref,),
+                ),
+                ExpectedCall("log_size", result=LogSizeResult.available(8), args=(LOG_PATH,)),
+                ExpectedCall(
+                    "read_log_chunk",
+                    result=b"new\n",
+                    args=(LOG_PATH, 4),
+                    kwargs={"limit": 4},
+                ),
+            ]
+        )
+        follower = self.follower(script, output=output)
+
+        special = follower.poll_once()
+        self.assertEqual(special.assessment.phase, AssessmentPhase.REQUEUEING)
+        self.assertFalse(special.assessment.final)
+        self.assertEqual(follower.offset, 4)
+        self.assertEqual(script.count("final"), 0)
+
+        pending = follower.poll_once()
+        self.assertEqual(pending.assessment.phase, AssessmentPhase.REQUEUEING)
+        self.assertEqual(follower.offset, 4)
+
+        running = follower.poll_once()
+        self.assertEqual(running.assessment.phase, AssessmentPhase.ACTIVE)
+        self.assertEqual(running.assessment.current_node, "node02")
+        self.assertEqual(follower.offset, 8)
+        self.assertEqual(output.getvalue(), b"old\nnew\n")
+        self.assertEqual(script.count("final"), 0)
+        script.assert_complete()
+
     def test_binary_chunks_are_written_byte_exact_and_offset_counts_bytes(self) -> None:
         chunk = b"\xff\r\n\x00\x1eOK"
         output = io.BytesIO()

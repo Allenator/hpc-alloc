@@ -4,7 +4,7 @@ import unittest
 
 from hpc_alloc.lifecycle import AssessmentPhase, EvidenceEvent, EvidenceTracker
 from hpc_alloc.models import FinalSource, JobPhase
-from hpc_alloc.slurm import AccountingRecord, QueueRow
+from hpc_alloc.slurm import FINAL_STATES, AccountingRecord, QueueRow
 
 
 def row(state: str, *, node: str | None = None, reason: str = "") -> QueueRow:
@@ -32,6 +32,61 @@ def final_record(state: str = "COMPLETED", exit_code: str = "0:0") -> Accounting
 
 
 class LifecycleTraceTests(unittest.TestCase):
+    def test_every_squeue_state_has_an_explicit_safe_classification(self) -> None:
+        expected = {
+            "BOOT_FAIL": (AssessmentPhase.TERMINAL_CANDIDATE, False),
+            "CANCELLED": (AssessmentPhase.TERMINAL_CANDIDATE, False),
+            "COMPLETED": (AssessmentPhase.TERMINAL_CANDIDATE, True),
+            "CONFIGURING": (AssessmentPhase.QUEUED, False),
+            "COMPLETING": (AssessmentPhase.STARTED_INACTIVE, True),
+            "DEADLINE": (AssessmentPhase.TERMINAL_CANDIDATE, False),
+            "FAILED": (AssessmentPhase.TERMINAL_CANDIDATE, True),
+            "NODE_FAIL": (AssessmentPhase.TERMINAL_CANDIDATE, True),
+            "OUT_OF_MEMORY": (AssessmentPhase.TERMINAL_CANDIDATE, True),
+            "PENDING": (AssessmentPhase.QUEUED, False),
+            "PREEMPTED": (AssessmentPhase.TERMINAL_CANDIDATE, True),
+            "RUNNING": (AssessmentPhase.ACTIVE, True),
+            "RESV_DEL_HOLD": (AssessmentPhase.QUEUED, False),
+            "REQUEUE_FED": (AssessmentPhase.REQUEUEING, True),
+            "REQUEUE_HOLD": (AssessmentPhase.REQUEUEING, True),
+            "REQUEUED": (AssessmentPhase.REQUEUEING, True),
+            "RESIZING": (AssessmentPhase.ACTIVE, True),
+            "REVOKED": (AssessmentPhase.TERMINAL_CANDIDATE, False),
+            "SIGNALING": (AssessmentPhase.ACTIVE, True),
+            "SPECIAL_EXIT": (AssessmentPhase.REQUEUEING, True),
+            "STAGE_OUT": (AssessmentPhase.STARTED_INACTIVE, True),
+            "STOPPED": (AssessmentPhase.STARTED_INACTIVE, True),
+            "SUSPENDED": (AssessmentPhase.STARTED_INACTIVE, True),
+            "TIMEOUT": (AssessmentPhase.TERMINAL_CANDIDATE, True),
+        }
+
+        self.assertEqual(
+            FINAL_STATES,
+            {
+                state
+                for state, (phase, _started) in expected.items()
+                if phase is AssessmentPhase.TERMINAL_CANDIDATE
+            },
+        )
+        for state, (phase, started) in expected.items():
+            with self.subTest(state=state):
+                assessment = EvidenceTracker().accept(
+                    EvidenceEvent.queue(row(state, node="node01"))
+                )
+                self.assertEqual(assessment.phase, phase)
+                self.assertEqual(assessment.ever_started, started)
+                self.assertEqual(assessment.log_eligible, started)
+                self.assertFalse(assessment.final)
+                self.assertEqual(
+                    assessment.current_node,
+                    "node01" if phase is AssessmentPhase.ACTIVE else None,
+                )
+                self.assertEqual(assessment.last_node, "node01" if started else None)
+                self.assertEqual(
+                    assessment.terminal_evidence,
+                    1 if phase is AssessmentPhase.TERMINAL_CANDIDATE else 0,
+                )
+
     def test_requeue_trace_preserves_started_history_and_clears_stale_node(self) -> None:
         tracker = EvidenceTracker()
 
@@ -80,6 +135,44 @@ class LifecycleTraceTests(unittest.TestCase):
         self.assertFalse(bounce.final)
         self.assertEqual(bounce.terminal_evidence, 0)
         self.assertIsNone(bounce.terminal_state)
+
+    def test_special_exit_is_requeueing_and_can_return_to_running(self) -> None:
+        tracker = EvidenceTracker()
+
+        special = tracker.accept(EvidenceEvent.queue(row("SPECIAL_EXIT", node="node01")))
+        self.assertEqual(special.phase, AssessmentPhase.REQUEUEING)
+        self.assertTrue(special.ever_started)
+        self.assertTrue(special.log_eligible)
+        self.assertIsNone(special.current_node)
+        self.assertEqual(special.last_node, "node01")
+        self.assertEqual(special.terminal_evidence, 0)
+        self.assertIsNone(special.terminal_state)
+
+        pending = tracker.accept(EvidenceEvent.queue(row("PENDING", reason="Held")))
+        self.assertEqual(pending.phase, AssessmentPhase.REQUEUEING)
+        self.assertFalse(pending.final)
+
+        running = tracker.accept(EvidenceEvent.queue(row("RUNNING", node="node02")))
+        self.assertEqual(running.phase, AssessmentPhase.ACTIVE)
+        self.assertEqual(running.current_node, "node02")
+        self.assertEqual(running.last_node, "node02")
+
+    def test_reservation_deleted_hold_after_start_is_requeueing(self) -> None:
+        tracker = EvidenceTracker(ever_started=True, last_node="node01")
+
+        assessment = tracker.accept(EvidenceEvent.queue(row("RESV_DEL_HOLD")))
+
+        self.assertEqual(assessment.phase, AssessmentPhase.REQUEUEING)
+        self.assertTrue(assessment.ever_started)
+        self.assertTrue(assessment.log_eligible)
+        self.assertIsNone(assessment.current_node)
+        self.assertEqual(assessment.last_node, "node01")
+
+    def test_special_exit_accounting_is_not_final_evidence(self) -> None:
+        record = final_record("SPECIAL_EXIT", "0:0")
+        self.assertFalse(record.final)
+        with self.assertRaisesRegex(ValueError, "requires a final record"):
+            EvidenceTracker().accept(EvidenceEvent.final(record))
 
     def test_present_completing_is_started_inactive_not_terminal_evidence(self) -> None:
         tracker = EvidenceTracker()

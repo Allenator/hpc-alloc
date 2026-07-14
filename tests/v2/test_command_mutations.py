@@ -361,6 +361,272 @@ host = "secondary.example.edu"
         self.assertEqual(self.repository.get_job(OPERATION_ID).phase, JobPhase.QUEUED)
         client_script.assert_complete()
 
+    def test_cancel_interrupt_inside_reservation_rolls_back_without_guidance(self) -> None:
+        job = self.acknowledged_job()
+        cancel_id = "c" * 32
+        interrupt = KeyboardInterrupt()
+        interrupt_pending = True
+        real_transaction = self.repository.transaction
+
+        class InterruptingConnection:
+            def __init__(self, connection: object) -> None:
+                self.connection = connection
+
+            def execute(
+                inner_self,
+                statement: str,
+                *args: object,
+                **kwargs: object,
+            ) -> object:
+                nonlocal interrupt_pending
+                cursor = inner_self.connection.execute(statement, *args, **kwargs)
+                if interrupt_pending and "INSERT INTO operations(" in statement:
+                    interrupt_pending = False
+                    raise interrupt
+                return cursor
+
+        @contextmanager
+        def interrupting_transaction():
+            with real_transaction() as connection:
+                yield (
+                    InterruptingConnection(connection)
+                    if interrupt_pending
+                    else connection
+                )
+
+        client_script = StrictScript()
+        stderr = io.StringIO()
+        with (
+            patch(
+                "hpc_alloc.commands.uuid.uuid4",
+                return_value=SimpleNamespace(hex=cancel_id),
+            ),
+            patch.object(
+                self.repository,
+                "transaction",
+                side_effect=interrupting_transaction,
+            ),
+            redirect_stderr(stderr),
+            self.assertRaises(KeyboardInterrupt) as raised,
+        ):
+            _cancel_record(self.context, self.paths, StrictProxy(client_script), job)
+
+        self.assertIs(raised.exception, interrupt)
+        self.assertEqual(
+            [
+                operation
+                for operation in self.repository.list_operations()
+                if operation.kind.value == "cancel"
+            ],
+            [],
+        )
+        self.assertNotIn("hpc-alloc recover", stderr.getvalue())
+        with operation_scope_lock(
+            self.paths.operation_locks_dir,
+            cancel_id,
+            blocking=False,
+        ):
+            pass
+        client_script.assert_complete()
+
+    def test_cancel_interrupt_after_reservation_commit_closes_intent(self) -> None:
+        job = self.acknowledged_job()
+        cancel_id = "c" * 32
+        interrupt = KeyboardInterrupt()
+        real_begin = self.repository.begin_cancel
+
+        def commit_then_interrupt(*args: object, **kwargs: object) -> object:
+            real_begin(*args, **kwargs)
+            raise interrupt
+
+        client_script = StrictScript()
+        stderr = io.StringIO()
+        with (
+            patch(
+                "hpc_alloc.commands.uuid.uuid4",
+                return_value=SimpleNamespace(hex=cancel_id),
+            ),
+            patch.object(
+                self.repository,
+                "begin_cancel",
+                side_effect=commit_then_interrupt,
+            ),
+            redirect_stderr(stderr),
+            self.assertRaises(KeyboardInterrupt) as raised,
+        ):
+            _cancel_record(self.context, self.paths, StrictProxy(client_script), job)
+
+        self.assertIs(raised.exception, interrupt)
+        self.assertEqual(
+            self.repository.get_operation(cancel_id).phase,
+            OperationPhase.FAILED,
+        )
+        self.assertEqual(self.repository.get_job(OPERATION_ID).phase, JobPhase.QUEUED)
+        self.assertNotIn("hpc-alloc recover", stderr.getvalue())
+        client_script.assert_complete()
+
+    def test_cancel_interrupt_after_dispatch_journal_reports_recovery(self) -> None:
+        job = self.acknowledged_job()
+        assert job.ref is not None
+        cancel_id = "c" * 32
+        interrupt = KeyboardInterrupt()
+        real_mark = self.repository.mark_cancel_dispatching
+
+        def commit_then_interrupt(*args: object, **kwargs: object) -> object:
+            real_mark(*args, **kwargs)
+            raise interrupt
+
+        client_script = StrictScript(
+            [
+                ExpectedCall(
+                    "inspect_cancel",
+                    result=CancellationInspection(CancellationInspectionStatus.READY),
+                    args=(job.ref,),
+                ),
+            ]
+        )
+        stderr = io.StringIO()
+        with (
+            patch(
+                "hpc_alloc.commands.uuid.uuid4",
+                return_value=SimpleNamespace(hex=cancel_id),
+            ),
+            patch.object(
+                self.repository,
+                "mark_cancel_dispatching",
+                side_effect=commit_then_interrupt,
+            ),
+            redirect_stderr(stderr),
+            self.assertRaises(KeyboardInterrupt) as raised,
+        ):
+            _cancel_record(self.context, self.paths, StrictProxy(client_script), job)
+
+        self.assertIs(raised.exception, interrupt)
+        self.assertEqual(
+            self.repository.get_operation(cancel_id).phase,
+            OperationPhase.AMBIGUOUS,
+        )
+        self.assertIn(f"`hpc-alloc recover {cancel_id}`", stderr.getvalue())
+        client_script.assert_complete()
+
+    def test_cancel_interrupt_during_dispatch_reports_recovery_without_replay(self) -> None:
+        job = self.acknowledged_job()
+        assert job.ref is not None
+        cancel_id = "c" * 32
+        interrupt = KeyboardInterrupt()
+        client_script = StrictScript(
+            [
+                ExpectedCall(
+                    "inspect_cancel",
+                    result=CancellationInspection(CancellationInspectionStatus.READY),
+                    args=(job.ref,),
+                ),
+                ExpectedCall("execute_cancel", result=interrupt, args=(job.ref,)),
+            ]
+        )
+        stderr = io.StringIO()
+        with (
+            patch(
+                "hpc_alloc.commands.uuid.uuid4",
+                return_value=SimpleNamespace(hex=cancel_id),
+            ),
+            redirect_stderr(stderr),
+            self.assertRaises(KeyboardInterrupt) as raised,
+        ):
+            _cancel_record(self.context, self.paths, StrictProxy(client_script), job)
+
+        self.assertIs(raised.exception, interrupt)
+        self.assertEqual(client_script.count("execute_cancel"), 1)
+        self.assertEqual(
+            self.repository.get_operation(cancel_id).phase,
+            OperationPhase.AMBIGUOUS,
+        )
+        self.assertIn(f"`hpc-alloc recover {cancel_id}`", stderr.getvalue())
+        client_script.assert_complete()
+
+    def test_cancel_interrupt_after_resolution_commit_has_no_false_guidance(self) -> None:
+        job = self.acknowledged_job()
+        assert job.ref is not None
+        cancel_id = "c" * 32
+        interrupt = KeyboardInterrupt()
+        real_resolve = self.repository.resolve_cancel_departed
+
+        def commit_then_interrupt(*args: object, **kwargs: object) -> object:
+            real_resolve(*args, **kwargs)
+            raise interrupt
+
+        client_script = StrictScript(
+            [
+                ExpectedCall(
+                    "inspect_cancel",
+                    result=CancellationInspection(CancellationInspectionStatus.READY),
+                    args=(job.ref,),
+                ),
+                ExpectedCall(
+                    "execute_cancel",
+                    result=CancellationResult(CancellationStatus.CANCELLED),
+                    args=(job.ref,),
+                ),
+            ]
+        )
+        stderr = io.StringIO()
+        with (
+            patch(
+                "hpc_alloc.commands.uuid.uuid4",
+                return_value=SimpleNamespace(hex=cancel_id),
+            ),
+            patch.object(
+                self.repository,
+                "resolve_cancel_departed",
+                side_effect=commit_then_interrupt,
+            ),
+            redirect_stderr(stderr),
+            self.assertRaises(KeyboardInterrupt) as raised,
+        ):
+            _cancel_record(self.context, self.paths, StrictProxy(client_script), job)
+
+        self.assertIs(raised.exception, interrupt)
+        self.assertEqual(
+            self.repository.get_operation(cancel_id).phase,
+            OperationPhase.RESOLVED,
+        )
+        self.assertNotIn("hpc-alloc recover", stderr.getvalue())
+        client_script.assert_complete()
+
+    def test_cancel_interrupt_cleanup_failure_leaves_actionable_operation(self) -> None:
+        job = self.acknowledged_job()
+        assert job.ref is not None
+        cancel_id = "c" * 32
+        interrupt = KeyboardInterrupt()
+        client_script = StrictScript(
+            [
+                ExpectedCall("inspect_cancel", result=interrupt, args=(job.ref,)),
+            ]
+        )
+        stderr = io.StringIO()
+        with (
+            patch(
+                "hpc_alloc.commands.uuid.uuid4",
+                return_value=SimpleNamespace(hex=cancel_id),
+            ),
+            patch.object(
+                self.repository,
+                "fail_cancel_operation",
+                side_effect=StateConflict("failure journal unavailable"),
+            ),
+            redirect_stderr(stderr),
+            self.assertRaises(KeyboardInterrupt) as raised,
+        ):
+            _cancel_record(self.context, self.paths, StrictProxy(client_script), job)
+
+        self.assertIs(raised.exception, interrupt)
+        self.assertEqual(
+            self.repository.get_operation(cancel_id).phase,
+            OperationPhase.CANCEL_PENDING,
+        )
+        self.assertIn(f"`hpc-alloc recover {cancel_id}`", stderr.getvalue())
+        client_script.assert_complete()
+
     def test_live_cancel_rejects_recovery_and_abandon_until_journaled(self) -> None:
         job = self.acknowledged_job()
         assert job.ref is not None
@@ -1242,6 +1508,337 @@ host = "secondary.example.edu"
             OperationPhase.FAILED,
         )
         self.assertEqual(self.repository.get_job(OPERATION_ID).phase, JobPhase.QUEUED)
+
+    def test_recover_resolves_durable_accounting_final_before_services(self) -> None:
+        self.acknowledged_job()
+        cancel = self.repository.begin_cancel(OPERATION_ID, operation_id="c" * 32)
+        cancel = self.repository.mark_cancel_dispatching(cancel.operation_id)
+        final = self.repository.update_job(
+            OPERATION_ID,
+            phase=JobPhase.FINAL,
+            ever_started=True,
+            last_node="node01",
+            terminal_state="CANCELLED",
+            exit_code="0:15",
+            observation_epoch=3,
+            final_source=FinalSource.ACCOUNTING,
+        )
+        original_revision = final.updated_at
+        original_finalized_at = final.finalized_at
+        projection_phases: list[OperationPhase] = []
+
+        def project(_ctx: object, _paths: object) -> bool:
+            projection_phases.append(
+                self.repository.get_operation(cancel.operation_id).phase
+            )
+            return False
+
+        with (
+            patch(
+                "hpc_alloc.commands._services",
+                side_effect=AssertionError("durable final recovery contacted the cluster"),
+            ),
+            patch("hpc_alloc.commands._sync_ssh_projection", side_effect=project),
+            patch("hpc_alloc.commands.info"),
+        ):
+            self.assertEqual(
+                cmd_recover(
+                    SimpleNamespace(
+                        operation_id=cancel.operation_id,
+                        cluster=None,
+                        abandon=False,
+                        yes=False,
+                    ),
+                    ctx=self.context,
+                    paths=self.paths,
+                    entrypoint=Path("/tmp/hpc-alloc"),
+                ),
+                0,
+            )
+
+        self.assertEqual(projection_phases, [OperationPhase.RESOLVED])
+        self.assertEqual(
+            self.repository.get_operation(cancel.operation_id).phase,
+            OperationPhase.RESOLVED,
+        )
+        stored = self.repository.get_job(OPERATION_ID)
+        self.assertEqual(stored.final_source, FinalSource.ACCOUNTING)
+        self.assertEqual(stored.updated_at, original_revision)
+        self.assertEqual(stored.finalized_at, original_finalized_at)
+        self.assertEqual(stored.last_node, "node01")
+        self.assertEqual(stored.observation_epoch, 3)
+
+    def test_recover_resolves_durable_confirmed_queue_final_before_services(self) -> None:
+        self.acknowledged_job()
+        cancel = self.repository.begin_cancel(OPERATION_ID, operation_id="c" * 32)
+        cancel = self.repository.mark_cancel_dispatching(cancel.operation_id)
+        final = self.repository.update_job(
+            OPERATION_ID,
+            phase=JobPhase.FINAL,
+            terminal_state="COMPLETED",
+            observation_epoch=2,
+            evidence_provenance=EvidenceProvenance.ABSENT,
+            evidence_detail="queue absence confirmed twice",
+            final_source=FinalSource.CONFIRMED_QUEUE,
+        )
+        original_revision = final.updated_at
+
+        with (
+            patch(
+                "hpc_alloc.commands._services",
+                side_effect=AssertionError("durable final recovery contacted the cluster"),
+            ),
+            patch("hpc_alloc.commands._sync_ssh_projection", return_value=False),
+            patch("hpc_alloc.commands.info"),
+        ):
+            self.assertEqual(
+                cmd_recover(
+                    SimpleNamespace(
+                        operation_id=cancel.operation_id,
+                        cluster=None,
+                        abandon=False,
+                        yes=False,
+                    ),
+                    ctx=self.context,
+                    paths=self.paths,
+                    entrypoint=Path("/tmp/hpc-alloc"),
+                ),
+                0,
+            )
+
+        stored = self.repository.get_job(OPERATION_ID)
+        self.assertEqual(stored.updated_at, original_revision)
+        self.assertEqual(stored.final_source, FinalSource.CONFIRMED_QUEUE)
+        self.assertEqual(stored.evidence_provenance, EvidenceProvenance.ABSENT)
+        self.assertEqual(stored.evidence_detail, "queue absence confirmed twice")
+        self.assertEqual(
+            self.repository.get_operation(cancel.operation_id).phase,
+            OperationPhase.RESOLVED,
+        )
+
+    def test_bulk_recover_closes_later_local_final_before_remote_bootstrap_failure(
+        self,
+    ) -> None:
+        self.configure_clusters()
+        owner = self.repository.get_or_create_machine_id("laptop")
+        self.repository.reserve_submission(
+            operation_id=OPERATION_ID,
+            cluster="grace",
+            logical_name="dev",
+            kind=JobKind.ALLOCATION,
+            owner_id=owner,
+            slurm_job_name=slurm_job_name("allocation", OPERATION_ID),
+            slurm_comment=format_tag(
+                owner, OPERATION_ID, "laptop", "allocation", "dev"
+            ),
+            resources=self.resources,
+        )
+        self.repository.mark_submission_ambiguous(OPERATION_ID, "reply lost")
+
+        final_operation_id = "b" * 32
+        self.repository.reserve_submission(
+            operation_id=final_operation_id,
+            cluster="grace",
+            logical_name="viz",
+            kind=JobKind.ALLOCATION,
+            owner_id=owner,
+            slurm_job_name=slurm_job_name("allocation", final_operation_id),
+            slurm_comment=format_tag(
+                owner, final_operation_id, "laptop", "allocation", "viz"
+            ),
+            resources=self.resources,
+        )
+        self.repository.acknowledge_submission(final_operation_id, "23456")
+        cancel = self.repository.begin_cancel(
+            final_operation_id,
+            operation_id="c" * 32,
+        )
+        self.repository.mark_cancel_dispatching(cancel.operation_id)
+        self.repository.update_job(
+            final_operation_id,
+            phase=JobPhase.FINAL,
+            ever_started=True,
+            terminal_state="CANCELLED",
+            exit_code="0:15",
+            final_source=FinalSource.ACCOUNTING,
+        )
+
+        failure = AuthRequired("remote recovery requires authentication")
+        with (
+            patch("hpc_alloc.commands._services", side_effect=failure) as services,
+            patch("hpc_alloc.commands._sync_ssh_projection", return_value=False),
+            patch("hpc_alloc.commands.info"),
+            self.assertRaises(AuthRequired) as raised,
+        ):
+            cmd_recover(
+                SimpleNamespace(
+                    operation_id=None,
+                    cluster=None,
+                    abandon=False,
+                    yes=False,
+                ),
+                ctx=self.context,
+                paths=self.paths,
+                entrypoint=Path("/tmp/hpc-alloc"),
+            )
+
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(
+            self.repository.get_operation(cancel.operation_id).phase,
+            OperationPhase.RESOLVED,
+        )
+        self.assertEqual(
+            self.repository.get_operation(OPERATION_ID).phase,
+            OperationPhase.AMBIGUOUS,
+        )
+        services.assert_called_once()
+
+    def test_bulk_recover_sweeps_target_finalized_after_initial_partition(
+        self,
+    ) -> None:
+        self.configure_clusters()
+        owner = self.repository.get_or_create_machine_id("laptop")
+        self.repository.reserve_submission(
+            operation_id=OPERATION_ID,
+            cluster="grace",
+            logical_name="dev",
+            kind=JobKind.ALLOCATION,
+            owner_id=owner,
+            slurm_job_name=slurm_job_name("allocation", OPERATION_ID),
+            slurm_comment=format_tag(
+                owner, OPERATION_ID, "laptop", "allocation", "dev"
+            ),
+            resources=self.resources,
+        )
+        self.repository.mark_submission_ambiguous(OPERATION_ID, "reply lost")
+
+        final_operation_id = "b" * 32
+        self.repository.reserve_submission(
+            operation_id=final_operation_id,
+            cluster="grace",
+            logical_name="viz",
+            kind=JobKind.ALLOCATION,
+            owner_id=owner,
+            slurm_job_name=slurm_job_name("allocation", final_operation_id),
+            slurm_comment=format_tag(
+                owner, final_operation_id, "laptop", "allocation", "viz"
+            ),
+            resources=self.resources,
+        )
+        self.repository.acknowledge_submission(final_operation_id, "23456")
+        cancel = self.repository.begin_cancel(
+            final_operation_id,
+            operation_id="c" * 32,
+        )
+        self.repository.mark_cancel_dispatching(cancel.operation_id)
+
+        get_job = self.repository.get_job
+        finalized = False
+
+        def finalize_after_live_partition(operation_id: str) -> object:
+            nonlocal finalized
+            job = get_job(operation_id)
+            if operation_id == final_operation_id and not finalized:
+                finalized = True
+                self.repository.update_job(
+                    final_operation_id,
+                    phase=JobPhase.FINAL,
+                    ever_started=True,
+                    terminal_state="CANCELLED",
+                    exit_code="0:15",
+                    final_source=FinalSource.ACCOUNTING,
+                )
+            return job
+
+        failure = AuthRequired("remote recovery requires authentication")
+        with (
+            patch.object(
+                self.repository,
+                "get_job",
+                side_effect=finalize_after_live_partition,
+            ),
+            patch("hpc_alloc.commands._services", side_effect=failure) as services,
+            patch("hpc_alloc.commands._sync_ssh_projection", return_value=False),
+            patch("hpc_alloc.commands.info"),
+            self.assertRaises(AuthRequired) as raised,
+        ):
+            cmd_recover(
+                SimpleNamespace(
+                    operation_id=None,
+                    cluster=None,
+                    abandon=False,
+                    yes=False,
+                ),
+                ctx=self.context,
+                paths=self.paths,
+                entrypoint=Path("/tmp/hpc-alloc"),
+            )
+
+        self.assertIs(raised.exception, failure)
+        self.assertTrue(finalized)
+        self.assertEqual(
+            self.repository.get_operation(cancel.operation_id).phase,
+            OperationPhase.RESOLVED,
+        )
+        services.assert_called_once()
+
+    def test_local_final_cancel_recovery_rebases_on_accounting_upgrade(self) -> None:
+        self.acknowledged_job()
+        cancel = self.repository.begin_cancel(OPERATION_ID, operation_id="c" * 32)
+        cancel = self.repository.mark_cancel_dispatching(cancel.operation_id)
+        stale = self.repository.update_job(
+            OPERATION_ID,
+            phase=JobPhase.FINAL,
+            terminal_state="CANCELLED",
+            exit_code="0:15",
+            observation_epoch=2,
+            evidence_provenance=EvidenceProvenance.ABSENT,
+            evidence_detail="queue absence confirmed twice",
+            final_source=FinalSource.CONFIRMED_QUEUE,
+        )
+        real_resolve = self.repository.resolve_operation
+        resolve_calls = 0
+        accounting_revision: str | None = None
+
+        def upgrade_then_resolve(*args: object, **kwargs: object) -> object:
+            nonlocal resolve_calls, accounting_revision
+            resolve_calls += 1
+            if resolve_calls == 1:
+                upgraded = self.repository.update_job(
+                    OPERATION_ID,
+                    phase=JobPhase.FINAL,
+                    ever_started=True,
+                    last_node="node02",
+                    terminal_state="CANCELLED",
+                    exit_code="0:15",
+                    observation_epoch=4,
+                    final_source=FinalSource.ACCOUNTING,
+                )
+                accounting_revision = upgraded.updated_at
+            return real_resolve(*args, **kwargs)
+
+        with (
+            patch.object(
+                self.repository,
+                "resolve_operation",
+                side_effect=upgrade_then_resolve,
+            ),
+            patch("hpc_alloc.commands.info"),
+        ):
+            self.assertTrue(_recover_cancel(self.context, None, cancel, stale))
+
+        self.assertEqual(resolve_calls, 2)
+        stored = self.repository.get_job(OPERATION_ID)
+        self.assertEqual(stored.updated_at, accounting_revision)
+        self.assertEqual(stored.final_source, FinalSource.ACCOUNTING)
+        self.assertTrue(stored.ever_started)
+        self.assertEqual(stored.last_node, "node02")
+        self.assertEqual(stored.observation_epoch, 4)
+        self.assertIsNone(stored.evidence_provenance)
+        self.assertEqual(
+            self.repository.get_operation(cancel.operation_id).phase,
+            OperationPhase.RESOLVED,
+        )
 
     def test_cancel_recovery_resolves_two_confirmed_absences_without_mutation(self) -> None:
         from hpc_alloc.monitor import JobMonitor

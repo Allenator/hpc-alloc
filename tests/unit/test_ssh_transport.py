@@ -227,6 +227,137 @@ class SshTransportTests(unittest.TestCase):
         self.assertIn("could not inspect", warnings[0])
         self.assertIn("could not be protected", warnings[1])
 
+    def test_retirement_bounds_inspection_and_exit_subprocesses(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = self.control_socket(root, "obsolete")
+            calls: list[tuple[list[str], object]] = []
+
+            def runner(argv: list[str], **kwargs: object):
+                calls.append((argv, kwargs.get("timeout")))
+                if "-G" in argv:
+                    return completed(argv, stdout=f"controlpath {path}\n")
+                return completed(argv)
+
+            with patch.object(
+                Path,
+                "lstat",
+                return_value=SimpleNamespace(
+                    st_mode=stat.S_IFSOCK,
+                    st_uid=os.geteuid(),
+                ),
+            ):
+                warnings = retire_compute_masters(
+                    ComputeMasterRetirement(("hpc-grace.dev",), ()),
+                    ssh_dir=root,
+                    runner=runner,
+                )
+
+        self.assertEqual(warnings, ())
+        self.assertEqual(len(calls), 2)
+        self.assertIn("-G", calls[0][0])
+        self.assertIn("-O", calls[1][0])
+        self.assertEqual([timeout for _argv, timeout in calls], [10, 10])
+
+    def test_retirement_aborts_when_retained_alias_inspection_times_out(self) -> None:
+        calls: list[list[str]] = []
+
+        def runner(argv: list[str], **kwargs: object):
+            calls.append(argv)
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            warnings = retire_compute_masters(
+                ComputeMasterRetirement(
+                    ("hpc-grace.dev", "hpc-grace.old"),
+                    ("hpc-grace.dev",),
+                ),
+                ssh_dir=Path(directory),
+                runner=runner,
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(warnings), 2)
+        self.assertIn("timed out after 10 seconds", warnings[0])
+        self.assertIn("could not be protected", warnings[1])
+
+    def test_retirement_skips_only_obsolete_alias_whose_inspection_times_out(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = self.control_socket(root, "closable")
+            closes: list[str] = []
+
+            def runner(argv: list[str], **kwargs: object):
+                if "-G" in argv:
+                    alias = argv[-1]
+                    if alias == "hpc-grace.stuck":
+                        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+                    return completed(argv, stdout=f"controlpath {path}\n")
+                closes.append(argv[-1])
+                return completed(argv)
+
+            with patch.object(
+                Path,
+                "lstat",
+                return_value=SimpleNamespace(
+                    st_mode=stat.S_IFSOCK,
+                    st_uid=os.geteuid(),
+                ),
+            ):
+                warnings = retire_compute_masters(
+                    ComputeMasterRetirement(
+                        ("hpc-grace.stuck", "hpc-grace.closable"), ()
+                    ),
+                    ssh_dir=root,
+                    runner=runner,
+                )
+
+        self.assertEqual(closes, ["hpc-grace.closable"])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("hpc-grace.stuck", warnings[0])
+        self.assertIn("timed out after 10 seconds", warnings[0])
+
+    def test_retirement_exit_timeout_is_best_effort(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = {
+                "hpc-grace.stuck": self.control_socket(root, "stuck"),
+                "hpc-grace.closable": self.control_socket(root, "closable"),
+            }
+            exits: list[str] = []
+
+            def runner(argv: list[str], **kwargs: object):
+                if "-G" in argv:
+                    return completed(
+                        argv, stdout=f"controlpath {paths[argv[-1]]}\n"
+                    )
+                alias = argv[-1]
+                exits.append(alias)
+                if alias == "hpc-grace.stuck":
+                    raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+                return completed(argv)
+
+            with patch.object(
+                Path,
+                "lstat",
+                return_value=SimpleNamespace(
+                    st_mode=stat.S_IFSOCK,
+                    st_uid=os.geteuid(),
+                ),
+            ):
+                warnings = retire_compute_masters(
+                    ComputeMasterRetirement(tuple(paths), ()),
+                    ssh_dir=root,
+                    runner=runner,
+                )
+
+        self.assertCountEqual(exits, list(paths))
+        self.assertEqual(len(warnings), 1)
+        self.assertIn(str(paths["hpc-grace.stuck"]), warnings[0])
+        self.assertIn("timed out after 10 seconds", warnings[0])
+
     def test_retirement_propagates_keyboard_interrupt(self) -> None:
         def runner(_argv: list[str], **_kwargs: object):
             raise KeyboardInterrupt
@@ -239,6 +370,30 @@ class SshTransportTests(unittest.TestCase):
                 ssh_dir=Path(directory),
                 runner=runner,
             )
+
+    def test_retirement_propagates_keyboard_interrupt_during_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = self.control_socket(root, "obsolete")
+
+            def runner(argv: list[str], **_kwargs: object):
+                if "-G" in argv:
+                    return completed(argv, stdout=f"controlpath {path}\n")
+                raise KeyboardInterrupt
+
+            with patch.object(
+                Path,
+                "lstat",
+                return_value=SimpleNamespace(
+                    st_mode=stat.S_IFSOCK,
+                    st_uid=os.geteuid(),
+                ),
+            ), self.assertRaises(KeyboardInterrupt):
+                retire_compute_masters(
+                    ComputeMasterRetirement(("hpc-grace.dev",), ()),
+                    ssh_dir=root,
+                    runner=runner,
+                )
 
     def test_ssh_argv_sets_batch_mode_explicitly_for_both_policies(self) -> None:
         self.assertEqual(

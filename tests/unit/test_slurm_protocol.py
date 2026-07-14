@@ -381,6 +381,15 @@ class SlurmProtocolTests(unittest.TestCase):
         assert record is not None
         self.assertEqual(record.state_code, "COMPLETED")
 
+    def test_special_exit_accounting_is_not_a_final_verdict(self) -> None:
+        ref = self.managed_ref()
+        accounting = framed(
+            f"{ref.job_id}|SPECIAL_EXIT|0:0|{ref.slurm_job_name}|\n"
+        )
+        client, _transport = self.client([accounting])
+
+        self.assertIsNone(client.final(ref))
+
     def test_accounting_requires_exact_job_id_not_first_line(self) -> None:
         payload = "999|COMPLETED|0:0|other|tag\n"
         client, _transport = self.client([framed(payload)])

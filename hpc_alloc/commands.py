@@ -95,6 +95,58 @@ def _best_effort_info(message: str) -> None:
         pass
 
 
+def _secondary_info(message: str) -> None:
+    """Report secondary context without replacing an in-flight primary error."""
+
+    try:
+        _best_effort_info(message)
+    except BaseException:
+        pass
+
+
+def _durable_job_phase(ctx: Any, job: Any) -> JobPhase | None:
+    """Best-effort phase lookup used only to qualify failure guidance."""
+
+    try:
+        return ctx.state.get_job(job.operation_id).phase
+    except BaseException:
+        phase = getattr(job, "phase", None)
+        try:
+            return JobPhase(phase)
+        except (TypeError, ValueError):
+            return None
+
+
+def _report_up_interrupt(ctx: Any, job: Any) -> None:
+    selector = canonical_job_selector(job)
+    if _durable_job_phase(ctx, job) is JobPhase.FINAL:
+        _secondary_info(
+            f"allocation wait interrupted after {selector} reached a durable final "
+            f"state; inspect it with `hpc-alloc status` or `hpc-alloc why {selector}`"
+        )
+        return
+    _secondary_info(
+        f"allocation wait interrupted; {selector} was not cancelled and may remain "
+        f"queued or running; check `hpc-alloc status` and release it with "
+        f"`hpc-alloc down {selector}`"
+    )
+
+
+def _report_run_follow_failure(ctx: Any, job: Any) -> None:
+    selector = canonical_job_selector(job)
+    if _durable_job_phase(ctx, job) is JobPhase.FINAL:
+        _secondary_info(
+            f"foreground follow stopped after {selector} reached a durable final state; "
+            f"inspect `hpc-alloc logs {selector}` or `hpc-alloc why {selector}`"
+        )
+        return
+    _secondary_info(
+        f"foreground follow stopped; {selector} was not cancelled and may continue; "
+        f"reattach with `hpc-alloc logs {selector} -f` or cancel it with "
+        f"`hpc-alloc cancel {selector}`"
+    )
+
+
 def machine_host() -> str:
     return normalize_host_label(platform.node())
 
@@ -180,6 +232,91 @@ def _submission_recovery_guidance(
         f"submission {operation_id} may have committed{known_job}; do not resubmit; "
         f"run `hpc-alloc recover {operation_id}`"
     )
+
+
+def _cancellation_recovery_guidance(
+    operation_id: str, *, ambiguous: bool = True
+) -> str:
+    state = "is ambiguous" if ambiguous else "may remain unresolved after interruption"
+    return (
+        f"cancellation {operation_id} {state}; run "
+        f"`hpc-alloc recover {operation_id}`"
+    )
+
+
+def _best_effort_cancel_interrupt_reconciliation(
+    ctx: Any,
+    *,
+    operation_id: str,
+    target_job_operation_id: str,
+    known_intent: bool,
+) -> None:
+    """Close an undispatched interrupt or retain an actionable recovery ID.
+
+    This runs while the cancellation's exclusive operation lock is still held.
+    Durable phase is authoritative because ``mark_cancel_dispatching`` commits
+    AMBIGUOUS immediately before the guarded one-shot scheduler mutation.
+    Every failure here is secondary to the original asynchronous interrupt.
+    """
+
+    def report(*, ambiguous: bool) -> None:
+        try:
+            _best_effort_info(
+                _cancellation_recovery_guidance(
+                    operation_id,
+                    ambiguous=ambiguous,
+                )
+            )
+        except BaseException:
+            pass
+
+    def matching_cancel(operation: Any) -> bool:
+        return (
+            operation.kind is OperationKind.CANCEL
+            and operation.target_job_operation_id == target_job_operation_id
+        )
+
+    try:
+        operation = ctx.state.get_operation(operation_id)
+    except RecordNotFound:
+        # An interrupt inside begin_cancel's transaction rolled the reservation
+        # back.  Absence while its lock is held proves there is no intent to
+        # recover and guarded dispatch was never entered.
+        return
+    except BaseException:
+        if known_intent:
+            report(ambiguous=False)
+        return
+
+    # Never mutate or advertise recovery for an unexpected durable identity.
+    if not matching_cancel(operation):
+        return
+
+    if operation.phase is OperationPhase.CANCEL_PENDING:
+        try:
+            ctx.state.fail_cancel_operation(
+                operation_id,
+                "cancellation was interrupted before guarded dispatch",
+            )
+            return
+        except BaseException:
+            # The close may have committed before its caller was interrupted.
+            # Re-read before telling the user that recovery is still required.
+            try:
+                operation = ctx.state.get_operation(operation_id)
+            except BaseException:
+                report(ambiguous=False)
+                return
+            if not matching_cancel(operation):
+                return
+            if operation.phase is OperationPhase.CANCEL_PENDING:
+                report(ambiguous=False)
+            elif operation.phase is OperationPhase.AMBIGUOUS:
+                report(ambiguous=True)
+            return
+
+    if operation.phase is OperationPhase.AMBIGUOUS:
+        report(ambiguous=True)
 
 
 def _best_effort_mark_submission_ambiguous(
@@ -1376,47 +1513,52 @@ def cmd_up(
     )
     if job is None:
         return 0
-    info(
-        f"submitted {cluster}:{job.job_id} for allocation {cluster}:{args.name} "
-        f"({resources['partition']}, {resources['time']}; {canonical_job_selector(job)})"
-    )
-    if args.no_wait:
-        return 0
-    _transport, client = _services(ctx, paths, entrypoint, cluster)
-    monitor = JobMonitor(client)
-    started = time.monotonic()
-    while True:
-        result = monitor.assess(job, auth=AuthMode.NONINTERACTIVE)
-        assessment = result.assessment
-        job, assessment, _tracker = _persist_reconciled_assessment(
-            ctx=ctx,
-            paths=paths,
-            client=client,
-            job=job,
-            assessment=assessment,
-            monotonic_evidence=assessment,
-        )
-        if assessment.phase == AssessmentPhase.ACTIVE and assessment.current_node:
-            alias = allocation_alias(cluster, args.name)
-            info(
-                f"allocation {cluster}:{args.name} ready on {assessment.current_node} "
-                f"(job {job.job_id}; ssh {alias})"
-            )
-            return 0
-        if assessment.final:
-            raise HpcAllocError(
-                f"job {job.job_id} ended before becoming active: "
-                f"{assessment.terminal_state or assessment.scheduler_state or 'unknown'}"
-            )
-        elapsed = int(time.monotonic() - started)
+    try:
         info(
-            f"job {job.job_id}: {assessment.scheduler_state or assessment.phase.value} "
-            f"(waited {elapsed}s)"
+            f"submitted {cluster}:{job.job_id} for allocation {cluster}:{args.name} "
+            f"({resources['partition']}, {resources['time']}; "
+            f"{canonical_job_selector(job)})"
         )
-        if elapsed >= args.wait_timeout:
-            info(f"leaving job queued; inspect it with `hpc-alloc status`")
+        if args.no_wait:
             return 0
-        time.sleep(5)
+        _transport, client = _services(ctx, paths, entrypoint, cluster)
+        monitor = JobMonitor(client)
+        started = time.monotonic()
+        while True:
+            result = monitor.assess(job, auth=AuthMode.NONINTERACTIVE)
+            assessment = result.assessment
+            job, assessment, _tracker = _persist_reconciled_assessment(
+                ctx=ctx,
+                paths=paths,
+                client=client,
+                job=job,
+                assessment=assessment,
+                monotonic_evidence=assessment,
+            )
+            if assessment.phase == AssessmentPhase.ACTIVE and assessment.current_node:
+                alias = allocation_alias(cluster, args.name)
+                info(
+                    f"allocation {cluster}:{args.name} ready on {assessment.current_node} "
+                    f"(job {job.job_id}; ssh {alias})"
+                )
+                return 0
+            if assessment.final:
+                raise HpcAllocError(
+                    f"job {job.job_id} ended before becoming active: "
+                    f"{assessment.terminal_state or assessment.scheduler_state or 'unknown'}"
+                )
+            elapsed = int(time.monotonic() - started)
+            info(
+                f"job {job.job_id}: {assessment.scheduler_state or assessment.phase.value} "
+                f"(waited {elapsed}s)"
+            )
+            if elapsed >= args.wait_timeout:
+                info(f"leaving job queued; inspect it with `hpc-alloc status`")
+                return 0
+            time.sleep(5)
+    except KeyboardInterrupt:
+        _report_up_interrupt(ctx, job)
+        raise
 
 
 def _remote_home(ctx: Any, client: Any, cluster: str) -> str:
@@ -1471,26 +1613,39 @@ def _cancel_record(ctx: Any, paths: AppPaths, client: Any, job: Any) -> Any:
     if job.ref is None:
         raise StateConflict("cannot cancel a submission without a confirmed Slurm job ID")
     operation_id = uuid.uuid4().hex
+    operation: Any | None = None
     with operation_scope_lock(
         paths.operation_locks_dir,
         operation_id,
         blocking=True,
     ):
-        return _cancel_record_owned(ctx, client, job, operation_id)
+        try:
+            operation = ctx.state.begin_cancel(
+                job.operation_id,
+                operation_id=operation_id,
+            )
+            return _cancel_record_owned(ctx, client, job, operation)
+        except KeyboardInterrupt:
+            _best_effort_cancel_interrupt_reconciliation(
+                ctx,
+                operation_id=operation_id,
+                target_job_operation_id=job.operation_id,
+                known_intent=operation is not None,
+            )
+            raise
 
 
 def _cancel_record_owned(
     ctx: Any,
     client: Any,
     job: Any,
-    operation_id: str,
+    operation: Any,
 ) -> Any:
     from .errors import ProtocolViolation, SchedulerUnavailable
     from .lifecycle import EvidenceEvent
     from .monitor import JobMonitor
     from .slurm import CancellationInspectionStatus, CancellationStatus
 
-    operation = ctx.state.begin_cancel(job.operation_id, operation_id=operation_id)
     current = job
     while True:
         assert current.ref is not None
@@ -1581,8 +1736,7 @@ def _cancel_record_owned(
     except HpcAllocError as exc:
         ctx.state.mark_cancel_ambiguous(operation.operation_id, str(exc))
         raise TransportLost(
-            f"cancellation {operation.operation_id} is ambiguous; run "
-            f"`hpc-alloc recover {operation.operation_id}`"
+            _cancellation_recovery_guidance(operation.operation_id)
         ) from exc
 
     if outcome.status == CancellationStatus.CANCELLED:
@@ -1599,10 +1753,7 @@ def _cancel_record_owned(
         return outcome
     if outcome.status == CancellationStatus.MUTATION_AMBIGUOUS:
         ctx.state.mark_cancel_ambiguous(operation.operation_id, outcome.detail)
-        raise TransportLost(
-            f"cancellation {operation.operation_id} is ambiguous; run "
-            f"`hpc-alloc recover {operation.operation_id}`"
-        )
+        raise TransportLost(_cancellation_recovery_guidance(operation.operation_id))
     if outcome.status == CancellationStatus.IDENTITY_MISMATCH:
         ctx.state.fail_cancel_operation(
             operation.operation_id,
@@ -1621,10 +1772,7 @@ def _cancel_record_owned(
     # An unknown post-dispatch result can never be downgraded to a safe retry.
     detail = outcome.detail or f"unrecognized cancellation result {outcome.status}"
     ctx.state.mark_cancel_ambiguous(operation.operation_id, detail)
-    raise TransportLost(
-        f"cancellation {operation.operation_id} is ambiguous; run "
-        f"`hpc-alloc recover {operation.operation_id}`"
-    )
+    raise TransportLost(_cancellation_recovery_guidance(operation.operation_id))
 
 
 def cmd_run(
@@ -1723,6 +1871,9 @@ def cmd_run(
         else:
             _best_effort_info(f"cancelled foreground job {cluster}:{job.job_id}")
         raise
+    except HpcAllocError:
+        _report_run_follow_failure(ctx, job)
+        raise
     state = (assessment.terminal_state or "").split()[0].rstrip("+")
     if assessment.exit_code and ":" in assessment.exit_code:
         code = int(assessment.exit_code.split(":", 1)[0])
@@ -1748,12 +1899,22 @@ def _resolve_managed_job(
     include_final: bool = False,
 ) -> Any:
     selector = parse_selector(target, explicit_cluster)
-    if selector.cluster:
-        ctx.config.resolve_cluster(selector.cluster)
     jobs = ctx.state.list_jobs(include_final=include_final)
     if kind is not None:
         jobs = [job for job in jobs if job.kind == kind]
-    return unique_job(jobs, selector)
+    try:
+        job = unique_job(jobs, selector)
+    except IdentityMismatch:
+        # Retain the established configuration error for an unknown qualifier
+        # when no durable historical identity can authorize it.
+        if selector.cluster:
+            ctx.config.resolve_cluster(selector.cluster)
+        raise
+    if selector.cluster and not (
+        include_final and job.phase is JobPhase.FINAL
+    ):
+        ctx.config.resolve_cluster(selector.cluster)
+    return job
 
 
 def cmd_cancel(
@@ -1871,6 +2032,17 @@ def _local_no_id_diagnosis(job: Any) -> str | None:
             "an untracked remote orphan may remain"
         )
     return None
+
+
+def _optional_scheduler_diagnostic(fetch: Callable[[], str]) -> str | None:
+    """Return output-only scheduler detail without discarding core evidence."""
+
+    try:
+        return fetch()
+    except (AuthRequired, HostKeyChanged):
+        raise
+    except HpcAllocError:
+        return None
 
 
 def cmd_logs(
@@ -2076,18 +2248,31 @@ def cmd_why(
                     diagnosis = f"per-user/group resource cap ({reason})"
                 elif "ReqNodeNotAvail" in reason or "Reserv" in reason:
                     diagnosis = "nodes are reserved, commonly for maintenance; a shorter walltime may fit"
-                    detail.extend(client.reservations().strip().splitlines()[:5])
+                    reservations = _optional_scheduler_diagnostic(client.reservations)
+                    if reservations is not None:
+                        detail.extend(reservations.strip().splitlines()[:5])
                 else:
                     diagnosis = f"queue contention ({reason})"
-                    estimate = client.estimated_start(job.job_id)
+                    estimate = _optional_scheduler_diagnostic(
+                        lambda: client.estimated_start(job.job_id)
+                    )
                     if estimate and estimate != "N/A":
                         detail.append(f"estimated start: {estimate}")
-                    detail.extend(client.priority(job.job_id).strip().splitlines()[:3])
+                    priority = _optional_scheduler_diagnostic(
+                        lambda: client.priority(job.job_id)
+                    )
+                    if priority is not None:
+                        detail.extend(priority.strip().splitlines()[:3])
             else:
                 diagnosis = f"queued ({state or assessment.phase.value})"
         elif assessment.phase == AssessmentPhase.ACTIVE:
             diagnosis = f"running on {assessment.current_node}"
-        elif assessment.phase in {AssessmentPhase.STARTED_INACTIVE, AssessmentPhase.REQUEUEING}:
+        elif assessment.phase == AssessmentPhase.STARTED_INACTIVE:
+            diagnosis = (
+                f"{state or assessment.phase.value}; execution has started but is not "
+                "currently active"
+            )
+        elif assessment.phase == AssessmentPhase.REQUEUEING:
             diagnosis = f"{state or assessment.phase.value}; previously started and may run again"
         elif assessment.final:
             final_state = assessment.terminal_state
@@ -2276,6 +2461,104 @@ def _recover_submission(ctx: Any, client: Any, operation: Any, job: Any) -> bool
     return False
 
 
+def _has_durable_scheduler_final(job: Any) -> bool:
+    return (
+        job.phase is JobPhase.FINAL
+        and job.final_source in {FinalSource.ACCOUNTING, FinalSource.CONFIRMED_QUEUE}
+    )
+
+
+def _can_recover_cancel_locally(operation: Any, job: Any) -> bool:
+    return operation.kind is OperationKind.CANCEL and (
+        operation.phase is OperationPhase.CANCEL_PENDING
+        or _has_durable_scheduler_final(job)
+    )
+
+
+def _prioritize_local_cancel_recoveries(ctx: Any, operations: list[Any]) -> list[Any]:
+    """Stable-partition bulk recovery so local cancellation work cannot be stranded."""
+
+    local: list[Any] = []
+    remote: list[Any] = []
+    for operation in operations:
+        locally_recoverable = (
+            operation.kind is OperationKind.CANCEL
+            and operation.phase is OperationPhase.CANCEL_PENDING
+        )
+        if operation.kind is OperationKind.CANCEL and not locally_recoverable:
+            job = ctx.state.get_job(operation.target_job_operation_id)
+            locally_recoverable = _can_recover_cancel_locally(operation, job)
+        (local if locally_recoverable else remote).append(operation)
+    return local + remote
+
+
+def _best_effort_recover_local_cancellations(
+    ctx: Any,
+    paths: AppPaths,
+    operations: list[Any],
+) -> None:
+    """Close newly local work after a bulk remote failure without masking it."""
+
+    for selected_operation in operations:
+        try:
+            with operation_scope_lock(
+                paths.operation_locks_dir,
+                selected_operation.operation_id,
+                blocking=False,
+            ):
+                operation = ctx.state.get_operation(selected_operation.operation_id)
+                if not operation.unresolved:
+                    continue
+                job = ctx.state.get_job(operation.target_job_operation_id)
+                if _can_recover_cancel_locally(operation, job):
+                    _recover_cancel(ctx, None, operation, job)
+        except BaseException:
+            # The remote failure remains primary.  In particular, an active
+            # operation lock must not turn this bounded local sweep into a wait
+            # or replace the exact access/transport error being propagated.
+            continue
+
+
+def _resolve_cancel_from_durable_final(
+    ctx: Any,
+    operation: Any,
+    job: Any,
+) -> bool:
+    """Atomically close ambiguity from scheduler-final evidence already stored."""
+
+    current = job
+    while _has_durable_scheduler_final(current):
+        source = current.final_source
+        assert source is not None
+        lifecycle_evidence: dict[str, Any] = {
+            "ever_started": True if current.ever_started else None,
+            "last_node": current.last_node,
+            "observation_epoch": current.observation_epoch,
+        }
+        if source is FinalSource.CONFIRMED_QUEUE:
+            lifecycle_evidence["evidence_provenance"] = current.evidence_provenance
+            lifecycle_evidence["evidence_detail"] = current.evidence_detail
+        try:
+            ctx.state.resolve_operation(
+                operation.operation_id,
+                final_source=source,
+                expected_target_updated_at=current.updated_at,
+                detail="local cancellation recovery adopted durable final scheduler evidence",
+                terminal_state=current.terminal_state,
+                exit_code=current.exit_code,
+                **lifecycle_evidence,
+            )
+        except LifecycleRevisionConflict:
+            # A concurrent observer may upgrade confirmed queue evidence to
+            # accounting.  Rebase on that exact durable row; finality itself
+            # is monotonic and no scheduler access is needed.
+            current = ctx.state.get_job(operation.target_job_operation_id)
+            continue
+        info(f"recovered final cancellation {operation.cluster}:{operation.job_id}")
+        return True
+    return False
+
+
 def _recover_cancel(ctx: Any, client: Any | None, operation: Any, job: Any) -> bool:
     """Reconcile a cancellation using local phase and read-only evidence only."""
 
@@ -2297,6 +2580,8 @@ def _recover_cancel(ctx: Any, client: Any | None, operation: Any, job: Any) -> b
         raise StateConflict(
             f"cancellation {operation.operation_id} is not recoverable from {operation.phase.value}"
         )
+    if _has_durable_scheduler_final(job):
+        return _resolve_cancel_from_durable_final(ctx, operation, job)
     if job.ref is None:
         return False
     if client is None:
@@ -2362,6 +2647,7 @@ def cmd_recover(
                 for operation in operations
                 if operation.cluster == requested_cluster
             ]
+        operations = _prioritize_local_cancel_recoveries(ctx, operations)
 
     with _ssh_projection_scope(ctx, paths):
         if args.operation_id and not operations[0].unresolved:
@@ -2410,44 +2696,52 @@ def cmd_recover(
             info(f"abandoned local operation {operation.operation_id}")
             return 0
         unresolved = 0
-        for selected_operation in operations:
-            with operation_scope_lock(
-                paths.operation_locks_dir,
-                selected_operation.operation_id,
-                blocking=False,
-            ):
-                operation = ctx.state.get_operation(selected_operation.operation_id)
-                if not operation.unresolved:
-                    if args.operation_id:
-                        info(
-                            f"operation {operation.operation_id} is already resolved "
-                            f"with durable phase {operation.phase.value}"
-                        )
-                    continue
-                job = ctx.state.get_job(operation.target_job_operation_id)
-                if (
-                    operation.kind == OperationKind.CANCEL
-                    and operation.phase is OperationPhase.CANCEL_PENDING
+        for index, selected_operation in enumerate(operations):
+            remote_attempted = False
+            try:
+                with operation_scope_lock(
+                    paths.operation_locks_dir,
+                    selected_operation.operation_id,
+                    blocking=False,
                 ):
-                    resolved = _recover_cancel(ctx, None, operation, job)
-                else:
-                    transport, client = _services(
+                    operation = ctx.state.get_operation(selected_operation.operation_id)
+                    if not operation.unresolved:
+                        if args.operation_id:
+                            info(
+                                f"operation {operation.operation_id} is already resolved "
+                                f"with durable phase {operation.phase.value}"
+                            )
+                        continue
+                    job = ctx.state.get_job(operation.target_job_operation_id)
+                    if _can_recover_cancel_locally(operation, job):
+                        resolved = _recover_cancel(ctx, None, operation, job)
+                    else:
+                        remote_attempted = True
+                        transport, client = _services(
+                            ctx,
+                            paths,
+                            entrypoint,
+                            operation.cluster,
+                        )
+                        transport.bootstrap(operation.cluster)
+                        if operation.kind == OperationKind.SUBMIT:
+                            resolved = _recover_submission(ctx, client, operation, job)
+                        else:
+                            resolved = _recover_cancel(ctx, client, operation, job)
+                    if not resolved:
+                        unresolved += 1
+                        info(
+                            f"operation {operation.operation_id} remains unresolved; "
+                            "no conclusive remote outcome found"
+                        )
+            except HpcAllocError:
+                if args.operation_id is None and remote_attempted:
+                    _best_effort_recover_local_cancellations(
                         ctx,
                         paths,
-                        entrypoint,
-                        operation.cluster,
+                        operations[index:],
                     )
-                    transport.bootstrap(operation.cluster)
-                    if operation.kind == OperationKind.SUBMIT:
-                        resolved = _recover_submission(ctx, client, operation, job)
-                    else:
-                        resolved = _recover_cancel(ctx, client, operation, job)
-                if not resolved:
-                    unresolved += 1
-                    info(
-                        f"operation {operation.operation_id} remains unresolved; "
-                        "no conclusive remote outcome found"
-                    )
+                raise
         return 1 if unresolved else 0
 
 

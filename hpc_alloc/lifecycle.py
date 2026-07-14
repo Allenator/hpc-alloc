@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from .models import EvidenceProvenance, FinalSource, JobPhase
-from .slurm import AccountingRecord, QueueRow
+from .slurm import FINAL_STATES, AccountingRecord, QueueRow
 
 
 class AssessmentPhase(StrEnum):
@@ -102,40 +102,17 @@ class JobAssessment:
         }
 
 
-_ACTIVE = frozenset({"RUNNING"})
-_QUEUED = frozenset({"PENDING", "CONFIGURING", "RESIZING"})
-_STARTED_INACTIVE = frozenset({"SUSPENDED", "STOPPED", "COMPLETING"})
-_REQUEUEING = frozenset({"REQUEUED", "REQUEUE_FED", "REQUEUE_HOLD"})
-_TERMINAL_LOOKING = frozenset(
+_ACTIVE = frozenset({"RUNNING", "RESIZING", "SIGNALING"})
+_QUEUED = frozenset({"PENDING", "CONFIGURING", "RESV_DEL_HOLD"})
+_STARTED_INACTIVE = frozenset({"SUSPENDED", "STOPPED", "COMPLETING", "STAGE_OUT"})
+_REQUEUEING = frozenset({"REQUEUED", "REQUEUE_FED", "REQUEUE_HOLD", "SPECIAL_EXIT"})
+_PROVES_STARTED = _ACTIVE | _STARTED_INACTIVE | _REQUEUEING | frozenset(
     {
-        "BOOT_FAIL",
-        "CANCELLED",
-        "COMPLETED",
-        "DEADLINE",
-        "FAILED",
-        "NODE_FAIL",
-        "OUT_OF_MEMORY",
-        "PREEMPTED",
-        "REVOKED",
-        "SPECIAL_EXIT",
-        "TIMEOUT",
-    }
-)
-_PROVES_STARTED = frozenset(
-    {
-        "RUNNING",
-        "SUSPENDED",
-        "STOPPED",
-        "REQUEUED",
-        "REQUEUE_FED",
-        "REQUEUE_HOLD",
-        "COMPLETING",
         "COMPLETED",
         "FAILED",
         "NODE_FAIL",
         "OUT_OF_MEMORY",
         "PREEMPTED",
-        "SPECIAL_EXIT",
         "TIMEOUT",
     }
 )
@@ -301,7 +278,7 @@ class EvidenceTracker:
         state = _state_code(row.state)
         if not state:
             return self._uncertain("queue row had no scheduler state")
-        if state in _TERMINAL_LOOKING:
+        if state in FINAL_STATES:
             if state in _PROVES_STARTED:
                 self._ever_started = True
                 if row.node:

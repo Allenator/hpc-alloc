@@ -44,7 +44,6 @@ FINAL_STATES = frozenset(
         "OUT_OF_MEMORY",
         "PREEMPTED",
         "REVOKED",
-        "SPECIAL_EXIT",
         "TIMEOUT",
     }
 )

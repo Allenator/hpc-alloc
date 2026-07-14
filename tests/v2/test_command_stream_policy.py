@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ from hpc_alloc.commands import (
     _follow_with_reconciliation,
     _persist_reconciled_assessment,
     cmd_run,
+    cmd_up,
 )
 from hpc_alloc.config import Config
 from hpc_alloc.errors import (
@@ -53,6 +55,16 @@ class InterruptedFollower:
         raise KeyboardInterrupt
 
 
+class FailedFollower:
+    failure: BaseException
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        pass
+
+    def follow(self, *, publish_assessment: object | None = None) -> object:
+        raise self.failure
+
+
 class CommandStreamPolicyTests(unittest.TestCase):
     def args(self) -> SimpleNamespace:
         return SimpleNamespace(
@@ -86,6 +98,7 @@ class CommandStreamPolicyTests(unittest.TestCase):
             ever_started=False,
             current_node=None,
             last_node=None,
+            phase=JobPhase.QUEUED,
         )
 
     def invoke(self, follower: type, cancel_result: object = None):
@@ -125,6 +138,287 @@ class CommandStreamPolicyTests(unittest.TestCase):
     def test_interrupt_still_returns_to_cli_as_interrupt_when_cancel_is_uncertain(self) -> None:
         with self.assertRaises(KeyboardInterrupt):
             self.invoke(InterruptedFollower, TransportLost("reply lost"))
+
+    def test_follower_errors_preserve_identity_and_report_live_job_context(self) -> None:
+        for failure in (
+            SchedulerUnavailable("squeue unavailable"),
+            TransportLost("SSH transport dropped"),
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                FailedFollower.failure = failure
+                paths = AppPaths.for_home(Path("/tmp/hpc-alloc-policy-test"))
+                transport = SimpleNamespace(bootstrap=Mock())
+                cancel = Mock()
+                stderr = io.StringIO()
+                with (
+                    patch(
+                        "hpc_alloc.commands._services",
+                        return_value=(transport, object()),
+                    ),
+                    patch("hpc_alloc.commands._remote_home", return_value="/home/me"),
+                    patch("hpc_alloc.commands._submit_job", return_value=self.job()),
+                    patch("hpc_alloc.commands._cancel_record", cancel),
+                    patch("hpc_alloc.streaming.LogFollower", FailedFollower),
+                    redirect_stderr(stderr),
+                    self.assertRaises(type(failure)) as raised,
+                ):
+                    cmd_run(
+                        self.args(),
+                        ctx=self.context(),
+                        paths=paths,
+                        entrypoint=Path("/tmp/hpc-alloc"),
+                    )
+
+                self.assertIs(raised.exception, failure)
+                cancel.assert_not_called()
+                output = stderr.getvalue()
+                selector = "grace:@" + "a" * 32
+                self.assertIn("was not cancelled and may continue", output)
+                self.assertIn(f"hpc-alloc logs {selector} -f", output)
+                self.assertIn(f"hpc-alloc cancel {selector}", output)
+
+    def test_follower_error_after_durable_final_avoids_live_guidance(self) -> None:
+        failure = SchedulerUnavailable("log drain failed")
+        FailedFollower.failure = failure
+        job = self.job()
+        final = SimpleNamespace(**{**vars(job), "phase": JobPhase.FINAL})
+        context = self.context()
+        context.state = SimpleNamespace(get_job=Mock(return_value=final))
+        paths = AppPaths.for_home(Path("/tmp/hpc-alloc-policy-test"))
+        stderr = io.StringIO()
+        cancel = Mock()
+        with (
+            patch(
+                "hpc_alloc.commands._services",
+                return_value=(SimpleNamespace(bootstrap=Mock()), object()),
+            ),
+            patch("hpc_alloc.commands._remote_home", return_value="/home/me"),
+            patch("hpc_alloc.commands._submit_job", return_value=job),
+            patch("hpc_alloc.commands._cancel_record", cancel),
+            patch("hpc_alloc.streaming.LogFollower", FailedFollower),
+            redirect_stderr(stderr),
+            self.assertRaises(SchedulerUnavailable) as raised,
+        ):
+            cmd_run(
+                self.args(),
+                ctx=context,
+                paths=paths,
+                entrypoint=Path("/tmp/hpc-alloc"),
+            )
+
+        self.assertIs(raised.exception, failure)
+        cancel.assert_not_called()
+        output = stderr.getvalue()
+        self.assertIn("reached a durable final state", output)
+        self.assertNotIn("may continue", output)
+        self.assertNotIn("hpc-alloc cancel", output)
+
+    def test_follower_context_failure_cannot_replace_primary_error(self) -> None:
+        failure = SchedulerUnavailable("squeue unavailable")
+        FailedFollower.failure = failure
+        job = self.job()
+
+        def report(message: str) -> None:
+            if "foreground follow stopped" in message:
+                raise RuntimeError("secondary diagnostic failed")
+
+        with (
+            patch(
+                "hpc_alloc.commands._services",
+                return_value=(SimpleNamespace(bootstrap=Mock()), object()),
+            ),
+            patch("hpc_alloc.commands._remote_home", return_value="/home/me"),
+            patch("hpc_alloc.commands._submit_job", return_value=job),
+            patch("hpc_alloc.streaming.LogFollower", FailedFollower),
+            patch("hpc_alloc.commands.info", side_effect=report),
+            self.assertRaises(SchedulerUnavailable) as raised,
+        ):
+            cmd_run(
+                self.args(),
+                ctx=self.context(),
+                paths=AppPaths.for_home(Path("/tmp/hpc-alloc-policy-test")),
+                entrypoint=Path("/tmp/hpc-alloc"),
+            )
+
+        self.assertIs(raised.exception, failure)
+
+    def test_up_interrupt_reports_uncancelled_allocation_and_preserves_identity(
+        self,
+    ) -> None:
+        interrupt = KeyboardInterrupt()
+        job = SimpleNamespace(
+            cluster="grace",
+            job_id="12345",
+            operation_id="b" * 32,
+            phase=JobPhase.QUEUED,
+        )
+        context = self.context()
+        context.state = SimpleNamespace(get_job=Mock(return_value=job))
+        resources = {
+            "partition": "day",
+            "time": "1:00:00",
+            "cpus": 2,
+            "mem": None,
+            "gpus": None,
+            "constraint": None,
+            "chdir": None,
+            "idle_timeout": None,
+        }
+        cancel = Mock()
+        stderr = io.StringIO()
+        monitor = SimpleNamespace(assess=Mock(side_effect=interrupt))
+        with (
+            patch("hpc_alloc.commands._resource_values", return_value=resources),
+            patch("hpc_alloc.commands._submit_job", return_value=job),
+            patch(
+                "hpc_alloc.commands._services",
+                return_value=(SimpleNamespace(), object()),
+            ),
+            patch("hpc_alloc.monitor.JobMonitor", return_value=monitor),
+            patch("hpc_alloc.commands._cancel_record", cancel),
+            redirect_stderr(stderr),
+            self.assertRaises(KeyboardInterrupt) as raised,
+        ):
+            cmd_up(
+                SimpleNamespace(
+                    cluster=None,
+                    name="dev",
+                    wait_timeout=30,
+                    dry_run=False,
+                    no_wait=False,
+                ),
+                ctx=context,
+                paths=AppPaths.for_home(Path("/tmp/hpc-alloc-policy-test")),
+                entrypoint=Path("/tmp/hpc-alloc"),
+            )
+
+        self.assertIs(raised.exception, interrupt)
+        cancel.assert_not_called()
+        selector = "grace:@" + "b" * 32
+        output = stderr.getvalue()
+        self.assertIn("was not cancelled and may remain queued or running", output)
+        self.assertIn("hpc-alloc status", output)
+        self.assertIn(f"hpc-alloc down {selector}", output)
+
+    def test_up_interrupt_after_durable_final_avoids_down_guidance(self) -> None:
+        interrupt = KeyboardInterrupt()
+        job = SimpleNamespace(
+            cluster="grace",
+            job_id="12345",
+            operation_id="b" * 32,
+            phase=JobPhase.QUEUED,
+        )
+        final = SimpleNamespace(**{**vars(job), "phase": JobPhase.FINAL})
+        context = self.context()
+        context.state = SimpleNamespace(get_job=Mock(return_value=final))
+        resources = {
+            "partition": "day",
+            "time": "1:00:00",
+            "cpus": 2,
+            "mem": None,
+            "gpus": None,
+            "constraint": None,
+            "chdir": None,
+            "idle_timeout": None,
+        }
+        stderr = io.StringIO()
+        with (
+            patch("hpc_alloc.commands._resource_values", return_value=resources),
+            patch("hpc_alloc.commands._submit_job", return_value=job),
+            patch(
+                "hpc_alloc.commands._services",
+                return_value=(SimpleNamespace(), object()),
+            ),
+            patch(
+                "hpc_alloc.monitor.JobMonitor",
+                return_value=SimpleNamespace(assess=Mock(side_effect=interrupt)),
+            ),
+            redirect_stderr(stderr),
+            self.assertRaises(KeyboardInterrupt) as raised,
+        ):
+            cmd_up(
+                SimpleNamespace(
+                    cluster=None,
+                    name="dev",
+                    wait_timeout=30,
+                    dry_run=False,
+                    no_wait=False,
+                ),
+                ctx=context,
+                paths=AppPaths.for_home(Path("/tmp/hpc-alloc-policy-test")),
+                entrypoint=Path("/tmp/hpc-alloc"),
+            )
+
+        self.assertIs(raised.exception, interrupt)
+        output = stderr.getvalue()
+        self.assertIn("reached a durable final state", output)
+        self.assertIn("hpc-alloc why grace:@" + "b" * 32, output)
+        self.assertNotIn("hpc-alloc down", output)
+
+    def test_up_sleep_interrupt_follows_successful_pending_checkpoint(self) -> None:
+        interrupt = KeyboardInterrupt()
+        job = SimpleNamespace(
+            cluster="grace",
+            job_id="12345",
+            operation_id="b" * 32,
+            phase=JobPhase.QUEUED,
+        )
+        context = self.context()
+        context.state = SimpleNamespace(get_job=Mock(return_value=job))
+        resources = {
+            "partition": "day",
+            "time": "1:00:00",
+            "cpus": 2,
+            "mem": None,
+            "gpus": None,
+            "constraint": None,
+            "chdir": None,
+            "idle_timeout": None,
+        }
+        assessment = SimpleNamespace(
+            phase=JobPhase.QUEUED,
+            current_node=None,
+            final=False,
+            scheduler_state="PENDING",
+        )
+        stderr = io.StringIO()
+        with (
+            patch("hpc_alloc.commands._resource_values", return_value=resources),
+            patch("hpc_alloc.commands._submit_job", return_value=job),
+            patch(
+                "hpc_alloc.commands._services",
+                return_value=(SimpleNamespace(), object()),
+            ),
+            patch(
+                "hpc_alloc.monitor.JobMonitor",
+                return_value=SimpleNamespace(
+                    assess=Mock(return_value=SimpleNamespace(assessment=assessment))
+                ),
+            ),
+            patch(
+                "hpc_alloc.commands._persist_reconciled_assessment",
+                return_value=(job, assessment, None),
+            ) as persist,
+            patch("hpc_alloc.commands.time.sleep", side_effect=interrupt),
+            redirect_stderr(stderr),
+            self.assertRaises(KeyboardInterrupt) as raised,
+        ):
+            cmd_up(
+                SimpleNamespace(
+                    cluster=None,
+                    name="dev",
+                    wait_timeout=30,
+                    dry_run=False,
+                    no_wait=False,
+                ),
+                ctx=context,
+                paths=AppPaths.for_home(Path("/tmp/hpc-alloc-policy-test")),
+                entrypoint=Path("/tmp/hpc-alloc"),
+            )
+
+        self.assertIs(raised.exception, interrupt)
+        persist.assert_called_once()
+        self.assertIn("was not cancelled and may remain queued or running", stderr.getvalue())
 
     def test_run_exit_code_comes_from_reconciled_final_authority(self) -> None:
         job = self.job()
