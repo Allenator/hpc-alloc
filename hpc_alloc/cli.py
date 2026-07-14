@@ -132,7 +132,11 @@ def _sigterm_as_interrupt(_signum: int, _frame: object) -> None:
 
 
 def main(argv: Sequence[str] | None = None, *, entrypoint: Path | None = None) -> int:
-    """Parse and dispatch one CLI invocation; return, rather than raise, its exit code."""
+    """Parse and dispatch one CLI invocation, returning its command status.
+
+    Argparse usage failures raise SystemExit before dispatch and the application
+    error boundary.
+    """
 
     from .commands import dispatch
 

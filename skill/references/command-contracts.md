@@ -68,11 +68,11 @@ Treat JSON stdout as the stable machine surface and do not parse display text.
 
 ## Exit, stream, and signal policy
 
-Interpret an ordinary hpc-alloc validation, scheduler, protocol, or application failure as exit 1. Interpret typed authentication, host-key, or transport failures as exit 3, but inspect stderr and command context because exit statuses can be passed through.
+Treat argparse usage failures, including missing required arguments and invalid typed values, as exit 2; they print usage and occur before command dispatch. Interpret a post-parse hpc-alloc validation, scheduler, protocol, or application failure as exit 1. Interpret typed authentication, host-key, or transport failures as exit 3, but inspect stderr and command context because exit statuses can be passed through.
 
 Let foreground `run` return the numeric batch exit status when exact accounting provides it. When confirmed queue finality has no accounting exit status, return 0 for `COMPLETED` and 1 otherwise; coerce any non-`COMPLETED` final state with numeric status 0 to 1.
 
-Allow `run` to pass through an application exit 3. Allow `ssh` to replace the client with OpenSSH and `sync` to return rsync's status, including 3; do not diagnose those statuses as VPN failures without supporting stderr.
+Allow `run` to pass through any numeric application exit, including 2 or 3. Allow `ssh` to replace the client with OpenSSH and `sync` to return rsync's status, including 2 or 3; do not diagnose those statuses as parser or VPN failures without supporting stderr and command context.
 
 - On Ctrl-C or SIGTERM while `up` waits after submission, preserve 130, do not cancel the allocation, and use the printed canonical selector with `status` or `down`.
 - On an ordinary scheduler, transport, or log failure while foreground `run` follows, do not cancel the submitted job; use the printed selector to reattach with `logs -f`, cancel it, or inspect an already durable-final record.

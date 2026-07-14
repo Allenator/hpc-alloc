@@ -221,6 +221,21 @@ class CliIntegrationTests(unittest.TestCase):
                 self.assertNotIn("sbatch", result.stdout)
         self.assertFalse((self.home / ".config" / "hpc-alloc" / "state.db").exists())
 
+    def test_argparse_failures_return_two_before_state_or_remote_work(self) -> None:
+        for arguments, detail in (
+            (("sync",), "the following arguments are required"),
+            (("up", "--cpus", "not-an-integer"), "invalid int value"),
+        ):
+            with self.subTest(arguments=arguments):
+                result = self.run_cli(*arguments)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("usage: hpc-alloc", result.stderr)
+                self.assertIn(f"hpc-alloc {arguments[0]}: error:", result.stderr)
+                self.assertIn(detail, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse((self.home / ".config" / "hpc-alloc" / "state.db").exists())
+
     def test_explicitly_empty_walltime_is_rejected_without_remote_work(self) -> None:
         self.write_config()
         for arguments in (

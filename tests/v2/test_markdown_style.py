@@ -29,10 +29,12 @@ EXCLUDED_FALLBACK_DIRECTORIES = frozenset(
 )
 
 _ATX_HEADING = re.compile(r"^ {0,3}#{1,6}(?:[ \t]+|$)")
-_BLOCKQUOTE_PREFIX = re.compile(r"^(?P<prefix>(?: {0,3}>[ \t]?)+)(?P<body>.*)$")
-_FENCE_OPEN = re.compile(r"^[ \t]*(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
+_BLOCKQUOTE_MARKER = re.compile(r"^ {0,3}> ?")
+_FENCE_OPEN = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
 _HTML_TAG = re.compile(r"^ {0,3}</?[A-Za-z][A-Za-z0-9-]*(?:[ \t][^>]*)?>[ \t]*$")
-_LIST_ITEM = re.compile(r"^[ \t]*(?:[-+*]|[0-9]{1,9}[.)])(?:[ \t]+|$)")
+_LIST_MARKER = re.compile(
+    r"^(?P<indent> {0,3})(?P<marker>[-+*]|(?P<number>[0-9]{1,9})[.)])"
+)
 _REFERENCE_DEFINITION = re.compile(r"^ {0,3}\[[^]]+\]:[ \t]*\S")
 _SETEXT_HEADING = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
 _TABLE_SEPARATOR = re.compile(
@@ -57,6 +59,38 @@ _GIT_REPOSITORY_ENVIRONMENT = frozenset(
 class MarkdownViolation:
     line: int
     message: str
+
+
+@dataclass(frozen=True)
+class _ContainerFrame:
+    kind: str
+    identity: tuple[int, int]
+    content_indent: int = 0
+    marker_indent: int = 0
+
+
+@dataclass(frozen=True)
+class _ListMarkerMatch:
+    end: int
+    content_indent: int
+    marker_indent: int
+    has_content: bool
+    interrupts_paragraph: bool
+
+
+@dataclass(frozen=True)
+class _OpenedContainer:
+    kind: str
+    identity: tuple[int, int]
+    interrupts_paragraph: bool
+    empty_item: bool = False
+
+
+@dataclass(frozen=True)
+class _ParsedLine:
+    frames: tuple[_ContainerFrame, ...]
+    content: str
+    opened: tuple[_OpenedContainer, ...]
 
 
 def _isolated_git_environment() -> dict[str, str]:
@@ -124,17 +158,8 @@ def discover_markdown_files(root: Path) -> tuple[Path, ...]:
     return tuple(sorted(discovered, key=lambda path: path.relative_to(root).as_posix()))
 
 
-def _blockquote_body(line: str) -> tuple[int, str] | None:
-    match = _BLOCKQUOTE_PREFIX.match(line)
-    if match is None:
-        return None
-    return match.group("prefix").count(">"), match.group("body")
-
-
-def _fence(line: str) -> str | None:
-    quoted = _blockquote_body(line)
-    candidate = quoted[1] if quoted is not None else line
-    match = _FENCE_OPEN.match(candidate)
+def _fence(content: str) -> str | None:
+    match = _FENCE_OPEN.match(content)
     if match is None:
         return None
     fence = match.group("fence")
@@ -143,15 +168,175 @@ def _fence(line: str) -> str | None:
     return fence
 
 
-def _is_fence_close(line: str, character: str, minimum_length: int) -> bool:
-    quoted = _blockquote_body(line)
-    candidate = quoted[1] if quoted is not None else line
+def _is_fence_close(content: str, character: str, minimum_length: int) -> bool:
     return bool(
         re.fullmatch(
-            rf"[ \t]*{re.escape(character)}{{{minimum_length},}}[ \t]*",
-            candidate,
+            rf" {{0,3}}{re.escape(character)}{{{minimum_length},}}[ \t]*",
+            content,
         )
     )
+
+
+def _match_list_marker(content: str) -> _ListMarkerMatch | None:
+    match = _LIST_MARKER.match(content)
+    if match is None:
+        return None
+    marker_end = match.end()
+    if marker_end < len(content) and content[marker_end] != " ":
+        return None
+
+    after_marker = content[marker_end:]
+    following_spaces = len(after_marker) - len(after_marker.lstrip(" "))
+    if not after_marker.strip():
+        padding = 1
+        content_start = len(content)
+    elif following_spaces <= 4:
+        padding = following_spaces
+        content_start = marker_end + following_spaces
+    else:
+        padding = 1
+        content_start = marker_end + 1
+
+    marker = match.group("marker")
+    number = match.group("number")
+    has_content = bool(content[content_start:].strip())
+    interrupts = has_content and (number is None or int(number) == 1)
+    return _ListMarkerMatch(
+        end=content_start,
+        content_indent=len(match.group("indent")) + len(marker) + padding,
+        marker_indent=len(match.group("indent")),
+        has_content=has_content,
+        interrupts_paragraph=interrupts,
+    )
+
+
+def _parse_containers(
+    line: str,
+    active_frames: tuple[_ContainerFrame, ...],
+    line_number: int,
+    paragraph_frames: tuple[_ContainerFrame, ...] | None,
+) -> _ParsedLine:
+    """Peel explicit and indented container prefixes from one expanded line."""
+
+    cursor = 0
+    frames: list[_ContainerFrame] = []
+    opened: list[_OpenedContainer] = []
+    existing_index = 0
+
+    while existing_index < len(active_frames):
+        frame = active_frames[existing_index]
+        remainder = line[cursor:]
+        if frame.kind == "quote":
+            marker = _BLOCKQUOTE_MARKER.match(remainder)
+            if marker is None:
+                break
+            cursor += marker.end()
+            frames.append(frame)
+            existing_index += 1
+            continue
+
+        marker = None
+        if not _THEMATIC_BREAK.match(remainder):
+            marker = _match_list_marker(remainder)
+        if marker is not None and marker.marker_indent == frame.marker_indent:
+            replacement = _ContainerFrame(
+                kind="list",
+                identity=(line_number, len(frames)),
+                content_indent=marker.content_indent,
+                marker_indent=marker.marker_indent,
+            )
+            cursor += marker.end
+            frames.append(replacement)
+            opened.append(
+                _OpenedContainer(
+                    kind="list",
+                    identity=replacement.identity,
+                    interrupts_paragraph=True,
+                    empty_item=not marker.has_content,
+                )
+            )
+            break
+
+        leading_spaces = len(remainder) - len(remainder.lstrip(" "))
+        if leading_spaces < frame.content_indent:
+            break
+        cursor += frame.content_indent
+        frames.append(frame)
+        existing_index += 1
+
+    while True:
+        remainder = line[cursor:]
+        quote = _BLOCKQUOTE_MARKER.match(remainder)
+        if quote is not None:
+            frame = _ContainerFrame(
+                kind="quote",
+                identity=(line_number, len(frames)),
+            )
+            frames.append(frame)
+            opened.append(
+                _OpenedContainer(
+                    kind="quote",
+                    identity=frame.identity,
+                    interrupts_paragraph=True,
+                )
+            )
+            cursor += quote.end()
+            continue
+
+        setext_for_open_paragraph = (
+            paragraph_frames is not None
+            and tuple(frames) == paragraph_frames
+            and bool(_SETEXT_HEADING.match(remainder))
+        )
+        if _THEMATIC_BREAK.match(remainder) or setext_for_open_paragraph:
+            break
+        marker = _match_list_marker(remainder)
+        if marker is None:
+            break
+        frame = _ContainerFrame(
+            kind="list",
+            identity=(line_number, len(frames)),
+            content_indent=marker.content_indent,
+            marker_indent=marker.marker_indent,
+        )
+        frames.append(frame)
+        opened.append(
+            _OpenedContainer(
+                kind="list",
+                identity=frame.identity,
+                interrupts_paragraph=marker.interrupts_paragraph,
+                empty_item=not marker.has_content,
+            )
+        )
+        cursor += marker.end
+
+    return _ParsedLine(tuple(frames), line[cursor:], tuple(opened))
+
+
+def _strip_container_frames(
+    line: str, frames: tuple[_ContainerFrame, ...]
+) -> tuple[tuple[_ContainerFrame, ...], str]:
+    """Return the matched container prefix and its residual content."""
+
+    cursor = 0
+    matched_frames: list[_ContainerFrame] = []
+    for frame in frames:
+        remainder = line[cursor:]
+        if frame.kind == "quote":
+            marker = _BLOCKQUOTE_MARKER.match(remainder)
+            if marker is None:
+                break
+            cursor += marker.end()
+        else:
+            if not remainder.strip():
+                matched_frames.append(frame)
+                continue
+            leading_spaces = len(remainder) - len(remainder.lstrip(" "))
+            if leading_spaces < frame.content_indent:
+                break
+            cursor += frame.content_indent
+        matched_frames.append(frame)
+    return tuple(matched_frames), line[cursor:]
 
 
 def _table_lines(lines: list[str]) -> set[int]:
@@ -184,15 +369,20 @@ def markdown_style_violations(text: str) -> tuple[MarkdownViolation, ...]:
     in_frontmatter = bool(lines and lines[0].strip() == "---")
     frontmatter_closed = not in_frontmatter
     in_html_comment = False
+    html_comment_frames: tuple[_ContainerFrame, ...] = ()
     fence_character: str | None = None
     fence_length = 0
-    in_indented_code = False
-    previous_kind: str | None = None
-    previous_blank = True
+    fence_frames: tuple[_ContainerFrame, ...] = ()
+    indented_code_frames: tuple[_ContainerFrame, ...] | None = None
+    active_frames: tuple[_ContainerFrame, ...] = ()
+    paragraph_frames: tuple[_ContainerFrame, ...] | None = None
+    paragraph_subject = "prose paragraph"
+    pending_empty_items: set[tuple[int, int]] = set()
 
     for index, line in enumerate(lines):
         line_number = index + 1
         stripped = line.strip()
+        expanded = line.expandtabs(4)
 
         if in_frontmatter:
             if index > 0 and stripped in {"---", "..."}:
@@ -201,48 +391,160 @@ def markdown_style_violations(text: str) -> tuple[MarkdownViolation, ...]:
             continue
 
         if fence_character is not None:
-            if _is_fence_close(line, fence_character, fence_length):
-                fence_character = None
-                fence_length = 0
+            matched_frames, candidate = _strip_container_frames(
+                expanded, fence_frames
+            )
+            if matched_frames == fence_frames:
+                if _is_fence_close(candidate, fence_character, fence_length):
+                    fence_character = None
+                    fence_length = 0
+                    active_frames = fence_frames
+                    fence_frames = ()
+                continue
+            fence_character = None
+            fence_length = 0
+            fence_frames = ()
+            active_frames = matched_frames
+
+        if in_html_comment:
+            matched_frames, candidate = _strip_container_frames(
+                expanded, html_comment_frames
+            )
+            if matched_frames == html_comment_frames:
+                if "-->" in candidate:
+                    in_html_comment = False
+                    html_comment_frames = ()
+                continue
+            in_html_comment = False
+            html_comment_frames = ()
+            active_frames = matched_frames
+
+        if not stripped:
+            pending_indexes = [
+                frame_index
+                for frame_index, frame in enumerate(active_frames)
+                if frame.identity in pending_empty_items
+            ]
+            if pending_indexes:
+                active_frames = active_frames[: min(pending_indexes)]
+                retained_identities = {frame.identity for frame in active_frames}
+                pending_empty_items.intersection_update(retained_identities)
+            paragraph_frames = None
+            indented_code_frames = None
             continue
-        candidate_fence = _fence(line)
+
+        parsed = _parse_containers(
+            expanded,
+            active_frames,
+            line_number,
+            paragraph_frames,
+        )
+        content = parsed.content
+        content_stripped = content.strip()
+        prior_pending_items = pending_empty_items.copy()
+        parsed_identities = {frame.identity for frame in parsed.frames}
+        pending_empty_items.intersection_update(parsed_identities)
+        if content_stripped or parsed.opened:
+            pending_empty_items.difference_update(prior_pending_items)
+        pending_empty_items.update(
+            opened.identity
+            for opened in parsed.opened
+            if opened.kind == "list" and opened.empty_item
+        )
+        candidate_fence = _fence(content)
+        opens_html_comment = content.lstrip().startswith("<!--")
+        is_structure = (
+            index in table_lines
+            or bool(_ATX_HEADING.match(content))
+            or bool(_SETEXT_HEADING.match(content))
+            or bool(_THEMATIC_BREAK.match(content))
+            or bool(_REFERENCE_DEFINITION.match(content))
+            or bool(_HTML_TAG.match(content))
+            or bool(_TABLE_SEPARATOR.match(content))
+            or (
+                content_stripped.startswith("|")
+                and content_stripped.endswith("|")
+            )
+            or not content_stripped
+            or opens_html_comment
+        )
+
+        if paragraph_frames is not None:
+            retained_frame_count = 0
+            for parsed_frame, paragraph_frame in zip(
+                parsed.frames, paragraph_frames
+            ):
+                if parsed_frame != paragraph_frame:
+                    break
+                retained_frame_count += 1
+            dropped_paragraph_container = retained_frame_count < len(
+                paragraph_frames
+            )
+            containers_interrupt = False
+            if parsed.frames != paragraph_frames and parsed.opened:
+                containers_interrupt = (
+                    dropped_paragraph_container
+                    or parsed.opened[0].interrupts_paragraph
+                )
+            leaf_interrupts = candidate_fence is not None or is_structure
+            if parsed.frames == paragraph_frames:
+                interrupts_paragraph = leaf_interrupts
+            elif parsed.opened:
+                interrupts_paragraph = containers_interrupt
+            else:
+                interrupts_paragraph = leaf_interrupts
+
+            if not interrupts_paragraph:
+                violations.append(
+                    MarkdownViolation(
+                        line_number,
+                        f"join this physical line to the preceding {paragraph_subject}",
+                    )
+                )
+                active_frames = paragraph_frames
+                pending_empty_items.intersection_update(
+                    frame.identity for frame in paragraph_frames
+                )
+                indented_code_frames = None
+                if line.endswith("  "):
+                    violations.append(
+                        MarkdownViolation(
+                            line_number,
+                            "replace the two-space hard break with inline <br> on the same physical line",
+                        )
+                    )
+                trailing_backslashes = len(line) - len(line.rstrip("\\"))
+                if trailing_backslashes % 2 == 1:
+                    violations.append(
+                        MarkdownViolation(
+                            line_number,
+                            "replace the backslash hard break with inline <br> on the same physical line",
+                        )
+                    )
+                continue
+            paragraph_frames = None
+
+        leading_content_spaces = len(content) - len(content.lstrip(" "))
+        if leading_content_spaces >= 4 and (
+            indented_code_frames is None or indented_code_frames == parsed.frames
+        ):
+            indented_code_frames = parsed.frames
+            active_frames = parsed.frames
+            continue
+        indented_code_frames = None
+
         if candidate_fence is not None:
             fence_character = candidate_fence[0]
             fence_length = len(candidate_fence)
-            previous_kind = "structure"
-            previous_blank = False
-            in_indented_code = False
+            fence_frames = parsed.frames
+            active_frames = parsed.frames
             continue
 
-        if in_html_comment:
-            if "-->" in line:
-                in_html_comment = False
+        if opens_html_comment:
+            in_html_comment = "-->" not in content
+            html_comment_frames = parsed.frames if in_html_comment else ()
+            active_frames = parsed.frames
             continue
-        if stripped.startswith("<!--"):
-            in_html_comment = "-->" not in line
-            previous_kind = "structure"
-            previous_blank = False
-            continue
-
-        if not stripped:
-            previous_kind = None
-            previous_blank = True
-            continue
-
-        begins_indented_code = line.startswith("\t") or len(line) - len(
-            line.lstrip(" ")
-        ) >= 4
-        if begins_indented_code and (
-            in_indented_code
-            or previous_blank
-            or previous_kind == "structure"
-            or index == 0
-        ):
-            in_indented_code = True
-            previous_kind = "structure"
-            previous_blank = False
-            continue
-        in_indented_code = False
 
         if line.endswith("  "):
             violations.append(
@@ -260,55 +562,17 @@ def markdown_style_violations(text: str) -> tuple[MarkdownViolation, ...]:
                 )
             )
 
-        quoted = _blockquote_body(line)
-        quote_depth = quoted[0] if quoted is not None else 0
-        content = quoted[1] if quoted is not None else line
-        content_stripped = content.strip()
-
-        is_list_item = bool(_LIST_ITEM.match(content))
-        is_structure = (
-            index in table_lines
-            or bool(_ATX_HEADING.match(content))
-            or bool(_SETEXT_HEADING.match(content))
-            or bool(_THEMATIC_BREAK.match(content))
-            or bool(_REFERENCE_DEFINITION.match(content))
-            or bool(_HTML_TAG.match(content))
-            or (quoted is not None and not content_stripped)
-        )
-
+        active_frames = parsed.frames
         if is_structure:
-            current_kind = "structure"
-        elif is_list_item:
-            current_kind = f"list:{quote_depth}"
-        elif quoted is not None:
-            current_kind = f"quote:{quote_depth}"
+            continue
+
+        paragraph_frames = parsed.frames
+        if parsed.frames and parsed.frames[-1].kind == "list":
+            paragraph_subject = "list item"
+        elif parsed.frames and parsed.frames[-1].kind == "quote":
+            paragraph_subject = "blockquote paragraph"
         else:
-            current_kind = "prose"
-
-        if current_kind == "prose" and previous_kind in {"prose", "list:0"}:
-            subject = "list item" if previous_kind == "list:0" else "prose paragraph"
-            violations.append(
-                MarkdownViolation(
-                    line_number,
-                    f"join this physical line to the preceding {subject}",
-                )
-            )
-        elif current_kind.startswith("quote:") and previous_kind in {
-            current_kind,
-            current_kind.replace("quote:", "list:", 1),
-        }:
-            subject = (
-                "list item" if previous_kind.startswith("list:") else "blockquote paragraph"
-            )
-            violations.append(
-                MarkdownViolation(
-                    line_number,
-                    f"join this physical line to the preceding {subject}",
-                )
-            )
-
-        previous_kind = current_kind
-        previous_blank = False
+            paragraph_subject = "prose paragraph"
 
     if in_frontmatter and not frontmatter_closed:
         violations.append(MarkdownViolation(1, "close the YAML frontmatter"))
@@ -481,6 +745,151 @@ printf '%s\\n' 'fenced code may wrap' \\
                     any(item.line == line and message in item.message for item in violations),
                     violations,
                 )
+
+    def test_container_indented_code_fences_and_headings_are_accepted(self) -> None:
+        cases = {
+            "blockquote code": ">     code one\n>     code two\n",
+            "bullet code": "- item\n\n      code one\n      code two\n",
+            "ordered code": "12. item\n\n        code one\n        code two\n",
+            "quoted list code": "> - item\n\n>       code one\n>       code two\n",
+            "list quote code": "- > item\n\n  >     code one\n  >     code two\n",
+            "list fence": "- ```text\n  wrapped code\n  ```\n",
+            "list heading": "- # A structural heading\noutside prose.\n",
+            "four-space fence content": "```text\n    ```\nstill code\n```\n",
+            "quoted fence": "> ```text\n> wrapped code\n> ```\noutside prose.\n",
+            "quoted comment": "> <!--\n> comment body\n> -->\noutside prose.\n",
+            "list fence with blank": "- ```text\n  code one\n\n  code two\n  ```\n",
+            "empty bullet then code": "-\n\n    code one\n    code two\n",
+            "empty ordered item then code": "1.\n\n    code one\n    code two\n",
+            "nested empty item then outer code": "- -\n\n      code one\n      code two\n",
+            "quoted empty item then quote code": (
+                "> -\n\n>     code one\n>     code two\n"
+            ),
+        }
+        for label, source in cases.items():
+            with self.subTest(label=label):
+                self.assertEqual(markdown_style_violations(source), ())
+
+    def test_list_paragraph_indentation_is_not_mistaken_for_code(self) -> None:
+        cases = {
+            "bullet second paragraph": (
+                "- item\n\n    Second paragraph\n    wrapped.\n",
+                4,
+            ),
+            "ordered second paragraph": (
+                "12. item\n\n    Second paragraph\n    wrapped.\n",
+                4,
+            ),
+            "quoted list second paragraph": (
+                "> - item\n\n>     Second paragraph\n>     wrapped.\n",
+                4,
+            ),
+            "deep continuation cannot interrupt": (
+                "- First half of an item\n      second half.\n",
+                2,
+            ),
+            "empty bullet paragraph": (
+                "-\n    First half of an item\n    second half.\n",
+                3,
+            ),
+            "spaced empty bullet paragraph": (
+                "-    \n    First half of an item\n    second half.\n",
+                3,
+            ),
+        }
+        for label, (source, expected_line) in cases.items():
+            with self.subTest(label=label):
+                violations = markdown_style_violations(source)
+                self.assertTrue(
+                    any(item.line == expected_line for item in violations),
+                    violations,
+                )
+
+    def test_lazy_container_continuations_are_rejected(self) -> None:
+        cases = {
+            "lazy blockquote": "> First half\nsecond half.\n",
+            "partial nested blockquote": "> > First half\n> second half.\n",
+            "fully lazy nested blockquote": "> > First half\nsecond half.\n",
+            "quoted list missing list prefix": "> - First half\n> second half.\n",
+            "quoted list missing all prefixes": "> - First half\nsecond half.\n",
+            "lazy list": "- First half\nsecond half.\n",
+            "list blockquote explicit": "- > First half\n  > second half.\n",
+            "list blockquote missing quote": "- > First half\n  second half.\n",
+            "list blockquote missing all prefixes": "- > First half\nsecond half.\n",
+        }
+        for label, source in cases.items():
+            with self.subTest(label=label):
+                violations = markdown_style_violations(source)
+                self.assertTrue(
+                    any(item.line == 2 for item in violations),
+                    violations,
+                )
+
+        repeated = markdown_style_violations("> First half\nsecond third\nfourth.\n")
+        self.assertEqual(
+            [item.line for item in repeated if "join this physical line" in item.message],
+            [2, 3],
+        )
+
+    def test_container_leaf_blocks_end_when_their_container_ends(self) -> None:
+        cases = {
+            "fenced code": "> ```text\noutside first\noutside second.\n",
+            "HTML comment": "> <!--\noutside prose\n-->\n",
+        }
+        for label, source in cases.items():
+            with self.subTest(label=label):
+                violations = markdown_style_violations(source)
+                self.assertTrue(
+                    any(
+                        item.line == 3 and "join this physical line" in item.message
+                        for item in violations
+                    ),
+                    violations,
+                )
+
+    def test_only_commonmark_block_openers_interrupt_paragraphs(self) -> None:
+        accepted = {
+            "nonempty bullet": "A complete paragraph.\n- A separate item.\n",
+            "ordered one": "A complete paragraph.\n1. A separate item.\n",
+            "blockquote": "A complete paragraph.\n> A separate quote.\n",
+            "heading": "A complete paragraph.\n# A separate heading\n",
+            "fence": "A complete paragraph.\n```text\ncode\n```\n",
+            "thematic break": "* * *\nOutside prose.\n",
+            "setext underline": "A setext heading\n-\nOutside prose.\n",
+            "outside ordered list": "> A complete quote.\n2. An outside list.\n",
+            "outside empty item": "> A complete quote.\n-\n",
+        }
+        for label, source in accepted.items():
+            with self.subTest(label=label):
+                self.assertEqual(markdown_style_violations(source), ())
+
+        rejected = {
+            "ordered two": "First half\n2. second half.\n",
+            "empty bullet": "First half\n*\n",
+            "deeply indented": "First half\n    second half.\n",
+            "deep fence-like continuation": "First half\n    ```\n",
+            "blockquote deeply indented": "> First half\n>     second half.\n",
+            "ordered two inside blockquote": "> First half\n> 2. second half.\n",
+        }
+        for label, source in rejected.items():
+            with self.subTest(label=label):
+                violations = markdown_style_violations(source)
+                self.assertTrue(
+                    any(item.line == 2 for item in violations),
+                    violations,
+                )
+
+    def test_completed_containers_do_not_create_lazy_continuations(self) -> None:
+        accepted = {
+            "quoted blank": "> A complete quote.\n>\nOutside prose.\n",
+            "blank line": "> A complete quote.\n\nOutside prose.\n",
+            "quoted heading then outside": "> # A quoted heading\nOutside prose.\n",
+            "sibling item": "- A complete item.\n- A separate item.\n",
+            "list then blockquote": "- A complete item.\n> A separate quote.\n",
+        }
+        for label, source in accepted.items():
+            with self.subTest(label=label):
+                self.assertEqual(markdown_style_violations(source), ())
 
     def test_unquoted_list_followed_by_blockquote_is_not_a_wrapped_item(self) -> None:
         source = "- A complete unquoted item.\n> A separate blockquote paragraph.\n"
