@@ -7,25 +7,41 @@ import fcntl
 import os
 import re
 import stat
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-from .errors import ConfigInvalid, StateConflict, StateInvalid
+from .errors import ConfigInvalid, OperationBusy, StateConflict, StateInvalid
 
 
 _OPERATION_ID = re.compile(r"[0-9a-f]{32}\Z")
+# How often a bounded acquire re-tries.  Short enough that `setup` starts
+# promptly once a long-running command exits, cheap enough to poll.
+_LOCK_POLL_SECONDS = 0.25
+# `setup` is the only exclusive taker.  Long enough to ride out an ordinary
+# short command, short enough that a multi-hour `run` fails fast and explains.
+SETUP_LOCK_TIMEOUT_SECONDS = 30.0
 
 
 @contextmanager
 def configuration_scope_lock(
-    path: Path, *, exclusive: bool
+    path: Path, *, exclusive: bool, timeout: float | None = None
 ) -> Iterator[None]:
     """Hold a shared or exclusive lock on a stable configuration sibling.
 
     The lock is deliberately separate from every atomically replaced data
     file.  Opening with ``O_NOFOLLOW`` and validating the descriptor prevents
     a symlink or special file from becoming a lock target.
+
+    ``timeout`` bounds an otherwise unbounded wait.  Every command holds this
+    lock *shared* for its whole lifetime -- hours, for a `run` or `logs -f` --
+    and `setup` needs it exclusively, so a plain blocking acquire left `setup`
+    hanging silently and indefinitely with no output and no explanation.  Worse,
+    flock grants no writer preference, so a steady trickle of short shared
+    commands (exactly what an agent polling `status` produces) could starve the
+    exclusive waiter forever.  A bounded wait turns both into a fast, explicit
+    failure that names the cause.
     """
 
     try:
@@ -60,10 +76,25 @@ def configuration_scope_lock(
                     f"configuration-scope lock must have exactly one hard link: {path}"
                 )
             os.fchmod(descriptor, 0o600)
-            fcntl.flock(
-                descriptor,
-                fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH,
-            )
+            mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            if timeout is None:
+                fcntl.flock(descriptor, mode)
+            else:
+                deadline = time.monotonic() + timeout
+                while True:
+                    try:
+                        fcntl.flock(descriptor, mode | fcntl.LOCK_NB)
+                        break
+                    except OSError as exc:
+                        if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                            raise
+                        if time.monotonic() >= deadline:
+                            raise StateConflict(
+                                "another hpc-alloc command is holding the "
+                                f"configuration lock ({path}); it is still "
+                                "running — stop it, or retry once it exits"
+                            ) from exc
+                        time.sleep(_LOCK_POLL_SECONDS)
             locked = True
         except OSError as exc:
             kind = "exclusive" if exclusive else "shared"
@@ -167,7 +198,7 @@ def operation_scope_lock(
                 fcntl.flock(descriptor, lock_flags)
             except OSError as exc:
                 if not blocking and exc.errno in {errno.EACCES, errno.EAGAIN}:
-                    raise StateConflict(
+                    raise OperationBusy(
                         f"operation {operation_id} is active in another hpc-alloc "
                         "process; retry after it exits"
                     ) from exc

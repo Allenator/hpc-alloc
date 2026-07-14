@@ -40,7 +40,42 @@ class CliIntegrationTests(unittest.TestCase):
             "HOME": str(self.home),
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONWARNINGS": "error",
+            # Python 3.14's argparse colorizes usage/help output whenever the
+            # developer's shell exports FORCE_COLOR, even when writing to a
+            # pipe.  The ANSI escapes then break every assertion on the literal
+            # text below.  Pin colour off so these tests check the CLI's output
+            # contract rather than the terminal that happened to launch them.
+            "PYTHON_COLORS": "0",
         }
+        self.environment.pop("FORCE_COLOR", None)
+
+    def test_sighup_is_routed_through_the_interrupt_path_like_sigterm(self) -> None:
+        """A closed terminal delivers SIGHUP to the foreground process group.
+
+        At its default disposition SIGHUP terminates the process outright -- no
+        exception, no `finally` -- so a foreground `run` would skip the
+        cancellation path that Ctrl-C and SIGTERM both take, and the detached
+        Slurm job would keep its GPUs for the whole walltime.
+        """
+
+        import signal
+
+        from hpc_alloc.cli import _install_interrupt_signals, _signal_as_interrupt
+
+        restore = {
+            number: signal.getsignal(number)
+            for number in (signal.SIGTERM, signal.SIGHUP)
+        }
+        self.addCleanup(
+            lambda: [signal.signal(number, handler) for number, handler in restore.items()]
+        )
+
+        _install_interrupt_signals()
+
+        self.assertIs(signal.getsignal(signal.SIGTERM), _signal_as_interrupt)
+        self.assertIs(signal.getsignal(signal.SIGHUP), _signal_as_interrupt)
+        with self.assertRaises(KeyboardInterrupt):
+            _signal_as_interrupt(signal.SIGHUP, None)
 
     def run_cli(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(

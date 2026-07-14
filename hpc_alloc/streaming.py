@@ -11,9 +11,16 @@ from .errors import (
     HpcAllocError,
     ProtocolViolation,
 )
-from .lifecycle import AssessmentPhase, EvidenceEvent, EvidenceTracker, JobAssessment
+from .lifecycle import (
+    AssessmentPhase,
+    EvidenceEvent,
+    EvidenceTracker,
+    JobAssessment,
+    awaits_requeue_confirmation,
+)
 from .models import FinalSource, JobRef
 from .monitor import accept_observation, break_lifecycle_evidence
+from .retry import RetryBudget
 from .slurm import MAX_LOG_CHUNK_BYTES, LogSizeStatus, QueueRow, SlurmClient
 
 
@@ -38,6 +45,11 @@ class FollowOutcome:
     final_log_offset: int
     bytes_written: int
     detach_reason: str | None = None
+    # False when the final drain could not read the log to EOF, so the streamed
+    # output is knowingly incomplete.  Callers must surface this: it is the
+    # difference between "the job printed nothing more" and "we failed to read
+    # what it printed".
+    log_complete: bool = True
 
 
 class LogFollower:
@@ -63,6 +75,9 @@ class LogFollower:
         queued_interval: float = 5,
         note_interval: float = 30,
         final_attempts: tuple[float, ...] = (0, 2, 2, 3, 4, 5, 7, 7),
+        drain_attempts: int = 3,
+        drain_retry_delay: float = 2,
+        retry_budget: RetryBudget | None = None,
     ) -> None:
         self.client = client
         self.ref = ref
@@ -77,6 +92,11 @@ class LogFollower:
         self.queued_interval = queued_interval
         self.note_interval = note_interval
         self.final_attempts = final_attempts
+        self.drain_attempts = drain_attempts
+        self.drain_retry_delay = drain_retry_delay
+        self.retry_budget = retry_budget or RetryBudget(
+            sleeper=sleeper, clock=clock, info=self.info
+        )
         self.offset = 0
         self.total_bytes_written = 0
         self._last_note = float("-inf")
@@ -177,9 +197,20 @@ class LogFollower:
 
         _row, observed = self._observe()
         assessment = self._publish_assessment(observed, publish_assessment)
-        if assessment.phase is AssessmentPhase.TERMINAL_CANDIDATE or (
-            assessment.phase is AssessmentPhase.FINAL
-            and assessment.final_source is FinalSource.CONFIRMED_QUEUE
+        # A NODE_FAIL / PREEMPTED candidate is deliberately NOT finalized here.
+        # The accounting read below would be taken in the same cycle as the
+        # observation that produced the candidate, so it describes the same
+        # instant -- inside the window in which Slurm requeues the job -- and a
+        # single requeue-eligible record locked the job to FINAL/ACCOUNTING
+        # irreversibly.  Deferring lets the next poll decide: a requeued job
+        # reappears as PENDING and clears the candidate, while a genuinely dead
+        # one earns a second, independent terminal or absent observation.
+        if not awaits_requeue_confirmation(assessment) and (
+            assessment.phase is AssessmentPhase.TERMINAL_CANDIDATE
+            or (
+                assessment.phase is AssessmentPhase.FINAL
+                and assessment.final_source is FinalSource.CONFIRMED_QUEUE
+            )
         ):
             attempts = (
                 self.final_attempts if assessment.phase == AssessmentPhase.FINAL else (0,)
@@ -226,23 +257,44 @@ class LogFollower:
             log_status=LogSizeStatus.AVAILABLE,
         )
 
-    def drain(self) -> int:
-        """Best-effort read for a known start or scheduler-final job."""
+    def drain(self) -> bool:
+        """Read the log to EOF after finality; report whether that succeeded.
+
+        This is the read that decides whether `run` delivered the job's whole
+        output: the tail written between the last poll and the job's exit, which
+        is exactly where results and tracebacks land.  It used to swallow every
+        failure and return 0, so one transient ssh or shared-filesystem error
+        silently truncated stdout while the command still reported COMPLETED and
+        exited 0 -- and on the seeded-final path, where this is the *only* read,
+        the entire log could be lost that way.
+
+        Retry a bounded number of times (most such failures are transient), then
+        report the shortfall so the caller can warn.  The remote log itself is
+        not lost, so the remedy is cheap: re-read it with `hpc-alloc logs`.
+        """
 
         if not self.tracker.assessment.log_eligible:
-            return 0
-        try:
-            size = self.client.log_size(self.log_path)
-            if size.status != LogSizeStatus.AVAILABLE or size.size is None:
-                return 0
-            if size.size < self.offset:
-                self.offset = 0
-                self.info(
-                    f"job {self.job_id}: log restarted (requeued?) — re-streaming from the top"
-                )
-            return self._stream_to_size(size.size, best_effort=True)
-        except HpcAllocError:
-            return 0
+            return True
+        for attempt in range(self.drain_attempts):
+            if attempt:
+                self._sleep(self.drain_retry_delay)
+            try:
+                size = self.client.log_size(self.log_path)
+                if size.status is not LogSizeStatus.AVAILABLE or size.size is None:
+                    continue
+                if size.size < self.offset:
+                    self.offset = 0
+                    self.info(
+                        f"job {self.job_id}: log restarted (requeued?) — re-streaming from the top"
+                    )
+                # Not best-effort: a mid-stream failure must be retried, not
+                # silently accepted as the end of the output.  The offset keeps
+                # whatever progress was made, so a retry resumes where it stopped.
+                self._stream_to_size(size.size)
+                return True
+            except HpcAllocError:
+                continue
+        return False
 
     def follow(
         self,
@@ -254,27 +306,39 @@ class LogFollower:
 
         seeded = self.tracker.assessment
         if seeded.final:
-            if drain:
-                self.drain()
+            complete = self.drain() if drain else True
             final = self.tracker.assessment
             return FollowOutcome(
                 assessment=final,
                 observed_terminal_state=final.terminal_state,
                 final_log_offset=self.offset,
                 bytes_written=self.total_bytes_written,
+                log_complete=complete,
             )
 
         while True:
-            result = self.poll_once(publish_assessment=publish_assessment)
+            try:
+                result = self.poll_once(publish_assessment=publish_assessment)
+            except HpcAllocError as exc:
+                # A slurmctld restart, a VPN blip, or a closed laptop lid used to
+                # abort the whole stream while the GPU job kept running.  Ride it
+                # out within the budget; absorb() re-raises anything that is not
+                # transient (auth, host key) or that outlives its patience.  A
+                # broken observation already cleared the tracker's death
+                # candidate, so evidence from before the gap cannot combine with
+                # evidence after it.
+                self.retry_budget.absorb(exc)
+                continue
+            self.retry_budget.reset()
             assessment = result.assessment
             if assessment.final:
-                if drain:
-                    self.drain()
+                complete = self.drain() if drain else True
                 return FollowOutcome(
                     assessment=assessment,
                     observed_terminal_state=assessment.terminal_state,
                     final_log_offset=self.offset,
                     bytes_written=self.total_bytes_written,
+                    log_complete=complete,
                 )
             delay = self.active_interval if assessment.ever_started else self.queued_interval
             self._sleep(delay)

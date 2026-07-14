@@ -479,6 +479,112 @@ class SshConfigTests(unittest.TestCase):
                 self.assertNotIn("HostName node99", candidate)
                 self.assertIsNone(job.current_node)
 
+    def allocation(self, name: str, node: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            operation_id=name.ljust(32, "z"),
+            cluster="grace",
+            logical_name=name,
+            kind=JobKind.ALLOCATION,
+            phase=JobPhase.ACTIVE,
+            current_node=node,
+            evidence_provenance=None,
+        )
+
+    def projection(self, root: Path, jobs: list[object]):
+        config_path = root / "config.toml"
+        config_path.write_text(
+            '[identity]\nnetid = "ab1234"\n[cluster.grace]\nhost = "grace.example.edu"\n'
+        )
+        repository = SimpleNamespace(
+            list_jobs=lambda **_kwargs: list(jobs),
+            list_operations=lambda: [],
+        )
+        managed_path = root / "ssh_config"
+
+        def sync(before_replace=None) -> bool:
+            return sync_managed_config(
+                config_path=config_path,
+                repository=repository,
+                managed_path=managed_path,
+                lock_path=root / ".ssh_config.lock",
+                known_hosts=root / "known_hosts",
+                before_replace=before_replace,
+            )
+
+        return sync, managed_path
+
+    def test_started_inactive_allocation_keeps_its_alias_and_master(self) -> None:
+        """A SUSPENDED / STOPPED / COMPLETING allocation still owns its node.
+
+        The repository nulls current_node for every non-ACTIVE phase, so without
+        the same node lease a TERMINAL_CANDIDATE gets, a preempt-suspended seat
+        loses its alias and has its live ControlMaster retired -- treating it
+        *less* conservatively than a terminal candidate, which is strictly less
+        certain.  recovery-and-lifecycle.md permits retirement only after
+        durable finality.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            job = self.allocation("dev", "node01")
+            sync, managed_path = self.projection(root, [job])
+            sync()
+
+            job.phase = JobPhase.STARTED_INACTIVE
+            job.current_node = None
+            observed: list[ComputeMasterRetirement] = []
+            sync(before_replace=observed.append)
+
+            text = managed_path.read_text()
+            self.assertIn("Host hpc-grace.dev", text)
+            self.assertIn("    HostName node01", text)
+            self.assertEqual(observed, [], "a suspended seat's master was retired")
+
+    def test_unchanged_allocation_is_retained_when_the_stanza_set_changes(self) -> None:
+        """Stanza blocks were compared as raw text.
+
+        render() ends the file with a newline, so only the *last* stanza carries
+        a trailing "\\n".  Adding or removing another allocation re-sorts the
+        stanzas, so an untouched, still-running allocation gained or lost that
+        newline, compared unequal, was judged obsolete, and had its live
+        ControlMaster torn down -- killing the user's open `ssh` shell and any
+        in-flight `sync` multiplexed on it.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dev = self.allocation("dev", "node01")
+            train = self.allocation("train", "node02")
+            jobs: list[object] = [dev]
+            sync, managed_path = self.projection(root, jobs)
+            sync()
+
+            # `train` sorts after `dev`, so `dev` stops being the final stanza.
+            jobs.append(train)
+            observed: list[ComputeMasterRetirement] = []
+            self.assertTrue(sync(before_replace=observed.append))
+            text = managed_path.read_text()
+            self.assertIn("Host hpc-grace.dev", text)
+            self.assertIn("Host hpc-grace.train", text)
+            self.assertEqual(
+                observed, [], "an untouched running allocation's master was retired"
+            )
+
+            # Removing `train` makes `dev` the final stanza again.  A retirement
+            # is now legitimate -- but only for `train`; `dev` must be retained
+            # so its live control socket is protected.
+            jobs.remove(train)
+            observed.clear()
+            self.assertTrue(sync(before_replace=observed.append))
+            self.assertEqual(
+                observed,
+                [
+                    ComputeMasterRetirement(
+                        ("hpc-grace.dev", "hpc-grace.train"), ("hpc-grace.dev",)
+                    )
+                ],
+            )
+
     def test_non_leased_phases_retire_the_prior_alias(self) -> None:
         cases = {
             "cancellation": (

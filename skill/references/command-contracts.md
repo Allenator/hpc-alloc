@@ -15,7 +15,7 @@ Use this reference to choose exact invocations and interpret public CLI results.
 | `hpc-alloc why [TARGET] [--cluster C] [--json]` | Diagnose the selected queued, active, inactive, uncertain, or final job and persist any applicable delayed accounting evidence. |
 | `hpc-alloc logs TARGET [--cluster C] [-n LINES] [-f]` | Read or follow an operation-scoped managed log. Wait safely for start with `-f`; never make follow imply cancellation. |
 | `hpc-alloc cancel JOBID\|@OPERATION [--cluster C]` | Cancel a managed allocation or run only after exact live identity verification; reject logical-name selectors. |
-| `hpc-alloc down [NAME\|JOBID\|@OPERATION\|--all] [--cluster C]` | Cancel one or all managed allocation jobs with exact verification and durable journaling. |
+| `hpc-alloc down NAME\|JOBID\|@OPERATION\|--all [--cluster C]` | Cancel one or all managed allocation jobs with exact verification and durable journaling. The target is required and is never inferred: a bare `down` exits 1 and lists the active allocations. |
 | `hpc-alloc ssh [--cluster C] [NAME\|JOBID\|@OPERATION] [-- CMD...]` | Open an interactive shell or replace the client process with SSH running a command on one active allocation. Place `--cluster` before the target because the remaining arguments belong to SSH. |
 | `hpc-alloc sync NAME\|JOBID\|@OPERATION SRC DST [--cluster C] [--pull] [--delete]` | Run rsync through one active allocation alias; treat `--delete` as destructive and require explicit intent. |
 | `hpc-alloc avail [--cluster C] [-p PARTITION] [--json]` | Summarize currently idle CPUs and free GPUs for one cluster. |

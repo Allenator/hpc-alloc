@@ -17,6 +17,7 @@ from hpc_alloc.errors import (
 )
 from hpc_alloc.ssh import (
     AuthMode,
+    ProbeStatus,
     RetryPolicy,
     SshTransport,
     retire_compute_masters,
@@ -33,6 +34,58 @@ def completed(argv: object, rc: int = 0, stdout: str = "", stderr: str = ""):
 
 
 class SshTransportTests(unittest.TestCase):
+    def test_a_stalled_node_probe_does_not_retire_a_live_master(self) -> None:
+        """A probe timeout means the node is slow, not that its master is dead.
+
+        A loaded allocation -- the very thing an allocation is for -- or a
+        briefly hung shared home can stall a new session past the probe timeout.
+        Retiring the master on that evidence tears down every session
+        multiplexed on the compute alias (another process's interactive shell,
+        an in-flight rsync) even though its connection was healthy.
+        """
+
+        calls: list[list[str]] = []
+
+        def runner(argv: list[str], **_kwargs: object):
+            calls.append(argv)
+            raise subprocess.TimeoutExpired(argv, 15)
+
+        with tempfile.TemporaryDirectory() as directory:
+            transport = self.transport(runner, Path(directory))
+            status = transport.probe_node("hpc-alloc-node-grace-dev")
+
+        self.assertIs(status, ProbeStatus.NETWORK)
+        self.assertEqual(
+            sum("-O" in call for call in calls),
+            0,
+            "a stalled probe retired a possibly-live ControlMaster",
+        )
+        self.assertEqual(len(calls), 1, "a stalled probe must not re-probe")
+
+    def test_remote_invocations_never_inherit_the_callers_stdin(self) -> None:
+        """ssh forwards its own stdin to the remote command unless told not to.
+
+        capture_output only redirects stdout/stderr, so an inherited fd 0 lets
+        each polling ssh child drain the caller's stdin -- silently eating the
+        remaining lines of a `while read ...; done < joblist` loop, or piped
+        input.  These invocations never consume stdin, so they must get DEVNULL.
+        """
+
+        seen: list[dict[str, object]] = []
+
+        def runner(argv: list[str], **kwargs: object):
+            seen.append(kwargs)
+            return completed(argv)
+
+        with tempfile.TemporaryDirectory() as directory:
+            transport = self.transport(runner, Path(directory))
+            transport.probe_alias("hpc-grace.login")
+            transport.close_master("hpc-grace.login")
+
+        self.assertTrue(seen)
+        for kwargs in seen:
+            self.assertIs(kwargs.get("stdin"), subprocess.DEVNULL)
+
     def transport(self, runner, root: Path) -> SshTransport:
         config = SimpleNamespace(clusters={"grace": object()}, ssh=SimpleNamespace(identity_file=None))
         paths = SimpleNamespace(ssh_dir=root)
@@ -615,7 +668,7 @@ class SshTransportTests(unittest.TestCase):
 
                 def runner(argv: list[str], **_kwargs: object):
                     calls.append(argv)
-                    if "-O" in argv and "exit" in argv:
+                    if "-O" in argv:
                         return completed(argv)
                     return completed(argv, 255, stderr=stderr)
 
@@ -630,7 +683,12 @@ class SshTransportTests(unittest.TestCase):
                     2,
                     "the post-master-close probe must determine the returned status",
                 )
-                self.assertEqual(sum("exit" in call for call in calls), 1)
+                # The master is retired exactly once, and with the drain-safe
+                # `-O stop`: `-O exit` would also kill every session multiplexed
+                # on it, including another process's interactive shell or
+                # in-flight rsync on this same compute alias.
+                self.assertEqual(sum("stop" in call for call in calls), 1)
+                self.assertEqual(sum("exit" in call for call in calls), 0)
 
     def test_require_node_success_returns_without_closing_master(self) -> None:
         calls: list[list[str]] = []

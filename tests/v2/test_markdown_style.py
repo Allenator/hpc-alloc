@@ -453,12 +453,13 @@ def markdown_style_violations(text: str) -> tuple[MarkdownViolation, ...]:
         )
         candidate_fence = _fence(content)
         opens_html_comment = content.lstrip().startswith("<!--")
-        is_structure = (
+        is_reference_definition = bool(_REFERENCE_DEFINITION.match(content))
+        is_standalone_structure = (
             index in table_lines
             or bool(_ATX_HEADING.match(content))
             or bool(_SETEXT_HEADING.match(content))
             or bool(_THEMATIC_BREAK.match(content))
-            or bool(_REFERENCE_DEFINITION.match(content))
+            or is_reference_definition
             or bool(_HTML_TAG.match(content))
             or bool(_TABLE_SEPARATOR.match(content))
             or (
@@ -486,13 +487,15 @@ def markdown_style_violations(text: str) -> tuple[MarkdownViolation, ...]:
                     dropped_paragraph_container
                     or parsed.opened[0].interrupts_paragraph
                 )
-            leaf_interrupts = candidate_fence is not None or is_structure
+            leaf_interrupts_paragraph = candidate_fence is not None or (
+                is_standalone_structure and not is_reference_definition
+            )
             if parsed.frames == paragraph_frames:
-                interrupts_paragraph = leaf_interrupts
+                interrupts_paragraph = leaf_interrupts_paragraph
             elif parsed.opened:
                 interrupts_paragraph = containers_interrupt
             else:
-                interrupts_paragraph = leaf_interrupts
+                interrupts_paragraph = leaf_interrupts_paragraph
 
             if not interrupts_paragraph:
                 violations.append(
@@ -563,7 +566,7 @@ def markdown_style_violations(text: str) -> tuple[MarkdownViolation, ...]:
             )
 
         active_frames = parsed.frames
-        if is_structure:
+        if is_standalone_structure:
             continue
 
         paragraph_frames = parsed.frames
@@ -831,6 +834,56 @@ printf '%s\\n' 'fenced code may wrap' \\
             [2, 3],
         )
 
+    def test_reference_definitions_do_not_interrupt_open_paragraphs(self) -> None:
+        cases = {
+            "prose": (
+                "First half\n[ref]: /url\nsecond half.\n",
+                "prose paragraph",
+            ),
+            "explicit blockquote": (
+                "> First half\n> [ref]: /url\n> second half.\n",
+                "blockquote paragraph",
+            ),
+            "lazy blockquote": (
+                "> First half\n[ref]: /url\nsecond half.\n",
+                "blockquote paragraph",
+            ),
+            "list item": (
+                "- First half\n  [ref]: /url\n  second half.\n",
+                "list item",
+            ),
+            "quoted list item": (
+                "> - First half\n>   [ref]: /url\n>   second half.\n",
+                "list item",
+            ),
+        }
+        for label, (source, subject) in cases.items():
+            with self.subTest(label=label):
+                self.assertEqual(
+                    markdown_style_violations(source),
+                    (
+                        MarkdownViolation(
+                            2,
+                            f"join this physical line to the preceding {subject}",
+                        ),
+                        MarkdownViolation(
+                            3,
+                            f"join this physical line to the preceding {subject}",
+                        ),
+                    ),
+                )
+
+    def test_reference_definitions_at_block_boundaries_are_accepted(self) -> None:
+        cases = {
+            "document start": "[ref]: /url\nNext paragraph.\n",
+            "after blank": "First paragraph.\n\n[ref]: /url\nNext paragraph.\n",
+            "blockquote": "> [ref]: /url\n> Quoted prose.\n",
+            "list item": "- [ref]: /url\n  Item prose.\n",
+        }
+        for label, source in cases.items():
+            with self.subTest(label=label):
+                self.assertEqual(markdown_style_violations(source), ())
+
     def test_container_leaf_blocks_end_when_their_container_ends(self) -> None:
         cases = {
             "fenced code": "> ```text\noutside first\noutside second.\n",
@@ -854,7 +907,8 @@ printf '%s\\n' 'fenced code may wrap' \\
             "blockquote": "A complete paragraph.\n> A separate quote.\n",
             "heading": "A complete paragraph.\n# A separate heading\n",
             "fence": "A complete paragraph.\n```text\ncode\n```\n",
-            "thematic break": "* * *\nOutside prose.\n",
+            "thematic break": "A complete paragraph.\n* * *\nOutside prose.\n",
+            "HTML comment": "A complete paragraph.\n<!-- comment -->\nOutside prose.\n",
             "setext underline": "A setext heading\n-\nOutside prose.\n",
             "outside ordered list": "> A complete quote.\n2. An outside list.\n",
             "outside empty item": "> A complete quote.\n-\n",

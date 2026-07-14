@@ -17,6 +17,7 @@ from hpc_alloc.commands import (
 )
 from hpc_alloc.config import Config
 from hpc_alloc.errors import (
+    HpcAllocError,
     LifecycleRevisionConflict,
     SchedulerUnavailable,
     StateConflict,
@@ -33,10 +34,23 @@ from hpc_alloc.models import (
 from hpc_alloc.monitor import JobMonitor
 from hpc_alloc.ownership import format_tag, slurm_job_name
 from hpc_alloc.paths import AppPaths
+from hpc_alloc.retry import RetryBudget
 from hpc_alloc.slurm import AccountingRecord, QueueRow
 from hpc_alloc.ssh_config import sync_managed_config
 from hpc_alloc.state import StateRepository
 from hpc_alloc.streaming import FollowOutcome, LogFollower
+
+
+def _no_patience() -> RetryBudget:
+    """A retry budget that absorbs nothing.
+
+    These tests assert that a failure still surfaces, and that the durable
+    checkpoint and the SSH projection both precede it.  Riding out a transient
+    failure is a separate behaviour, covered in test_streaming.py; zero patience
+    keeps these tests about ordering rather than about waiting.
+    """
+
+    return RetryBudget(scheduler_patience=0, transport_patience=0)
 
 
 class BrokenFollower:
@@ -122,6 +136,44 @@ class CommandStreamPolicyTests(unittest.TestCase):
                 entrypoint=Path("/tmp/hpc-alloc"),
             )
         return result, cancel
+
+    def test_run_without_a_final_state_raises_a_typed_error_not_indexerror(self) -> None:
+        """A FINAL assessment can legitimately carry no terminal state.
+
+        Two absent queue observations finalize a job as confirmed-queue with
+        terminal_state=None, and the accounting ladder returns nothing while
+        slurmdbd lags.  `"".split()` is `[]`, so indexing [0] raised IndexError
+        -- which cli.main does not catch -- instead of reaching the typed guard
+        written for exactly this case.
+        """
+
+        job = self.job()
+        assessment = SimpleNamespace(terminal_state=None, exit_code=None)
+        paths = AppPaths.for_home(Path("/tmp/hpc-alloc-policy-test"))
+
+        with (
+            patch(
+                "hpc_alloc.commands._services",
+                return_value=(SimpleNamespace(bootstrap=Mock()), object()),
+            ),
+            patch("hpc_alloc.commands._remote_home", return_value="/home/me"),
+            patch("hpc_alloc.commands._submit_job", return_value=job),
+            patch(
+                "hpc_alloc.commands._follow_with_reconciliation",
+                return_value=(job, assessment),
+            ),
+            patch("hpc_alloc.commands._pipe_aware_info"),
+            patch("hpc_alloc.commands.info"),
+        ):
+            with self.assertRaises(HpcAllocError) as raised:
+                cmd_run(
+                    self.args(),
+                    ctx=self.context(),
+                    paths=paths,
+                    entrypoint=Path("/tmp/hpc-alloc"),
+                )
+
+        self.assertIn("left the queue without a final state", str(raised.exception))
 
     def test_broken_pipe_cancels_foreground_run_and_returns_141(self) -> None:
         result, cancel = self.invoke(BrokenFollower)
@@ -555,6 +607,7 @@ class LifecycleFollowerReconciliationTests(unittest.TestCase):
             ".hpc-alloc/allocation.log",
             tracker=JobMonitor.tracker(source),
             output=io.BytesIO(),
+            retry_budget=_no_patience(),
         )
 
         def project(_ctx: object, _paths: object) -> bool:
@@ -648,6 +701,7 @@ host = "grace.example.edu"
                 ".hpc-alloc/allocation.log",
                 tracker=JobMonitor.tracker(source),
                 output=io.BytesIO(),
+                retry_budget=_no_patience(),
             )
 
             with self.assertRaises(SchedulerUnavailable) as raised:
@@ -760,6 +814,7 @@ host = "grace.example.edu"
                 ".hpc-alloc/allocation.log",
                 tracker=JobMonitor.tracker(source),
                 output=io.BytesIO(),
+                retry_budget=_no_patience(),
             )
 
             with (
@@ -858,6 +913,7 @@ host = "grace.example.edu"
             ".hpc-alloc/allocation.log",
             tracker=JobMonitor.tracker(source),
             output=io.BytesIO(),
+            retry_budget=_no_patience(),
         )
 
         with (

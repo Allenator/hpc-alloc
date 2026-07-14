@@ -73,6 +73,36 @@ class InstallerDeliveryTests(unittest.TestCase):
         if home.joinpath(".claude").exists():
             raise AssertionError("installer created ~/.claude before validation completed")
 
+    def test_existing_real_skill_directory_is_replaced_not_nested(self) -> None:
+        """`ln -sfn SRC DIR` descends into an existing real directory.
+
+        It creates DIR/skill *inside* it rather than replacing it, so SKILL.md
+        lands at hpc-alloc/skill/SKILL.md, Claude Code never loads the skill --
+        and the installer still prints "linked" and exits 0.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            source = root / "source"
+            installer = self.copy_complete_source(source)
+
+            stale = home / ".claude" / "skills" / "hpc-alloc"
+            stale.mkdir(parents=True)
+            stale.joinpath("SKILL.md").write_text("a stale copied skill\n")
+
+            result = self.run_installer(installer, cwd=source, home=home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            link = home / ".claude" / "skills" / "hpc-alloc"
+            self.assertTrue(link.is_symlink(), "a real directory survived the install")
+            self.assertEqual(link.resolve(), (source / "skill").resolve())
+            self.assertTrue(link.joinpath("SKILL.md").exists())
+            self.assertFalse(
+                link.joinpath("skill").exists(),
+                "installer nested the link inside the existing directory",
+            )
+
     def test_incomplete_source_fails_before_creating_delivery_links(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

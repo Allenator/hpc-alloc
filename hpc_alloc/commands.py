@@ -32,11 +32,16 @@ from .errors import (
     IdentityMismatch,
     LifecycleRevisionConflict,
     LocalToolUnavailable,
+    OperationBusy,
     RecordNotFound,
     StateConflict,
     TransportLost,
 )
-from .locking import configuration_scope_lock, operation_scope_lock
+from .locking import (
+    SETUP_LOCK_TIMEOUT_SECONDS,
+    configuration_scope_lock,
+    operation_scope_lock,
+)
 from .models import (
     EvidenceProvenance,
     FinalSource,
@@ -48,6 +53,7 @@ from .models import (
 from .ownership import normalize_host_label, parse_tag, slurm_job_name
 from .output import neutralize_stderr, neutralize_stdout
 from .paths import AppPaths
+from .retry import RetryBudget
 from .selectors import SelectorKind, canonical_job_selector, parse_selector, unique_job
 from .ssh_config import (
     allocation_alias,
@@ -64,6 +70,10 @@ DEFAULT_CPUS = 2
 DEFAULT_GPU_IDLE_MINUTES = 30
 REMOTE_LOG_DIR = ".hpc-alloc"
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}\Z")
+# Characters a remote POSIX shell cannot expand, split on, or execute.  A leading
+# `~` is deliberately allowed: the documented `hpc-alloc sync … '~/project'` form
+# relies on the remote shell expanding it.
+_REMOTE_SYNC_PATH = re.compile(r"[A-Za-z0-9_@%+=:,./~-]+")
 GPU_RE = re.compile(r"(?:[A-Za-z0-9][A-Za-z0-9_.-]*:)?[1-9][0-9]*\Z")
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -528,7 +538,16 @@ def cmd_setup(args: Any, *, paths: AppPaths, entrypoint: Path) -> int:
     )
     resolve_user_ssh_config(paths.user_ssh_config)
 
-    with configuration_scope_lock(paths.config_scope_lock, exclusive=True):
+    # Bounded: every other command holds this lock shared for its entire
+    # lifetime -- hours, for a `run` or `logs -f` -- so a blocking acquire left
+    # `setup` hanging silently and indefinitely, and flock's lack of writer
+    # preference let a stream of short commands starve it outright.  Fail fast
+    # and say why instead.
+    with configuration_scope_lock(
+        paths.config_scope_lock,
+        exclusive=True,
+        timeout=SETUP_LOCK_TIMEOUT_SECONDS,
+    ):
         # This check is authoritative: another setup may have completed while
         # this invocation was validating its candidate.
         config_exists = paths.config_file.exists()
@@ -648,6 +667,13 @@ def _services(ctx: Any, paths: AppPaths, entrypoint: Path, cluster: str | None =
     # lifecycle state committed.  Repair that derived file before OpenSSH can
     # resolve either a login or allocation alias.
     _sync_ssh_projection(ctx, paths)
+    # The Include is exactly as derived, and exactly as repairable, as the file
+    # it points at -- and without it OpenSSH sees no managed Host block at all,
+    # so every alias becomes an unresolvable hostname and the command dies at
+    # exit 3 ("check the VPN").  The remedy the docs then prescribe, `hpc-alloc
+    # connect`, routes through here too and would fail identically forever.  The
+    # call is idempotent and does not rewrite an Include that is already present.
+    ensure_include(paths.user_ssh_config)
     transport = SshTransport(
         ctx.config,
         paths,
@@ -1152,6 +1178,55 @@ def cmd_status(
     return 0
 
 
+def _reconcile_name_holder(
+    ctx: Any, client: Any, cluster: str, kind: JobKind, logical_name: str
+) -> None:
+    """Finalize a departed allocation that still reserves this logical name.
+
+    A successful `down` deliberately leaves its job TERMINAL_CANDIDATE: an
+    acknowledged cancellation proves the request was *accepted*, not that the
+    job reached a terminal state, and this codebase never fabricates finality
+    from a mutation acknowledgement.  But the live-allocation unique index
+    reserves the name for every non-FINAL row, so `up --name dev` immediately
+    after `down dev` failed with a StateConflict until some unrelated later
+    command happened to finalize the row.
+
+    Reconciling here pays the cost exactly where it is needed -- only when a
+    same-named allocation still holds the name -- and finalizes it only on
+    genuine two-observation or accounting evidence.  An allocation that is still
+    alive (or still draining in COMPLETING, and so still holding its node)
+    simply does not finalize, and reserve_submission raises its usual, accurate
+    conflict.
+    """
+
+    from .monitor import JobMonitor, persist_assessment
+    from .ssh import AuthMode
+
+    if kind != JobKind.ALLOCATION:
+        return
+    try:
+        holders = [
+            job
+            for job in ctx.state.list_jobs(include_final=False)
+            if job.kind == JobKind.ALLOCATION
+            and job.cluster == cluster
+            and job.logical_name == logical_name
+            and job.ref is not None
+        ]
+        for holder in holders:
+            assessment = JobMonitor(client).assess(
+                holder,
+                auth=AuthMode.NONINTERACTIVE,
+                confirm=True,
+            ).assessment
+            if assessment.final:
+                persist_assessment(ctx.state, holder, assessment)
+    except HpcAllocError:
+        # Never mask the reservation's authoritative conflict below: if the name
+        # really is still held, that is the error the user must see.
+        return
+
+
 def _submit_job(
     *,
     ctx: Any,
@@ -1200,6 +1275,7 @@ def _submit_job(
         return None
     transport, client = _services(ctx, paths, entrypoint, cluster)
     transport.bootstrap(cluster, AuthMode.INTERACTIVE_BOOTSTRAP)
+    _reconcile_name_holder(ctx, client, cluster, kind, logical_name)
     # Retry-safe filesystem preparation is deliberately outside the durable
     # scheduler mutation boundary.  It cannot submit a job, so any failure
     # here leaves no local intent and no possible remote scheduler side effect.
@@ -1480,6 +1556,18 @@ def _follow_with_reconciliation(
     # draining, or sleeping.  Consequently a stale final CAS can reconcile
     # back to live without one byte of stale-policy drain.
     outcome = follower.follow(publish_assessment=publish)
+    if not outcome.log_complete:
+        # The job's own exit status is deliberately preserved.  Flipping it here
+        # would tell an agent the *job* failed when in fact only our read of its
+        # log did -- inviting a duplicate GPU submission, which is the worse
+        # outcome.  But the shortfall must be loud: the output above is knowingly
+        # incomplete, and silence would present a truncated result as a complete
+        # one.  The remote log still exists, so re-reading it is cheap.
+        _best_effort_info(
+            f"warning: could not read the log of {source.cluster}:{source.job_id} to the end; "
+            f"the output above may be truncated — re-read it with "
+            f"`hpc-alloc logs {source.cluster}:{source.job_id}`"
+        )
     return source, outcome.assessment
 
 
@@ -1524,8 +1612,17 @@ def cmd_up(
         _transport, client = _services(ctx, paths, entrypoint, cluster)
         monitor = JobMonitor(client)
         started = time.monotonic()
+        budget = RetryBudget(info=info)
         while True:
-            result = monitor.assess(job, auth=AuthMode.NONINTERACTIVE)
+            try:
+                result = monitor.assess(job, auth=AuthMode.NONINTERACTIVE)
+            except HpcAllocError as exc:
+                # One slurmctld restart or VPN blip used to abort the wait
+                # outright, leaving a submitted GPU job queued and unwatched.
+                # absorb() re-raises anything untimely or untreatable by waiting.
+                budget.absorb(exc)
+                continue
+            budget.reset()
             assessment = result.assessment
             job, assessment, _tracker = _persist_reconciled_assessment(
                 ctx=ctx,
@@ -1778,7 +1875,7 @@ def _cancel_record_owned(
 def cmd_run(
     args: Any, *, ctx: Any, paths: AppPaths, entrypoint: Path, **_kwargs: Any
 ) -> int:
-    from .lifecycle import EvidenceTracker
+    from .lifecycle import EvidenceTracker, state_code
     from .ssh import AuthMode
     from .streaming import LogFollower
 
@@ -1874,16 +1971,16 @@ def cmd_run(
     except HpcAllocError:
         _report_run_follow_failure(ctx, job)
         raise
-    state = (assessment.terminal_state or "").split()[0].rstrip("+")
-    if assessment.exit_code and ":" in assessment.exit_code:
-        code = int(assessment.exit_code.split(":", 1)[0])
-    else:
-        code = 0 if state == "COMPLETED" else 1
+    state = state_code(assessment.terminal_state or "")
     if not state:
         raise HpcAllocError(
             f"job {updated.job_id} left the queue without a final state; run `hpc-alloc why "
             f"{cluster}:{updated.job_id}`"
         )
+    if assessment.exit_code and ":" in assessment.exit_code:
+        code = int(assessment.exit_code.split(":", 1)[0])
+    else:
+        code = 0 if state == "COMPLETED" else 1
     if state != "COMPLETED" and code == 0:
         code = 1
     info(f"job {updated.job_id} finished: {state} (exit {code})")
@@ -1975,7 +2072,21 @@ def cmd_down(
             )
         ]
     else:
-        jobs = [_default_allocation(ctx, args.cluster)]
+        # `down` is irreversible.  It used to fall back to an implicit target --
+        # the sole allocation, or whichever one happened to be named `dev` when
+        # several existed -- so an omitted selector silently cancelled a
+        # different, still-in-use seat and exited 0 with no prompt.  Naming the
+        # target (or --all) costs one word.
+        candidates = sorted(
+            f"{job.cluster}:{job.logical_name}"
+            for job in ctx.state.list_jobs(include_final=False)
+            if job.kind == JobKind.ALLOCATION
+            and (args.cluster is None or job.cluster == args.cluster)
+        )
+        listed = ", ".join(candidates) if candidates else "none are active"
+        raise ConfigInvalid(
+            f"down requires an allocation target or --all (active: {listed})"
+        )
     if not jobs:
         info("no matching active allocations")
         return 0
@@ -1993,18 +2104,26 @@ def cmd_down(
                         f"{outcome.status.value.lower().replace('_', ' ')} allocation "
                         f"{job.cluster}:{job.logical_name} ({job.job_id})"
                     )
-                except (AuthRequired, HostKeyChanged) as exc:
+                except (AuthRequired, HostKeyChanged, TransportLost) as exc:
                     info(f"could not release {job.cluster}:{job.logical_name}: {exc}")
                     # Security/authentication failures are not best-effort
                     # scheduler errors.  Stop before touching another allocation;
                     # the projection scope repairs state changed by earlier jobs.
+                    #
+                    # TransportLost belongs here for a sharper reason: it is how
+                    # _cancel_record_owned reports a *possibly dispatched*
+                    # cancellation.  Folding it into the best-effort `failed`
+                    # counter returned exit 1 -- "validation/scheduler" -- for
+                    # the one outcome an agent must never blindly retry, and the
+                    # docs promise exit 3 for it.  A blind retry then hits the
+                    # pending-cancellation index and fails forever.
                     raise
                 except HpcAllocError as exc:
                     failed += 1
                     info(f"could not release {job.cluster}:{job.logical_name}: {exc}")
                     if not args.all:
                         raise
-    except (AuthRequired, HostKeyChanged):
+    except (AuthRequired, HostKeyChanged, TransportLost):
         if args.all and projection.synchronized:
             for message in successes:
                 info(message)
@@ -2376,26 +2495,69 @@ def cmd_ssh(
         raise LocalToolUnavailable(f"cannot execute ssh: {exc}") from exc
 
 
+def _safe_remote_sync_path(path: str) -> str:
+    """Reject a remote rsync path the remote login shell would re-interpret.
+
+    rsync passes its remote path through the remote shell, and neither macOS's
+    openrsync nor the `--protect-args` flag it lacks can prevent that.  So a path
+    containing a space split into several arguments, and `*`, `$VAR`, `` `cmd` ``
+    and `$(cmd)` were expanded or executed on the cluster.  With `--delete` on a
+    push, a mis-split destination silently deleted files under the *wrong* remote
+    directory and still exited 0.
+
+    The tool depends on that shell pass for one thing only -- the documented
+    leading `~` -- so rather than quote the path (which would break `~`), restrict
+    it to characters the shell cannot do anything with.
+    """
+
+    if not path:
+        raise ConfigInvalid("remote sync path must not be empty")
+    if _REMOTE_SYNC_PATH.fullmatch(path) is None:
+        raise ConfigInvalid(
+            f"unsafe remote sync path {path!r}: the remote shell re-parses this "
+            "path, so it may contain only letters, digits and _@%+=:,./~- "
+            "(no spaces, quotes, globs, or $(...) substitutions)"
+        )
+    return path
+
+
 def cmd_sync(
     args: Any, *, ctx: Any, paths: AppPaths, entrypoint: Path, **_kwargs: Any
 ) -> int:
+    from .ssh import ssh_transport_argv
+
     job, transport = _active_allocation(ctx, paths, entrypoint, args.target, args.cluster)
     alias = allocation_alias(job.cluster, job.logical_name)
     transport.require_node(alias)
     source, destination = args.src, args.dst
     if args.pull:
-        source = f"{alias}:{source}"
+        source = f"{alias}:{_safe_remote_sync_path(source)}"
     else:
-        destination = f"{alias}:{destination}"
-    command = ["rsync", "-az", "-e", "ssh"]
+        destination = f"{alias}:{_safe_remote_sync_path(destination)}"
+    # rsync hands the remote spec to the remote *login shell*, which re-splits
+    # and expands it.  The documented `~/project` form depends on exactly that,
+    # so the path is deliberately left unquoted -- and _safe_remote_sync_path is
+    # what makes the shell's re-parse a no-op for everything else.  `-e` gets the
+    # same hardened transport as every other SSH call site rather than a bare
+    # `ssh`, so a dead master cannot drop the transfer to an interactive password
+    # prompt or hang without a connect timeout.
+    command = ["rsync", "-az", "-e", shlex.join(ssh_transport_argv())]
     if args.delete:
         command.append("--delete")
     command += ["--", source, destination]
     info(shlex.join(command))
     try:
-        return subprocess.run(command).returncode
+        completed = subprocess.run(command)
     except OSError as exc:
         raise LocalToolUnavailable(f"cannot execute rsync: {exc}") from exc
+    status = completed.returncode
+    if status < 0:
+        # A signal-killed child reports -N.  Returned verbatim it reaches the
+        # shell as 256-N (241 for SIGTERM, 247 for SIGKILL) -- neither rsync's
+        # status, which this command contracts to pass through, nor any
+        # documented hpc-alloc exit code.  Report the conventional 128+N.
+        status = 128 - status
+    return status
 
 
 def _recover_submission(ctx: Any, client: Any, operation: Any, job: Any) -> bool:
@@ -2512,10 +2674,15 @@ def _best_effort_recover_local_cancellations(
                 job = ctx.state.get_job(operation.target_job_operation_id)
                 if _can_recover_cancel_locally(operation, job):
                     _recover_cancel(ctx, None, operation, job)
-        except BaseException:
+        except Exception:
             # The remote failure remains primary.  In particular, an active
             # operation lock must not turn this bounded local sweep into a wait
             # or replace the exact access/transport error being propagated.
+            #
+            # Catch Exception, never BaseException: this loop performs durable
+            # cancellation writes, so swallowing KeyboardInterrupt/SystemExit
+            # would let a Ctrl-C (or the SIGTERM/SIGHUP the CLI converts into
+            # one) keep mutating the remaining operations instead of stopping.
             continue
 
 
@@ -2598,13 +2765,41 @@ def _recover_cancel(ctx: Any, client: Any | None, operation: Any, job: Any) -> b
             auth=AuthMode.NONINTERACTIVE,
             confirm=True,
         ).assessment
-        if not assessment.final:
-            observed = assessment.scheduler_state or assessment.phase.value
+        observed = assessment.scheduler_state or assessment.phase.value
+        if assessment.uncertain:
+            # No usable observation at all.  The cancellation must stay guarded:
+            # releasing it on uncertainty could let a retry dispatch a second
+            # mutation while the first may still have been delivered.
             ctx.state.mark_cancel_ambiguous(
                 operation.operation_id,
                 f"read-only recovery remains inconclusive ({observed})",
             )
             return False
+        if not assessment.final:
+            # The job was positively observed still alive, which proves the
+            # ambiguous cancellation never took effect -- cancelling terminates a
+            # job, it does not requeue one.  Resolving the operation as failed
+            # releases the one-pending-cancel index so an explicit retry can
+            # dispatch a fresh, freshly-guarded cancellation.  Unlike a
+            # submission, a repeated cancellation is idempotent, so the extreme
+            # conservatism the submit path needs is not warranted here.
+            #
+            # Re-marking it AMBIGUOUS (the old behaviour) held that index
+            # forever: every later `down`/`cancel` hit StateConflict("job
+            # already has a pending cancellation") and every later `recover`
+            # landed back here, so a live GPU allocation could never be released
+            # through the CLI at all -- the user had to wait out its walltime.
+            ctx.state.fail_cancel_operation(
+                operation.operation_id,
+                f"read-only recovery observed the job still {observed}; "
+                "the cancellation did not take effect",
+            )
+            info(
+                f"cancellation {operation.operation_id} did not take effect — "
+                f"{operation.cluster}:{operation.job_id} is still {observed}; "
+                f"release it with `hpc-alloc cancel {operation.cluster}:{operation.job_id}`"
+            )
+            return True
         if assessment.final_source is None:
             raise ProtocolViolation("final cancellation recovery evidence lacks provenance")
         try:
@@ -2734,6 +2929,22 @@ def cmd_recover(
                             f"operation {operation.operation_id} remains unresolved; "
                             "no conclusive remote outcome found"
                         )
+            except OperationBusy as exc:
+                if args.operation_id is not None:
+                    raise
+                # A bulk sweep must not die because one operation is in use by a
+                # live process.  A concurrent `down` holds its cancel
+                # operation's lock for the whole guarded cancel, and
+                # _prioritize_local_cancel_recoveries deterministically sorts
+                # exactly that operation to the front -- and because the lock
+                # conflict is raised by the `with` itself, before
+                # remote_attempted is set, the handler below skipped even the
+                # local fallback and aborted the sweep on item 0, stranding
+                # every genuinely orphaned operation behind it.  The busy
+                # operation is owned by the process holding it; leave it there.
+                unresolved += 1
+                info(f"skipped {selected_operation.operation_id}: {exc}")
+                continue
             except HpcAllocError:
                 if args.operation_id is None and remote_attempted:
                     _best_effort_recover_local_cancellations(

@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -79,6 +80,49 @@ class ConfigurationScopeLockTests(unittest.TestCase):
         exclusive_thread.join(5)
         self.assertFalse(shared_thread.is_alive())
         self.assertFalse(exclusive_thread.is_alive())
+
+    def test_a_bounded_exclusive_acquire_fails_fast_and_explains(self) -> None:
+        """`setup` must never hang silently behind a long-running command.
+
+        Every other command holds this lock *shared* for its entire lifetime --
+        hours, for a `run` or `logs -f` -- so `setup`'s blocking exclusive
+        acquire produced a dead terminal with no output and no explanation for
+        as long as the job ran.  flock also grants no writer preference, so a
+        steady trickle of short `status` polls (exactly what an agent driver
+        produces) could starve it indefinitely.
+        """
+
+        with configuration_scope_lock(self.path, exclusive=False):
+            started = time.monotonic()
+            with self.assertRaises(StateConflict) as raised:
+                with configuration_scope_lock(
+                    self.path, exclusive=True, timeout=0.5
+                ):
+                    raise AssertionError("the exclusive lock must not be granted")
+            elapsed = time.monotonic() - started
+
+        self.assertIn("another hpc-alloc command", str(raised.exception))
+        self.assertIn(str(self.path), str(raised.exception))
+        # Bounded: it gives up promptly rather than waiting out the whole job.
+        self.assertLess(elapsed, 5)
+
+    def test_a_bounded_acquire_still_succeeds_once_the_holder_exits(self) -> None:
+        release = threading.Event()
+        acquired = threading.Event()
+
+        def hold() -> None:
+            with configuration_scope_lock(self.path, exclusive=False):
+                acquired.set()
+                release.wait(5)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        self.addCleanup(holder.join)
+        self.assertTrue(acquired.wait(5))
+
+        release.set()
+        with configuration_scope_lock(self.path, exclusive=True, timeout=5):
+            pass
 
     def test_symlink_and_special_file_are_rejected(self) -> None:
         self.path.parent.mkdir()

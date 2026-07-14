@@ -9,7 +9,9 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from hpc_alloc.commands import (
+    _best_effort_recover_local_cancellations,
     _cancel_record,
+    _reconcile_name_holder,
     _recover_cancel,
     _recover_submission,
     _sync_ssh_projection,
@@ -22,8 +24,10 @@ from hpc_alloc.config import Config
 from hpc_alloc.errors import (
     AmbiguousSubmission,
     AuthRequired,
+    ConfigInvalid,
     HostKeyChanged,
     IdentityMismatch,
+    OperationBusy,
     SchedulerUnavailable,
     StateConflict,
     TransportLost,
@@ -1340,14 +1344,33 @@ host = "secondary.example.edu"
             ]
         )
 
-        self.assertFalse(
-            _recover_cancel(self.context, StrictProxy(client_script), cancel, job)
-        )
+        # A job positively observed still alive proves the ambiguous
+        # cancellation never took effect (cancelling terminates a job, it does
+        # not requeue one), so recovery resolves the operation as failed.  That
+        # releases the one_pending_cancel index and lets an explicit retry
+        # dispatch a fresh, freshly-guarded cancellation.
+        #
+        # Leaving it AMBIGUOUS (the old behaviour) held that index forever:
+        # every later `down`/`cancel` raised StateConflict("job already has a
+        # pending cancellation") and every later `recover` landed right back
+        # here, so a live GPU allocation could never be released -- the user had
+        # to wait out its walltime.  Recovery is still observation-only on the
+        # wire: it issues no remote mutation, as the strict script asserts.
+        with patch("hpc_alloc.commands.info"):
+            self.assertTrue(
+                _recover_cancel(self.context, StrictProxy(client_script), cancel, job)
+            )
         self.assertEqual(
             self.repository.get_operation(cancel.operation_id).phase,
-            OperationPhase.AMBIGUOUS,
+            OperationPhase.FAILED,
         )
+        # The job row itself is untouched -- recovery resolves the cancellation
+        # operation, it never rewrites the job's durable lifecycle.
+        self.assertEqual(self.repository.get_job(OPERATION_ID).phase, JobPhase.QUEUED)
         client_script.assert_complete()
+
+        # The seat is releasable again.
+        self.repository.begin_cancel(OPERATION_ID, operation_id="d" * 32)
 
     def test_cancel_recovery_resolves_authoritative_final_accounting(self) -> None:
         job = self.acknowledged_job()
@@ -1460,7 +1483,12 @@ host = "secondary.example.edu"
             ),
             patch("hpc_alloc.commands.info"),
         ):
-            self.assertFalse(
+            # The CAS race discards the stale final verdict and re-assesses.  The
+            # fresh observation shows the job positively RUNNING, which proves
+            # the ambiguous cancellation never landed, so recovery resolves the
+            # operation as failed and frees the seat for an explicit retry
+            # instead of pinning it AMBIGUOUS forever.
+            self.assertTrue(
                 _recover_cancel(self.context, StrictProxy(script), cancel, job)
             )
 
@@ -1471,7 +1499,7 @@ host = "secondary.example.edu"
         self.assertEqual(stored.last_node, "node02")
         self.assertEqual(
             self.repository.get_operation(cancel.operation_id).phase,
-            OperationPhase.AMBIGUOUS,
+            OperationPhase.FAILED,
         )
         script.assert_complete()
 
@@ -3005,6 +3033,285 @@ host = "secondary.example.edu"
                 0,
             )
         project.assert_called_once_with(self.context, self.paths)
+
+    def test_bulk_recover_skips_a_busy_operation_instead_of_aborting(self) -> None:
+        """A live process's operation must not kill the whole sweep.
+
+        A concurrent `down` holds its cancel operation's lock for the entire
+        guarded cancel, and _prioritize_local_cancel_recoveries deterministically
+        sorts exactly that CANCEL_PENDING operation to the front.  Because the
+        lock conflict is raised by the `with` statement itself -- before
+        remote_attempted is set -- the handler skipped even its local fallback
+        and re-raised, aborting on item 0 and stranding every genuinely orphaned
+        operation behind it.
+        """
+
+        self.configure_clusters()
+        owner = self.repository.get_or_create_machine_id("laptop")
+        second = "b" * 32
+        for operation_id, name, job_id in (
+            (OPERATION_ID, "dev", "12345"),
+            (second, "viz", "23456"),
+        ):
+            self.repository.reserve_submission(
+                operation_id=operation_id,
+                cluster="grace",
+                logical_name=name,
+                kind=JobKind.ALLOCATION,
+                owner_id=owner,
+                slurm_job_name=slurm_job_name("allocation", operation_id),
+                slurm_comment=format_tag(
+                    owner, operation_id, "laptop", "allocation", name
+                ),
+                resources=self.resources,
+            )
+            self.repository.acknowledge_submission(operation_id, job_id)
+
+        busy = self.repository.begin_cancel(OPERATION_ID, operation_id="c" * 32)
+        other = self.repository.begin_cancel(second, operation_id="d" * 32)
+
+        args = SimpleNamespace(
+            operation_id=None, abandon=False, yes=False, cluster=None
+        )
+
+        # Another live process owns `busy`'s operation lock for the duration of
+        # its guarded cancel.
+        with operation_scope_lock(
+            self.paths.operation_locks_dir, busy.operation_id, blocking=True
+        ):
+            with patch("hpc_alloc.commands.info"):
+                status = cmd_recover(
+                    args,
+                    ctx=self.context,
+                    paths=self.paths,
+                    entrypoint=Path("/tmp/hpc-alloc"),
+                )
+
+        # The busy operation is left to its owner ...
+        self.assertEqual(
+            self.repository.get_operation(busy.operation_id).phase,
+            OperationPhase.CANCEL_PENDING,
+        )
+        # ... but the sweep still reconciled the one behind it.
+        self.assertEqual(
+            self.repository.get_operation(other.operation_id).phase,
+            OperationPhase.FAILED,
+        )
+        self.assertEqual(status, 1)
+
+    def test_bare_down_refuses_to_pick_an_implicit_target(self) -> None:
+        """`down` is irreversible and used to guess its target.
+
+        With no selector it cancelled the sole allocation -- or, when several
+        existed, whichever one happened to be named `dev` -- with no prompt and
+        exit 0.  An agent that omitted the selector silently killed a different,
+        still-in-use seat.
+        """
+
+        self.configure_clusters()
+        self.acknowledged_job()
+        cancel = Mock(side_effect=AssertionError("nothing may be cancelled"))
+
+        with patch("hpc_alloc.commands._cancel_record", cancel):
+            with self.assertRaisesRegex(ConfigInvalid, "requires an allocation target"):
+                cmd_down(
+                    SimpleNamespace(all=False, target=None, cluster=None),
+                    ctx=self.context,
+                    paths=self.paths,
+                    entrypoint=Path("/tmp/hpc-alloc"),
+                )
+
+        cancel.assert_not_called()
+
+    def test_bulk_down_preserves_the_transport_exit_class(self) -> None:
+        """TransportLost is how a *possibly dispatched* cancellation is reported.
+
+        Folding it into --all's best-effort `failed` counter returned exit 1
+        ("validation/scheduler") for the one outcome an agent must never blindly
+        retry -- and the docs promise exit 3 for it.  AuthRequired and
+        HostKeyChanged were already re-raised; TransportLost, the third exit-3
+        type, was not.
+        """
+
+        self.configure_clusters()
+        job = self.acknowledged_job()
+        failure = TransportLost("cancellation may have been dispatched")
+        transport = SimpleNamespace(bootstrap=Mock())
+
+        with (
+            patch("hpc_alloc.commands._services", return_value=(transport, object())),
+            patch("hpc_alloc.commands._cancel_record", side_effect=failure),
+            patch("hpc_alloc.commands.info"),
+        ):
+            with self.assertRaises(TransportLost) as raised:
+                cmd_down(
+                    SimpleNamespace(all=True, target=None, cluster=None),
+                    ctx=self.context,
+                    paths=self.paths,
+                    entrypoint=Path("/tmp/hpc-alloc"),
+                )
+
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(raised.exception.exit_code, 3)
+        self.assertIsNotNone(job.job_id)
+
+    def test_a_departed_allocation_stops_reserving_its_name(self) -> None:
+        """`up --name dev` immediately after `down dev` must work.
+
+        A successful `down` deliberately leaves the row TERMINAL_CANDIDATE -- an
+        acknowledged cancellation proves the request was accepted, not that the
+        job reached a terminal state -- but the live-allocation unique index
+        reserves the name for every non-FINAL row.  The submission path
+        therefore reconciles a same-named holder on real evidence before
+        reserving, rather than fabricating finality at cancel time.
+        """
+
+        job = self.acknowledged_job()
+        assert job.ref is not None
+        cancel = self.repository.begin_cancel(OPERATION_ID, operation_id="c" * 32)
+        self.repository.mark_cancel_dispatching(cancel.operation_id)
+        self.repository.resolve_cancel_departed(
+            cancel.operation_id, detail="cancellation request acknowledged"
+        )
+        holder = self.repository.get_job(OPERATION_ID)
+        self.assertEqual(holder.phase, JobPhase.TERMINAL_CANDIDATE)
+
+        # The name is still reserved, so a naive submission would conflict.
+        with self.assertRaisesRegex(StateConflict, "non-final job"):
+            self.repository.reserve_submission(
+                operation_id="e" * 32,
+                cluster="grace",
+                logical_name="dev",
+                kind=JobKind.ALLOCATION,
+                owner_id=self.repository.get_or_create_machine_id("laptop"),
+                slurm_job_name=slurm_job_name("allocation", "e" * 32),
+                slurm_comment=format_tag(
+                    self.repository.get_or_create_machine_id("laptop"),
+                    "e" * 32,
+                    "laptop",
+                    "allocation",
+                    "dev",
+                ),
+                resources=self.resources,
+            )
+
+        # The job is gone from two exact observations, so reconciliation
+        # finalizes it on genuine confirmed-queue evidence.
+        script = StrictScript(
+            [
+                ExpectedCall("observe", result=None, args=(job.ref,), kwargs={"auth": AuthMode.NONINTERACTIVE}),
+                ExpectedCall("final", result=None, args=(job.ref,), kwargs={"attempts": (0,), "auth": AuthMode.NONINTERACTIVE}),
+                ExpectedCall("observe", result=None, args=(job.ref,), kwargs={"auth": AuthMode.NONINTERACTIVE}),
+                ExpectedCall("final", result=None, args=(job.ref,), kwargs={"attempts": (0, 2, 2), "auth": AuthMode.NONINTERACTIVE}),
+            ]
+        )
+        _reconcile_name_holder(
+            self.context, StrictProxy(script), "grace", JobKind.ALLOCATION, "dev"
+        )
+
+        self.assertEqual(self.repository.get_job(OPERATION_ID).phase, JobPhase.FINAL)
+
+        # The name is free: the next `up --name dev` reserves it.
+        owner = self.repository.get_or_create_machine_id("laptop")
+        self.repository.reserve_submission(
+            operation_id="e" * 32,
+            cluster="grace",
+            logical_name="dev",
+            kind=JobKind.ALLOCATION,
+            owner_id=owner,
+            slurm_job_name=slurm_job_name("allocation", "e" * 32),
+            slurm_comment=format_tag(owner, "e" * 32, "laptop", "allocation", "dev"),
+            resources=self.resources,
+        )
+
+    def test_an_ambiguous_cancellation_does_not_wedge_the_seat_forever(self) -> None:
+        """The full wedge, end to end.
+
+        `down` commits the cancel operation AMBIGUOUS immediately before
+        dispatch; the transport then dies, so the mutation may or may not have
+        landed.  Previously `recover` observed the job still running, re-marked
+        the operation AMBIGUOUS, and the one_pending_cancel index kept blocking
+        every future `down`/`cancel` -- so a live GPU allocation could never be
+        released and the user had to wait out its walltime.
+        """
+
+        job = self.acknowledged_job()
+        assert job.ref is not None
+        cancel = self.repository.begin_cancel(OPERATION_ID, operation_id="c" * 32)
+        self.repository.mark_cancel_dispatching(cancel.operation_id)
+        self.repository.mark_cancel_ambiguous(cancel.operation_id, "transport lost")
+
+        # While the cancellation is ambiguous the guard is held, exactly as
+        # designed: a retry must not blindly dispatch a second mutation.
+        with self.assertRaisesRegex(StateConflict, "pending cancellation"):
+            self.repository.begin_cancel(OPERATION_ID, operation_id="d" * 32)
+
+        live = QueueRow(
+            job_id=job.job_id or "",
+            state="RUNNING",
+            node="node01",
+            reason="None",
+            time_left="1:00:00",
+            partition="day",
+            name=job.slurm_job_name,
+            submitted_at="2026-07-10T11:00:00",
+            comment=job.slurm_comment,
+        )
+        script = StrictScript(
+            [
+                ExpectedCall(
+                    "observe",
+                    result=live,
+                    args=(job.ref,),
+                    kwargs={"auth": AuthMode.NONINTERACTIVE},
+                )
+            ]
+        )
+
+        operation = self.repository.get_operation(cancel.operation_id)
+        with patch("hpc_alloc.commands.info"):
+            self.assertTrue(
+                _recover_cancel(self.context, StrictProxy(script), operation, job)
+            )
+
+        # The guard is released, so the seat can actually be released now.
+        retried = self.repository.begin_cancel(OPERATION_ID, operation_id="d" * 32)
+        self.assertEqual(retried.phase, OperationPhase.CANCEL_PENDING)
+
+    def test_local_cancellation_sweep_never_swallows_an_interrupt(self) -> None:
+        """This bounded sweep performs durable cancellation writes.
+
+        Catching BaseException discarded a Ctrl-C (or the SIGTERM/SIGHUP the CLI
+        converts into one) and let the loop carry on mutating the *remaining*
+        operations, then exit with the original transport error's code -- so the
+        user could not stop it and never learned it had been interrupted.
+        """
+
+        operations = [
+            SimpleNamespace(operation_id=OPERATION_ID),
+            SimpleNamespace(operation_id="b" * 32),
+        ]
+        unresolved = SimpleNamespace(
+            operation_id=OPERATION_ID,
+            unresolved=True,
+            target_job_operation_id=OPERATION_ID,
+        )
+        ctx = SimpleNamespace(
+            state=SimpleNamespace(
+                get_operation=Mock(return_value=unresolved),
+                get_job=Mock(return_value=object()),
+            )
+        )
+        recover = Mock(side_effect=KeyboardInterrupt)
+
+        with (
+            patch("hpc_alloc.commands._can_recover_cancel_locally", return_value=True),
+            patch("hpc_alloc.commands._recover_cancel", recover),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                _best_effort_recover_local_cancellations(ctx, self.paths, operations)
+
+        recover.assert_called_once()
 
     def test_multi_operation_recovery_projects_early_change_on_later_failure(self) -> None:
         self.configure_clusters()

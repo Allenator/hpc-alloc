@@ -89,12 +89,34 @@ def ssh_argv(
 ) -> list[str]:
     """Build every SSH invocation in one place."""
 
+    argv = ssh_transport_argv(
+        batch=batch, connect_timeout=connect_timeout, extra_options=extra_options
+    )
+    argv += ["--", alias]
+    if remote_command is not None:
+        argv.append(remote_command)
+    return argv
+
+
+def ssh_transport_argv(
+    *,
+    batch: bool = True,
+    connect_timeout: int = 10,
+    extra_options: Sequence[str] = (),
+) -> list[str]:
+    """The ssh command and options, with no host and no remote command.
+
+    rsync needs this shape for ``-e``.  Passing it a bare ``ssh`` instead left
+    the transfer as the one SSH call site with none of the hardening every other
+    one gets: no BatchMode, so a dead master could drop it to an interactive
+    password prompt on the user's terminal, and no ConnectTimeout, so it could
+    hang indefinitely where the rest of the tool bounds and raises a typed error.
+    """
+
     argv = ["ssh", "-o", f"BatchMode={'yes' if batch else 'no'}"]
     for option in extra_options:
         argv += ["-o", option]
-    argv += ["-o", f"ConnectTimeout={connect_timeout}", "--", alias]
-    if remote_command is not None:
-        argv.append(remote_command)
+    argv += ["-o", f"ConnectTimeout={connect_timeout}"]
     return argv
 
 
@@ -288,6 +310,9 @@ class SshTransport:
         self._verified: set[str] = set()
         self.last_probe: ProbeStatus | None = None
         self.probe_detail = ""
+        # True when the last probe timed out rather than actively failing.  A
+        # stall is evidence of slowness, never of a dead ControlMaster.
+        self.probe_stalled = False
 
     def _run(self, *args: object, **kwargs: object) -> subprocess.CompletedProcess:
         """Invoke a local OpenSSH tool without leaking local OS tracebacks."""
@@ -351,11 +376,29 @@ class SshTransport:
         )
         return result.returncode == 0
 
-    def close_master(self, alias: str) -> None:
+    def close_master(self, alias: str, *, drain: bool = True) -> None:
+        """Retire a ControlMaster, by default letting its sessions finish.
+
+        `-O exit` terminates the master immediately, taking every session
+        multiplexed on it with it.  That is unsafe here: the login master is
+        shared by every concurrent hpc-alloc process, so one process healing a
+        blip would tear down another's in-flight submission -- which, because
+        submissions never retry, surfaces as an ambiguous mutation and orphans a
+        GPU job.  A compute master can likewise be carrying the user's
+        interactive `ssh` shell or an in-flight `sync`.
+
+        `-O stop` instead makes the master stop accepting *new* multiplexed
+        sessions and exit once the existing ones drain, which heals just as well
+        (a subsequent connection builds a fresh master) without killing live
+        work.  A master too wedged to service `-O stop` is equally too wedged
+        for `-O exit`; sweep_dead_sockets clears that case.
+        """
+
         self._run(
-            ["ssh", "-O", "exit", "--", alias],
+            ["ssh", "-O", "stop" if drain else "exit", "--", alias],
             capture_output=True,
             text=True,
+            stdin=subprocess.DEVNULL,
         )
 
     def sweep_dead_sockets(self) -> None:
@@ -365,6 +408,7 @@ class SshTransport:
                 ["ssh", "-S", str(socket), "-O", "check", "unused"],
                 capture_output=True,
                 text=True,
+                stdin=subprocess.DEVNULL,
             )
             if result.returncode != 0:
                 try:
@@ -394,6 +438,7 @@ class SshTransport:
         self._verified.discard(cluster)
 
     def probe_alias(self, alias: str, *, timeout: int = 15) -> ProbeStatus:
+        self.probe_stalled = False
         try:
             result = self._run(
                 ssh_argv(alias, "true"),
@@ -401,9 +446,11 @@ class SshTransport:
                 text=True,
                 errors="replace",
                 timeout=timeout,
+                stdin=subprocess.DEVNULL,
             )
         except subprocess.TimeoutExpired:
             self.probe_detail = "connection stalled"
+            self.probe_stalled = True
             return ProbeStatus.NETWORK
         self.probe_detail = (result.stderr or "").strip()
         if result.returncode == 0:
@@ -419,10 +466,16 @@ class SshTransport:
 
     def probe_node(self, alias: str, *, timeout: int = 15) -> ProbeStatus:
         status = self.probe_alias(alias, timeout=timeout)
-        if status != ProbeStatus.OK:
-            self.close_master(alias)
-            status = self.probe_alias(alias, timeout=timeout)
-        return status
+        if status is ProbeStatus.OK or self.probe_stalled:
+            # A stalled probe means the node is slow -- a loaded allocation (the
+            # very thing an allocation is for) or a briefly hung shared home --
+            # not that its master is dead.  Retiring the master on that evidence
+            # would disrupt every session multiplexed on it, including another
+            # process's interactive shell or in-flight rsync, while the master's
+            # connection was in fact healthy.
+            return status
+        self.close_master(alias)
+        return self.probe_alias(alias, timeout=timeout)
 
     def require_node(self, alias: str, *, timeout: int = 15) -> None:
         """Require a usable compute alias and preserve its typed SSH failure."""
@@ -568,6 +621,12 @@ class SshTransport:
         kwargs: dict[str, object] = {
             "capture_output": True,
             "timeout": timeout,
+            # ssh forwards its own stdin to the remote command unless told
+            # otherwise, and capture_output only redirects stdout/stderr.  These
+            # polling invocations never consume input, so an inherited fd 0
+            # would silently drain the caller's stdin one poll at a time --
+            # eating a `while read ...; done < list` loop's remaining lines.
+            "stdin": subprocess.DEVNULL,
         }
         if not binary:
             kwargs.update(text=True, errors="replace")
@@ -649,4 +708,5 @@ __all__ = [
     "can_prompt",
     "retire_compute_masters",
     "ssh_argv",
+    "ssh_transport_argv",
 ]

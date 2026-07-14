@@ -13,7 +13,13 @@ from .errors import (
     JobIdReused,
     TransportLost,
 )
-from .lifecycle import AssessmentPhase, EvidenceEvent, EvidenceTracker, JobAssessment
+from .lifecycle import (
+    AssessmentPhase,
+    EvidenceEvent,
+    EvidenceTracker,
+    JobAssessment,
+    awaits_requeue_confirmation,
+)
 from .models import FinalSource, JobPhase, JobRecord
 from .slurm import AccountingRecord, QueueRow
 from .ssh import AuthMode
@@ -124,11 +130,18 @@ class JobMonitor:
                 assessment = tracker.accept(EvidenceEvent.final(record))
             return MonitorResult(assessment, accounting_checked)
         if assessment.phase == AssessmentPhase.TERMINAL_CANDIDATE:
-            record = exact_final((0,))
-            if record is not None:
-                return MonitorResult(
-                    tracker.accept(EvidenceEvent.final(record)), accounting_checked
-                )
+            # A NODE_FAIL / PREEMPTED candidate must not be finalized by an
+            # accounting read taken in this same cycle: that read describes the
+            # same instant, inside the window in which Slurm requeues the job.
+            # Fall through to the confirmation observation instead, which either
+            # sees the job back in the queue (clearing the candidate) or confirms
+            # the death with a genuinely independent second observation.
+            if not awaits_requeue_confirmation(assessment):
+                record = exact_final((0,))
+                if record is not None:
+                    return MonitorResult(
+                        tracker.accept(EvidenceEvent.final(record)), accounting_checked
+                    )
             if confirm:
                 self._sleep(self.confirmation_delay)
                 row, assessment = accept_observation(

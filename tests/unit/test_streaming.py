@@ -48,7 +48,9 @@ class LogFollowerTests(unittest.TestCase):
         result = follower.poll_once()
         self.assertEqual(result.assessment.phase, AssessmentPhase.QUEUED)
         self.assertEqual([call[0] for call in client.calls], ["observe"])
-        self.assertEqual(follower.drain(), 0)
+        # Nothing to read: the job never started, so no log exists and the drain
+        # is trivially complete rather than a truncated read.
+        self.assertTrue(follower.drain())
         self.assertEqual([call[0] for call in client.calls], ["observe"])
 
     def test_scheduler_failure_makes_no_file_call_and_breaks_evidence(self) -> None:

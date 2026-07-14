@@ -165,7 +165,14 @@ def _managed_compute_stanzas(text: str) -> dict[str, str]:
         ):
             continue
         if alias not in duplicate_aliases:
-            stanzas[alias] = block
+            # Normalize away the block's position in the file.  render() ends the
+            # document with a newline, so `split("\n\n")` hands the *last* stanza
+            # a trailing "\n" that its siblings lack.  Retirement compares these
+            # blocks for equality, so an untouched, still-running allocation
+            # whose stanza merely moved (another allocation was added or removed
+            # and the stanzas re-sorted) would otherwise compare unequal, be
+            # judged obsolete, and have its live ControlMaster torn down.
+            stanzas[alias] = block.strip("\n")
     return stanzas
 
 
@@ -222,12 +229,33 @@ def _resolved_cancel_targets(
     return frozenset(targets)
 
 
-def _terminal_candidate_leases(
+def _still_holds_its_node(job: object) -> bool:
+    """True for the phases in which an allocation still owns its compute node.
+
+    The repository nulls ``current_node`` for every non-ACTIVE phase, so these
+    phases must have the prior projection's endpoint leased back to them or
+    their alias -- and the live ControlMaster behind it -- would be retired
+    while the seat is still held.
+
+    STARTED_INACTIVE (SUSPENDED / STOPPED / COMPLETING) definitively still holds
+    the node.  A scheduler-derived TERMINAL_CANDIDATE may still hold it, and is
+    kept conservatively.  REQUEUEING and FINAL have genuinely released it.
+    """
+
+    if _is_scheduler_terminal_candidate(job):
+        return True
+    try:
+        return JobPhase(getattr(job, "phase", None)) == JobPhase.STARTED_INACTIVE
+    except (TypeError, ValueError):
+        return False
+
+
+def _held_node_leases(
     jobs: Iterable[object],
     prior_stanzas: Mapping[str, str],
     resolved_cancel_targets: frozenset[str],
 ) -> dict[str, str]:
-    """Lease trusted prior nodes across scheduler-derived terminal uncertainty."""
+    """Lease trusted prior nodes to allocations that still hold them."""
 
     leases: dict[str, str] = {}
     for job in jobs:
@@ -237,7 +265,7 @@ def _terminal_candidate_leases(
         cluster = getattr(job, "cluster", None)
         if not name or not cluster:
             continue
-        if not _is_scheduler_terminal_candidate(job):
+        if not _still_holds_its_node(job):
             continue
         # A successful cancellation is durable operator intent.  It
         # conservatively suppresses this and later candidate leases for the
@@ -471,6 +499,16 @@ def render(
                 if _is_scheduler_terminal_candidate(job)
                 else None
             )
+        elif phase == JobPhase.STARTED_INACTIVE:
+            # SUSPENDED / STOPPED / COMPLETING: the allocation has started and
+            # still holds its compute node, so its alias and ControlMaster must
+            # survive.  The repository nulls current_node for every non-ACTIVE
+            # phase, so without the same lease a preempt-suspended seat would
+            # lose its alias and have its live master retired -- and it would be
+            # treated *less* conservatively than a TERMINAL_CANDIDATE, which is
+            # strictly less certain.  REQUEUEING is deliberately excluded: a
+            # requeued job has genuinely released its node.
+            node = leased_nodes.get(alias)
         elif phase == JobPhase.FINAL:
             node = None
         if not node:
@@ -542,7 +580,7 @@ def sync_managed_config(
             if candidate_ids
             else frozenset()
         )
-        leased_nodes = _terminal_candidate_leases(
+        leased_nodes = _held_node_leases(
             jobs,
             prior_stanzas,
             resolved_cancel_targets,

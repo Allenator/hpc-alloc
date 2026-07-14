@@ -66,6 +66,10 @@ class MonitorTraceTests(unittest.TestCase):
         )
 
     def test_preempted_then_pending_is_requeueing_not_final(self) -> None:
+        # No accounting read happens here at all: a PREEMPTED candidate is
+        # requeue-eligible, so consulting accounting in this same cycle would
+        # only re-describe the instant already observed, from inside the window
+        # in which Slurm requeues the job.  The confirmation observation decides.
         managed = job(ever_started=True)
         assert managed.ref is not None
         script = StrictScript(
@@ -75,12 +79,6 @@ class MonitorTraceTests(unittest.TestCase):
                     result=row("PREEMPTED"),
                     args=(managed.ref,),
                     kwargs={"auth": AuthMode.NONINTERACTIVE},
-                ),
-                ExpectedCall(
-                    "final",
-                    result=None,
-                    args=(managed.ref,),
-                    kwargs={"attempts": (0,), "auth": AuthMode.NONINTERACTIVE},
                 ),
                 ExpectedCall(
                     "observe",
@@ -96,6 +94,47 @@ class MonitorTraceTests(unittest.TestCase):
         self.assertFalse(result.assessment.final)
         self.assertEqual(result.assessment.terminal_evidence, 0)
         self.assertEqual(clock.sleeps, [3])
+        script.assert_complete()
+
+    def test_a_requeued_job_survives_even_when_accounting_reports_the_failure(
+        self,
+    ) -> None:
+        """The case the old code actually got wrong.
+
+        The previous trace only stayed alive because the fake's accounting read
+        returned None.  In reality slurmdbd *does* report NODE_FAIL for the
+        failed attempt, and one such record promoted the job straight to an
+        immutable FINAL/ACCOUNTING verdict -- so a job Slurm then requeued was
+        irreversibly reaped: `status` hid it, `cancel` refused it, and it held
+        its GPUs for the full walltime.  No accounting read may be taken for a
+        requeue-eligible candidate in the cycle that produced it.
+        """
+
+        managed = job(ever_started=True)
+        assert managed.ref is not None
+        script = StrictScript(
+            [
+                ExpectedCall(
+                    "observe",
+                    result=row("NODE_FAIL"),
+                    args=(managed.ref,),
+                    kwargs={"auth": AuthMode.NONINTERACTIVE},
+                ),
+                ExpectedCall(
+                    "observe",
+                    result=row("RUNNING"),
+                    args=(managed.ref,),
+                    kwargs={"auth": AuthMode.NONINTERACTIVE},
+                ),
+            ]
+        )
+        clock = VirtualClock()
+        result = self.monitor(script, clock).assess(managed)
+
+        self.assertFalse(result.assessment.final)
+        self.assertEqual(result.assessment.phase, AssessmentPhase.ACTIVE)
+        self.assertEqual(result.assessment.terminal_evidence, 0)
+        self.assertFalse(result.accounting_checked)
         script.assert_complete()
 
     def test_two_absences_are_confirmed_but_accounting_is_still_consulted(self) -> None:

@@ -32,6 +32,7 @@ runtime_modules=(
   hpc_alloc.ownership
   hpc_alloc.output
   hpc_alloc.paths
+  hpc_alloc.retry
   hpc_alloc.selectors
   hpc_alloc.slurm
   hpc_alloc.ssh
@@ -115,6 +116,13 @@ esac
 
 skills_dir="${HOME}/.claude/skills"
 mkdir -p "$skills_dir"
+# `ln -sfn SRC DIR` descends into an existing real directory and creates
+# DIR/skill inside it, so SKILL.md would land at hpc-alloc/skill/SKILL.md and
+# never load -- while the install still reported success.  Clear a non-symlink
+# target first so the link always replaces it.
+if [ -e "$skills_dir/hpc-alloc" ] && [ ! -L "$skills_dir/hpc-alloc" ]; then
+  rm -rf "$skills_dir/hpc-alloc"
+fi
 ln -sfn "$here/skill" "$skills_dir/hpc-alloc"
 echo "linked $skills_dir/hpc-alloc -> $here/skill"
 

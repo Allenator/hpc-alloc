@@ -48,6 +48,15 @@ FINAL_STATES = frozenset(
     }
 )
 
+# The terminal states Slurm actually requeues a job out of.  With the default
+# JobRequeue=1, a NODE_FAIL job is restarted under the same job ID, and a
+# PreemptMode=REQUEUE preemption does the same -- so observing one of these
+# states, in the queue *or* in accounting, does not prove the job is dead.
+# Consumers must therefore require a second, independent observation before
+# accepting one as final; a single observation and the accounting read taken in
+# the same poll cycle both describe the same instant inside the requeue window.
+REQUEUE_ELIGIBLE_FINAL = frozenset({"NODE_FAIL", "PREEMPTED"})
+
 _SQUEUE_INVALID_SINGLETON = "slurm_load_jobs error: Invalid job id specified"
 _SACCT_BASE_FIELDS = (
     "JobIDRaw",

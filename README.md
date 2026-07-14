@@ -85,9 +85,9 @@ Use `up --dry-run` or `run --dry-run` to print a paste-ready submission command 
 | `why [TARGET] [--cluster NAME] [--json]` | Explain a queued, running, uncertain, or final job selected by name, job ID, or `@operation`. |
 | `logs TARGET [--cluster NAME] [-n LINES] [-f]` | Read or follow a managed job log by convenience or durable selector. |
 | `cancel (JOBID\|@OPERATION) [--cluster NAME]` | Cancel a managed job only after exact remote identity verification. |
-| `down [NAME\|JOBID\|@OPERATION\|--all] [--cluster NAME]` | Cancel one or all managed allocation jobs. |
+| `down NAME\|JOBID\|@OPERATION\|--all [--cluster NAME]` | Cancel one or all managed allocation jobs. The target is required: `down` is irreversible, so it never guesses which allocation you meant. |
 | `ssh [--cluster NAME] [NAME\|JOBID\|@OPERATION] [-- CMD...]` | Open an allocation shell or run a command there. |
-| `sync (NAME\|JOBID\|@OPERATION) SRC DST [--cluster NAME] [--pull] [--delete]` | Transfer files with rsync through the allocation alias. |
+| `sync (NAME\|JOBID\|@OPERATION) SRC DST [--cluster NAME] [--pull] [--delete]` | Transfer files with rsync through the allocation alias. rsync expands the remote path through the remote login shell — which is what makes `'~/project'` work — so the remote path is restricted to `A-Za-z0-9_@%+=:,./~-` and a path containing a space, quote, glob, or `$(...)` is rejected rather than silently re-split by that shell. |
 | `avail [--cluster NAME] [-p PARTITION] [--json]` | Summarize idle CPUs and free GPUs for one cluster. |
 | `partitions [--cluster NAME] [--json]` | Show live partition limits, GRES, and feature data for one cluster. |
 | `recover [OPERATION_ID] [--cluster NAME] [--abandon] [--yes]` | Reconcile ambiguous submit/cancel operations by exact queue or accounting identity, or explicitly abandon one local intent. |

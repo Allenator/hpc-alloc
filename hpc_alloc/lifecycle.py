@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from .models import EvidenceProvenance, FinalSource, JobPhase
-from .slurm import FINAL_STATES, AccountingRecord, QueueRow
+from .slurm import FINAL_STATES, REQUEUE_ELIGIBLE_FINAL, AccountingRecord, QueueRow
 
 
 class AssessmentPhase(StrEnum):
@@ -118,7 +118,15 @@ _PROVES_STARTED = _ACTIVE | _STARTED_INACTIVE | _REQUEUEING | frozenset(
 )
 
 
-def _state_code(state: str) -> str:
+def state_code(state: str) -> str:
+    """Reduce a Slurm state phrase to its bare state code.
+
+    ``CANCELLED by 12345`` becomes ``CANCELLED`` and a blank or whitespace-only
+    phrase becomes ``""``.  Every consumer must route through this helper: an
+    empty phrase has no first word, so hand-rolled ``split()[0]`` indexing
+    raises instead of yielding the empty code its callers guard on.
+    """
+
     words = state.upper().split()
     return words[0].rstrip("+") if words else ""
 
@@ -275,7 +283,7 @@ class EvidenceTracker:
         return self.assessment
 
     def _queue(self, row: QueueRow) -> JobAssessment:
-        state = _state_code(row.state)
+        state = state_code(row.state)
         if not state:
             return self._uncertain("queue row had no scheduler state")
         if state in FINAL_STATES:
@@ -374,10 +382,37 @@ class EvidenceTracker:
         raise ValueError(f"unsupported evidence kind {event.kind!r}")
 
 
+def awaits_requeue_confirmation(assessment: JobAssessment) -> bool:
+    """True for a terminal candidate whose state Slurm may requeue it out of.
+
+    Queue evidence already requires two independent observations before a job is
+    declared dead.  Accounting evidence did not: a single accounting read, taken
+    in the same poll cycle as the observation that produced the candidate,
+    promoted the job straight to an immutable FINAL/ACCOUNTING verdict.  For
+    NODE_FAIL and PREEMPTED -- the two states Slurm actually requeues on -- that
+    read describes the same instant, inside the requeue window, so it is not
+    independent evidence at all: the job was irreversibly reaped, `status` then
+    hid it, and the requeued instance ran on holding its GPUs, untracked, for
+    the full walltime.
+
+    Callers must therefore defer the accounting read for such a candidate and
+    let the next cycle's queue observation decide: a second terminal or absent
+    row finalizes the job, while a requeued job reappears as PENDING and clears
+    the candidate outright.
+    """
+
+    return (
+        assessment.phase is AssessmentPhase.TERMINAL_CANDIDATE
+        and state_code(assessment.terminal_state or "") in REQUEUE_ELIGIBLE_FINAL
+    )
+
+
 __all__ = [
     "AssessmentPhase",
     "EvidenceEvent",
     "EvidenceKind",
     "EvidenceTracker",
     "JobAssessment",
+    "awaits_requeue_confirmation",
+    "state_code",
 ]

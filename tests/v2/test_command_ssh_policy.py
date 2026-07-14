@@ -54,6 +54,32 @@ host = "grace.example.edu"
             primary_cluster="grace",
         )
 
+    def test_services_repairs_a_missing_managed_include(self) -> None:
+        """Only `setup` ever wrote the Include into ~/.ssh/config.
+
+        Without it OpenSSH sees no managed Host block at all, so every alias is
+        an unresolvable hostname and the command dies at exit 3 ("check the
+        VPN") -- and `hpc-alloc connect`, the remedy the docs prescribe for exit
+        3, routes through _services too and failed identically forever.  The
+        only escape was an undocumented `setup --force`.
+        """
+
+        paths, context = self.context()
+        paths.ssh_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        paths.user_ssh_config.write_text("Host example\n    HostName example.com\n")
+
+        _services(context, paths, Path("/tmp/hpc-alloc"), "grace")
+
+        restored = paths.user_ssh_config.read_text()
+        self.assertIn("Include ~/.config/hpc-alloc/ssh_config", restored)
+        self.assertIn("Host example", restored)
+
+        # Idempotent: a second command must not duplicate the Include.
+        _services(context, paths, Path("/tmp/hpc-alloc"), "grace")
+        self.assertEqual(
+            paths.user_ssh_config.read_text().count("Include ~/.config/hpc-alloc"), 1
+        )
+
     def test_services_projects_new_cluster_before_transport_construction(
         self,
     ) -> None:
@@ -199,6 +225,128 @@ class CommandSshPolicyTests(unittest.TestCase):
         )
         transport.require_node.assert_called_once_with("hpc-grace.dev")
         execvp.assert_not_called()
+
+    def test_cmd_sync_rejects_a_remote_path_the_shell_would_reinterpret(self) -> None:
+        """rsync hands its remote path to the remote *login shell*.
+
+        macOS ships openrsync, which has no --protect-args, so a path with a
+        space split into several arguments and globs / $VAR / $(cmd) were
+        expanded or executed on the cluster.  With --delete on a push, a
+        mis-split destination silently deleted files under the wrong remote
+        directory and still exited 0.
+        """
+
+        transport = SimpleNamespace(require_node=Mock())
+        run = Mock(side_effect=AssertionError("rsync must not execute"))
+
+        for hostile in (
+            "~/my out dir/",
+            "~/data/*",
+            "~/$(id -un)",
+            "~/`whoami`",
+            "~/results;rm -rf ~",
+        ):
+            with self.subTest(path=hostile):
+                args = SimpleNamespace(
+                    target="dev",
+                    cluster=None,
+                    src="./source",
+                    dst=hostile,
+                    pull=False,
+                    delete=True,
+                )
+                with (
+                    patch(
+                        "hpc_alloc.commands._active_allocation",
+                        return_value=(self.job, transport),
+                    ),
+                    patch("hpc_alloc.commands.subprocess.run", run),
+                ):
+                    with self.assertRaisesRegex(ConfigInvalid, "unsafe remote sync path"):
+                        cmd_sync(
+                            args,
+                            ctx=object(),
+                            paths=self.paths,
+                            entrypoint=self.entrypoint,
+                        )
+
+        run.assert_not_called()
+
+    def test_cmd_sync_keeps_tilde_expansion_and_hardens_its_transport(self) -> None:
+        """The documented `~/project` form relies on the remote shell expanding
+        `~`, so the path stays unquoted -- validation is what makes the rest of
+        the shell's re-parse a no-op.  And rsync's `-e` must carry the same
+        BatchMode/ConnectTimeout hardening as every other SSH call site, or a
+        dead master could drop the transfer to an interactive password prompt.
+        """
+
+        transport = SimpleNamespace(require_node=Mock())
+        run = Mock(return_value=SimpleNamespace(returncode=0))
+        args = SimpleNamespace(
+            target="dev",
+            cluster=None,
+            src="./project",
+            dst="~/project",
+            pull=False,
+            delete=False,
+        )
+
+        with (
+            patch(
+                "hpc_alloc.commands._active_allocation",
+                return_value=(self.job, transport),
+            ),
+            patch("hpc_alloc.commands.subprocess.run", run),
+            patch("hpc_alloc.commands.info"),
+        ):
+            self.assertEqual(
+                cmd_sync(
+                    args, ctx=object(), paths=self.paths, entrypoint=self.entrypoint
+                ),
+                0,
+            )
+
+        command = run.call_args.args[0]
+        self.assertIn("hpc-grace.dev:~/project", command)
+        transport_option = command[command.index("-e") + 1]
+        self.assertIn("BatchMode=yes", transport_option)
+        self.assertIn("ConnectTimeout=", transport_option)
+
+    def test_cmd_sync_normalizes_a_signal_killed_rsync_status(self) -> None:
+        """subprocess reports a signal-killed child as -N.
+
+        Returned verbatim that reaches the shell as 256-N (241 for SIGTERM),
+        which is neither rsync's status -- the documented pass-through -- nor
+        any hpc-alloc exit code an agent can classify.
+        """
+
+        transport = SimpleNamespace(require_node=Mock())
+        run = Mock(return_value=SimpleNamespace(returncode=-15))
+        args = SimpleNamespace(
+            target="dev",
+            cluster=None,
+            src="./source",
+            dst="~/destination",
+            pull=False,
+            delete=False,
+        )
+
+        with (
+            patch(
+                "hpc_alloc.commands._active_allocation",
+                return_value=(self.job, transport),
+            ),
+            patch("hpc_alloc.commands.subprocess.run", run),
+            patch("hpc_alloc.commands.info"),
+        ):
+            status = cmd_sync(
+                args,
+                ctx=object(),
+                paths=self.paths,
+                entrypoint=self.entrypoint,
+            )
+
+        self.assertEqual(status, 143)
 
     def test_cmd_sync_propagates_compute_host_key_failure_without_rsync(self) -> None:
         failure = HostKeyChanged("SSH host-key verification failed for hpc-grace.dev")

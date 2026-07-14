@@ -102,6 +102,26 @@ grace = "grace.ycrc.yale.edu"
         self.assert_invalid(VALID_CONFIG.replace(b"cpus = 2", b"cpus = true"), "positive integer")
         self.assert_invalid(VALID_CONFIG.replace(b"cpus = 2", b"cpus = 0"), "positive integer")
 
+    def test_memory_accepts_only_ascii_digits(self) -> None:
+        """`\\d` also matches full-width and Arabic-Indic digits.
+
+        Those pass a `\\d`-based grammar but the scheduler rejects them, and
+        because submission never retries, a value that slips past pre-flight
+        validation fails remotely as an ambiguous submission ("may have
+        committed") instead of a clean local ConfigInvalid.
+        """
+
+        for memory in ("６４G", "٦٤G"):
+            with self.subTest(memory=memory):
+                self.assert_invalid(
+                    VALID_CONFIG.replace(b"cpus = 2", f'mem = "{memory}"'.encode()),
+                    "mem",
+                )
+                with self.assertRaisesRegex(ConfigInvalid, "mem"):
+                    Config.validate_resource_override("mem", memory)
+
+        self.assertEqual(Config.validate_resource_override("mem", "64G"), "64G")
+
     def test_all_documented_numeric_duration_forms_are_accepted(self) -> None:
         for duration in (
             b"90",

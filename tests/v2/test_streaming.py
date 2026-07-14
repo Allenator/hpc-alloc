@@ -935,9 +935,116 @@ class StreamingTests(unittest.TestCase):
             tracker=EvidenceTracker(ever_started=True),
             output=output,
         )
-        self.assertEqual(follower.drain(), MAX_LOG_CHUNK_BYTES)
+        follower.drain_attempts = 1
+
+        # The read failed part-way through.  drain must keep the bytes it did
+        # deliver *and* report the shortfall: silently returning the truncated
+        # output as if it were the whole log is how `run` used to print a partial
+        # result and still report COMPLETED with exit 0.
+        self.assertFalse(follower.drain())
         self.assertEqual(follower.offset, MAX_LOG_CHUNK_BYTES)
         self.assertEqual(output.getvalue(), first)
+        script.assert_complete()
+
+    def test_follow_rides_out_a_transient_scheduler_failure(self) -> None:
+        """A controller restart mid-stream must not kill the stream.
+
+        `follow` had no exception handling at all, and the transport's single
+        heal-and-retry never covers SchedulerUnavailable (a scheduler query that
+        runs and exits nonzero leaves ssh itself exiting 0).  So one hiccup
+        aborted `run` / `logs -f` outright while the GPU job kept running -- and
+        the failed observation had already cleared the death candidate, so the
+        stream was thrown away for nothing.
+        """
+
+        clock = VirtualClock()
+        completed = AccountingRecord(
+            job_id=self.ref.job_id,
+            state="COMPLETED",
+            exit_code="0:0",
+            job_name=self.ref.slurm_job_name,
+            comment=self.ref.slurm_comment,
+        )
+        script = StrictScript(
+            [
+                # The blip.  It used to end the stream right here.
+                ExpectedCall(
+                    "observe",
+                    result=SchedulerUnavailable("controller is restarting"),
+                    args=(self.ref,),
+                ),
+                # Absent once: a death candidate, not yet a death.
+                ExpectedCall("observe", result=None, args=(self.ref,)),
+                ExpectedCall(
+                    "final", result=None, args=(self.ref,), kwargs={"attempts": (0,)}
+                ),
+                ExpectedCall("log_size", result=LogSizeResult.available(0), args=(LOG_PATH,)),
+                # Absent twice: confirmed departure, then accounting refines it.
+                ExpectedCall("observe", result=None, args=(self.ref,)),
+                ExpectedCall(
+                    "final",
+                    result=completed,
+                    args=(self.ref,),
+                    kwargs={"attempts": (0, 9)},
+                ),
+                ExpectedCall("log_size", result=LogSizeResult.available(0), args=(LOG_PATH,)),
+                ExpectedCall("log_size", result=LogSizeResult.available(0), args=(LOG_PATH,)),
+            ]
+        )
+        follower = self.follower(
+            script,
+            tracker=EvidenceTracker(ever_started=True),
+            output=io.BytesIO(),
+            clock=clock,
+        )
+
+        outcome = follower.follow()
+
+        self.assertTrue(outcome.assessment.final)
+        self.assertEqual(outcome.assessment.terminal_state, "COMPLETED")
+        self.assertTrue(outcome.log_complete)
+        # The blip was ridden out rather than aborting the stream.
+        self.assertIn(15, clock.sleeps)
+        script.assert_complete()
+
+    def test_drain_retries_a_transient_failure_instead_of_truncating(self) -> None:
+        """One transient ssh or shared-filesystem error must not lose the tail.
+
+        The tail is exactly where a job's results and tracebacks land, and it is
+        the only part `run` has not already streamed.  drain used to swallow the
+        error and return 0, so the output was silently truncated while the
+        command still reported COMPLETED and exited 0.
+        """
+
+        output = io.BytesIO()
+        script = StrictScript(
+            [
+                ExpectedCall(
+                    "log_size",
+                    result=TransportLost("connection reset"),
+                    args=(LOG_PATH,),
+                ),
+                ExpectedCall(
+                    "log_size",
+                    result=LogSizeResult.available(11),
+                    args=(LOG_PATH,),
+                ),
+                ExpectedCall(
+                    "read_log_chunk",
+                    result=b"RESULT: 0.9",
+                    args=(LOG_PATH, 0),
+                    kwargs={"limit": 11},
+                ),
+            ]
+        )
+        follower = self.follower(
+            script,
+            tracker=EvidenceTracker(ever_started=True),
+            output=output,
+        )
+
+        self.assertTrue(follower.drain())
+        self.assertEqual(output.getvalue(), b"RESULT: 0.9")
         script.assert_complete()
 
     def test_final_seeded_follow_skips_observation_and_drains_once(self) -> None:

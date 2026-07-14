@@ -37,6 +37,16 @@ class LifecycleRevisionConflict(StateConflict):
     """Scheduler evidence was collected against an outdated job revision."""
 
 
+class OperationBusy(StateConflict):
+    """Another live hpc-alloc process holds this operation's scope lock.
+
+    A StateConflict subclass so existing handlers keep their behaviour, but a
+    distinct type because it says nothing about the operation itself: a bulk
+    sweep must skip a busy operation and carry on rather than abort, whereas a
+    conflict raised *by* an operation is a real failure.
+    """
+
+
 class RecordNotFound(HpcAllocError):
     """A requested durable job or operation does not exist."""
 

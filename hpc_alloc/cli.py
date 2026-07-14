@@ -127,8 +127,23 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _sigterm_as_interrupt(_signum: int, _frame: object) -> None:
+def _signal_as_interrupt(_signum: int, _frame: object) -> None:
     raise KeyboardInterrupt
+
+
+def _install_interrupt_signals() -> None:
+    """Route every terminating signal through the KeyboardInterrupt path.
+
+    SIGHUP is what a closed terminal delivers.  Left at its default disposition
+    it kills the process outright -- no ``except``, no ``finally`` -- so a
+    foreground ``run`` would skip its cancellation path and leak the detached
+    Slurm job for its whole walltime, even though Ctrl-C and SIGTERM both
+    release it.
+    """
+
+    signal.signal(signal.SIGTERM, _signal_as_interrupt)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, _signal_as_interrupt)
 
 
 def main(argv: Sequence[str] | None = None, *, entrypoint: Path | None = None) -> int:
@@ -141,7 +156,7 @@ def main(argv: Sequence[str] | None = None, *, entrypoint: Path | None = None) -
     from .commands import dispatch
 
     args = build_parser().parse_args(argv)
-    signal.signal(signal.SIGTERM, _sigterm_as_interrupt)
+    _install_interrupt_signals()
     try:
         return int(dispatch(args, entrypoint=entrypoint or Path(sys.argv[0]).resolve()) or 0)
     except KeyboardInterrupt:
