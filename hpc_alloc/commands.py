@@ -2714,15 +2714,31 @@ def _recover_submission(ctx: Any, client: Any, operation: Any, job: Any) -> bool
         client.verify_accounting_identity(recovered_ref, record.job_name, record.comment)
         adopted = ctx.state.acknowledge_submission(operation.operation_id, record.job_id)
         if record.final:
-            # Recovery must not maintain a second scheduler-state taxonomy.
-            # Feed authoritative accounting through the same lifecycle engine
-            # used by normal monitoring so start history and log eligibility
-            # stay identical for states such as BOOT_FAIL and REVOKED.
             from .lifecycle import EvidenceEvent
             from .monitor import JobMonitor
+            from .slurm import REQUEUE_ELIGIBLE_FINAL
 
-            tracker = JobMonitor.tracker(adopted)
-            assessment = tracker.accept(EvidenceEvent.final(record))
+            if record.state_code in REQUEUE_ELIGIBLE_FINAL:
+                # A NODE_FAIL/PREEMPTED record for this job ID may be the reaped
+                # failed attempt of a job being requeued under the same ID: a
+                # single accounting record is not proof of death, the same rule
+                # the monitoring and cancellation paths enforce.  Finalizing on it
+                # here would leave the requeued instance running untracked for its
+                # whole walltime.  Re-assess the adopted job through that shared
+                # two-observation rule instead: if it requeued it is back in the
+                # queue (alive and now tracked), and only a confirmed second
+                # observation finalizes it -- re-fetching accounting so the
+                # terminal state is preserved for a genuine death.
+                assessment = JobMonitor(client).assess(
+                    adopted, auth=AuthMode.NONINTERACTIVE, confirm=True
+                ).assessment
+            else:
+                # Recovery must not maintain a second scheduler-state taxonomy.
+                # Feed authoritative accounting through the same lifecycle engine
+                # used by normal monitoring so start history and log eligibility
+                # stay identical for states such as BOOT_FAIL and REVOKED.
+                tracker = JobMonitor.tracker(adopted)
+                assessment = tracker.accept(EvidenceEvent.final(record))
             adopted, assessment, _tracker = _persist_reconciled_assessment(
                 ctx=ctx,
                 paths=None,

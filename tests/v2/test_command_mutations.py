@@ -2845,6 +2845,94 @@ host = "secondary.example.edu"
                 )
                 script.assert_complete()
 
+    def test_submission_recovery_defers_a_requeue_eligible_final(self) -> None:
+        """A lost-sbatch job that NODE_FAILed and is being requeued must not be
+        reaped on a single accounting record.
+
+        find_accounting_by_name returns the reaped failed attempt (NODE_FAIL is
+        final), but the job is being requeued under the same ID.  Finalizing on
+        that one record would leave the requeued instance running untracked for
+        its whole walltime -- the same single-observation reap the monitoring and
+        cancellation paths defend against.  Re-observing the adopted job shows the
+        requeued instance back in the queue, so it is adopted alive and tracked,
+        not finalized.
+        """
+
+        owner = self.repository.get_or_create_machine_id("laptop")
+        operation_id = "e" * 32
+        logical_name = "requeued"
+        job_name = slurm_job_name("allocation", operation_id)
+        comment = format_tag(owner, operation_id, "laptop", "allocation", logical_name)
+        self.repository.reserve_submission(
+            operation_id=operation_id,
+            cluster="grace",
+            logical_name=logical_name,
+            kind=JobKind.ALLOCATION,
+            owner_id=owner,
+            slurm_job_name=job_name,
+            slurm_comment=comment,
+            resources=self.resources,
+        )
+        self.repository.mark_submission_ambiguous(operation_id, "reply lost")
+        operation = self.repository.get_operation(operation_id)
+        job = self.repository.get_job(operation_id)
+
+        reaped_attempt = AccountingRecord(
+            job_id="12345",
+            state="NODE_FAIL",
+            exit_code="1:0",
+            job_name=job_name,
+            comment=comment,
+        )
+        requeued_instance = QueueRow(
+            job_id="12345",
+            state="RUNNING",
+            node="node01",
+            reason="None",
+            time_left="1:00:00",
+            partition="day",
+            name=job_name,
+            submitted_at="2026-07-14T11:00:00",
+            comment=comment,
+        )
+        script = StrictScript(
+            [
+                ExpectedCall(
+                    "scan",
+                    result=RawQueueScan(()),
+                    kwargs={"auth": AuthMode.NONINTERACTIVE},
+                ),
+                ExpectedCall(
+                    "find_accounting_by_name",
+                    result=reaped_attempt,
+                    args=(job_name,),
+                    kwargs={"auth": AuthMode.NONINTERACTIVE},
+                ),
+                ExpectedCall("verify_accounting_identity"),
+                # The adopted job is re-observed through the shared two-observation
+                # rule; the requeued instance is back in the queue.
+                ExpectedCall("observe", result=requeued_instance),
+            ]
+        )
+
+        with patch("hpc_alloc.commands.info"):
+            self.assertTrue(
+                _recover_submission(
+                    self.context, StrictProxy(script), operation, job
+                )
+            )
+
+        recovered = self.repository.get_job(operation_id)
+        # The submission ambiguity is resolved (the job ID is adopted), but the
+        # job is NOT finalized -- the requeued instance is alive and tracked.
+        self.assertEqual(recovered.job_id, "12345")
+        self.assertNotEqual(recovered.phase, JobPhase.FINAL)
+        self.assertEqual(
+            self.repository.get_operation(operation_id).phase,
+            OperationPhase.ACKNOWLEDGED,
+        )
+        script.assert_complete()
+
     def test_explicit_recovery_cluster_mismatch_precedes_projection_and_mutation(self) -> None:
         self.configure_clusters()
         self.acknowledged_job()
@@ -3253,11 +3341,13 @@ host = "secondary.example.edu"
             submitted_at="2026-07-10T11:00:00",
             comment=job.slurm_comment,
         )
-        # A COMPLETING candidate needs a second observation to confirm, so the
-        # monitor observes twice; both show it still draining.
+        # COMPLETING settles the assessment on the first read (it maps to
+        # STARTED_INACTIVE, not a terminal candidate), so exactly one observation
+        # is made and no remote call is left unconsumed.  Pinning the count is the
+        # point: the guard's release must be driven by an actual observation, not
+        # by an early exit that skips the scheduler.
         script = StrictScript(
             [
-                ExpectedCall("observe", result=draining, args=(job.ref,), kwargs={"auth": AuthMode.NONINTERACTIVE}),
                 ExpectedCall("observe", result=draining, args=(job.ref,), kwargs={"auth": AuthMode.NONINTERACTIVE}),
             ]
         )
@@ -3266,6 +3356,7 @@ host = "secondary.example.edu"
             self.assertFalse(
                 _recover_cancel(self.context, StrictProxy(script), operation, job)
             )
+        script.assert_complete()
 
         # The guard is held, not released: a second cancellation cannot be
         # dispatched while the first may have landed.
@@ -3305,11 +3396,12 @@ host = "secondary.example.edu"
             comment=job.slurm_comment,
         )
         # SUSPENDED is a plainly-alive, non-draining observation, so the monitor
-        # settles on the first read; scripting a second (as the draining test
-        # does) is harmless because it is never consumed.
+        # settles on the first read.  Script exactly one and assert the script is
+        # fully consumed, so the release is provably driven by an observation --
+        # a regression that released the guard WITHOUT observing (or made an extra
+        # scheduler read, a real Duo push on the live cluster) would fail here.
         script = StrictScript(
             [
-                ExpectedCall("observe", result=suspended, args=(job.ref,), kwargs={"auth": AuthMode.NONINTERACTIVE}),
                 ExpectedCall("observe", result=suspended, args=(job.ref,), kwargs={"auth": AuthMode.NONINTERACTIVE}),
             ]
         )
@@ -3318,6 +3410,7 @@ host = "secondary.example.edu"
             self.assertTrue(
                 _recover_cancel(self.context, StrictProxy(script), operation, job)
             )
+        script.assert_complete()
 
         # The guard is released (FAILED), and a fresh cancellation can now be
         # dispatched without the "pending cancellation" conflict.

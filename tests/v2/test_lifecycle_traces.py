@@ -367,24 +367,44 @@ class LifecycleTraceTests(unittest.TestCase):
     def test_only_draining_states_hold_an_ambiguous_cancellation(self) -> None:
         """The read-only classifier that decides whether to release the guard.
 
-        A landed cancellation can only be observed draining (COMPLETING /
-        STAGE_OUT); every other non-final live state proves it never arrived.
-        Final and uncertain assessments are handled by their own paths and must
-        never release the guard from here.
+        A landed cancellation can only be observed in the kill sequence
+        (SIGNALING / COMPLETING / STAGE_OUT); every other non-final live state
+        proves it never arrived.  Final, uncertain, and terminal-candidate
+        assessments are handled by their own paths and must never release the
+        guard from here -- the predicate is self-contained and does not rely on
+        the caller having resolved candidates first.
         """
 
-        for state in ("RUNNING", "PENDING", "SUSPENDED", "STOPPED"):
+        for state in ("RUNNING", "PENDING", "SUSPENDED", "STOPPED", "RESIZING"):
             assessment = EvidenceTracker().accept(EvidenceEvent.queue(row(state, node="node01")))
             self.assertTrue(
                 proves_cancellation_did_not_land(assessment),
-                msg=f"{state} is plainly alive and not draining",
+                msg=f"{state} is plainly alive and not in the kill sequence",
             )
 
-        for state in ("COMPLETING", "STAGE_OUT"):
+        # SIGNALING is in _ACTIVE (phase ACTIVE) but is exactly what a landed
+        # cancellation looks like while the kill signal is delivered, so the
+        # classifier must HOLD on it despite the alive phase.
+        for state in ("SIGNALING", "COMPLETING", "STAGE_OUT"):
             assessment = EvidenceTracker().accept(EvidenceEvent.queue(row(state, node="node01")))
             self.assertFalse(
                 proves_cancellation_did_not_land(assessment),
                 msg=f"{state} is consistent with a cancellation that landed",
+            )
+
+        # A single terminal or absent observation is a TERMINAL_CANDIDATE -- a
+        # death candidate, often dying BECAUSE the cancellation landed -- not
+        # proof of life.  It must not release the guard even though its
+        # scheduler_state (a terminal code, or None) is not in the draining set.
+        for candidate in (
+            EvidenceTracker().accept(EvidenceEvent.queue(row("CANCELLED", node="node01"))),
+            EvidenceTracker().accept(EvidenceEvent.absent()),
+        ):
+            self.assertFalse(candidate.final)
+            self.assertFalse(candidate.uncertain)
+            self.assertFalse(
+                proves_cancellation_did_not_land(candidate),
+                msg="a terminal candidate is provisional death, not proof of life",
             )
 
         final = EvidenceTracker().accept(EvidenceEvent.final(final_record("COMPLETED", "0:0")))
