@@ -41,7 +41,7 @@ On interruption before the cancellation reservation commits, emit no recovery gu
 
 Recover `CANCEL_PENDING` locally without contacting Slurm. Recover an ambiguous cancellation locally when its target already has durable `ACCOUNTING` or `CONFIRMED_QUEUE` finality, including when `status` persisted that evidence after the cancellation became ambiguous. In bulk recovery, prioritize such local work and continue a bounded local sweep even if a later remote bootstrap fails.
 
-When local evidence is insufficient, make cancellation recovery observation-only: inspect the exact live queue identity and exact final accounting, and never replay `scancel`. Leave a live match or inconclusive observation unresolved. Resolve only exact final accounting or two consecutive successful non-live observations for the old operation; accept exact absence, an exact scheduler-terminal row, or proof that the numeric ID now belongs to a different exact identity as non-live evidence.
+When local evidence is insufficient, make cancellation recovery observation-only: inspect the exact live queue identity and exact final accounting, and never replay `scancel`. Leave a live match or inconclusive observation unresolved. Resolve only exact final accounting or two consecutive successful non-live observations for the old operation, requiring the two observations even with accounting for a requeue-eligible terminal (`NODE_FAIL` or `PREEMPTED`), since a single accounting record can be the reaped attempt of a job Slurm is requeueing under the same ID; accept exact absence, an exact scheduler-terminal row, or proof that the numeric ID now belongs to a different exact identity as non-live evidence.
 
 Use `recover OPERATION_ID --cluster NAME` only when the explicit cluster equals the operation's recorded cluster; require that check before prompting, state changes, projection updates, or remote access. Report an already-resolved operation's durable phase successfully, but reject `--abandon` for resolved operations.
 
@@ -67,7 +67,7 @@ Map recognized Slurm queue states consistently:
 - Classify `PENDING`, `CONFIGURING`, and `RESV_DEL_HOLD` as `QUEUED` before first start, or as `REQUEUEING` when durable start history already exists.
 - Classify `SUSPENDED`, `STOPPED`, `COMPLETING`, and `STAGE_OUT` as `STARTED_INACTIVE`.
 - Classify `REQUEUED`, `REQUEUE_FED`, `REQUEUE_HOLD`, and `SPECIAL_EXIT` as `REQUEUEING`.
-- Treat recognized final scheduler rows as non-live evidence requiring confirmation unless exact final accounting is available.
+- Treat recognized final scheduler rows as non-live evidence requiring confirmation. Exact final accounting resolves an ordinary terminal row immediately, but a requeue-eligible row (`NODE_FAIL` or `PREEMPTED`, which Slurm may restart under the same job ID) still needs a second independent observation, because a single accounting record can be the reaped attempt of a job being requeued.
 - Treat any present but unrecognized state as `UNCERTAIN`; never let it drive log, cancellation, draining, or projection policy.
 
 Require consecutive successful non-live evidence within one observation session. Break consecutiveness on scheduler, transport, protocol, or process-restart uncertainty. Let a present nonterminal exact row clear a prior terminal candidate, and let a lifecycle revision race rebase policy on the fresh durable row before log access, drain, sleep, or SSH projection changes.
