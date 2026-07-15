@@ -33,6 +33,13 @@ class MonitorResult:
     # `why` needs the same record for its own display, and was fetching it a
     # second time -- an entire retry ladder, the heaviest query the tool makes,
     # for a record whose content could not have changed in between.
+    #
+    # This does NOT imply the assessment is final.  A deferred requeue-eligible
+    # candidate consults accounting (a NODE_FAIL/PREEMPTED record) but must not
+    # finalize on it, so this field can hold a terminal-looking record for a job
+    # that is alive and being requeued.  A consumer must gate on
+    # ``assessment.final`` before treating it as the terminal record, or it will
+    # report a requeued job as dead.
     record: AccountingRecord | None = None
 
 

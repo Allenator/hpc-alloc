@@ -3003,12 +3003,23 @@ host = "secondary.example.edu"
                         # First absent observation: a requeue-eligible accounting
                         # record here is NOT proof of death -- the job may be
                         # transiently gone mid-requeue -- so it must not finalize.
+                        # The cheap single-attempt probe (0,) confirms this is the
+                        # deferring read, not the confirming ladder.
                         ExpectedCall("observe", result=None),
-                        ExpectedCall("final", result=record),
+                        ExpectedCall(
+                            "final",
+                            result=record,
+                            kwargs={"attempts": (0,), "auth": AuthMode.NONINTERACTIVE},
+                        ),
                         # Second, independent absent observation confirms the
-                        # death; only now does the accounting read finalize it.
+                        # death; only now, on the full (0, 2, 2) confirming ladder,
+                        # does the accounting read finalize it.
                         ExpectedCall("observe", result=None),
-                        ExpectedCall("final", result=record),
+                        ExpectedCall(
+                            "final",
+                            result=record,
+                            kwargs={"attempts": (0, 2, 2), "auth": AuthMode.NONINTERACTIVE},
+                        ),
                     ]
                 )
 
