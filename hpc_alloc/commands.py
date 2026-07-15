@@ -1863,7 +1863,15 @@ def _cancel_record_owned(
                     ctx.state.fail_cancel_operation(operation.operation_id, detail)
                     raise ProtocolViolation(detail)
                 tracker.begin_observation_epoch()
-                assessment = tracker.accept(EvidenceEvent.final(record))
+                # The cancellation inspection ran its own two-observation loop
+                # before returning ALREADY_FINAL, so a requeue-eligible record
+                # here is already twice-confirmed even though this fresh tracker
+                # has logged no evidence.  Assert that confirmation so accept()'s
+                # choke-point guard admits it instead of refusing a first,
+                # unconfirmed requeue-eligible read.
+                assessment = tracker.accept(
+                    EvidenceEvent.final(record, requeue_confirmed=True)
+                )
                 ctx.state.resolve_operation(
                     operation.operation_id,
                     final_source=assessment.final_source or FinalSource.ACCOUNTING,

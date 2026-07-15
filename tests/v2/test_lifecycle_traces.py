@@ -323,6 +323,78 @@ class LifecycleTraceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires a final record"):
             tracker.accept(EvidenceEvent.final(final_record("RUNNING")))
 
+    def test_accept_refuses_to_reap_a_requeue_eligible_job_on_one_read(self) -> None:
+        """The two-observation rule is enforced at the choke point itself.
+
+        NODE_FAIL and PREEMPTED are the states Slurm requeues under the same job
+        ID, so a lone accounting read of one -- taken in the same instant as the
+        observation that produced it -- is not independent proof of death.  Every
+        finalization routes through accept(); refusing a first, unconfirmed
+        requeue-eligible read here makes a future fifth single-observation reaper
+        a loud failure instead of a silently orphaned GPU allocation.
+        """
+
+        for state in ("NODE_FAIL", "PREEMPTED"):
+            with self.subTest(state=state):
+                tracker = EvidenceTracker()  # a fresh tracker has no prior evidence
+                self.assertEqual(tracker.assessment.terminal_evidence, 0)
+                with self.assertRaisesRegex(ValueError, "requeue-eligible"):
+                    tracker.accept(EvidenceEvent.final(final_record(state, "0:1")))
+                # The refusal must leave no half-applied FINAL behind.
+                self.assertNotEqual(tracker.assessment.phase, AssessmentPhase.FINAL)
+                self.assertFalse(tracker.assessment.final)
+
+    def test_accept_finalizes_a_requeue_eligible_job_confirmed_out_of_band(self) -> None:
+        """The one caller that confirmed the death itself passes the flag.
+
+        inspect_cancel runs its own two-observation loop in the transport layer
+        before returning an ALREADY_FINAL record, so it hands accept() a record
+        that is already twice-confirmed even though this fresh tracker has logged
+        no evidence.  ``requeue_confirmed=True`` is how it asserts that.
+        """
+
+        for state in ("NODE_FAIL", "PREEMPTED"):
+            with self.subTest(state=state):
+                assessment = EvidenceTracker().accept(
+                    EvidenceEvent.final(final_record(state, "0:1"), requeue_confirmed=True)
+                )
+                self.assertTrue(assessment.final)
+                self.assertEqual(assessment.final_source, FinalSource.ACCOUNTING)
+                self.assertEqual(assessment.terminal_state, state)
+                self.assertTrue(assessment.ever_started)
+
+    def test_accept_finalizes_a_requeue_eligible_job_after_an_independent_look(self) -> None:
+        """The monitoring path reaches accept(final) only after a real second look.
+
+        A first requeue-eligible observation makes a terminal candidate
+        (terminal_evidence == 1); the accounting read then refines a genuine
+        second observation rather than reaping on the first, so the gate admits
+        it without the out-of-band flag.
+        """
+
+        for state in ("NODE_FAIL", "PREEMPTED"):
+            with self.subTest(state=state):
+                tracker = EvidenceTracker(ever_started=True, last_node="node01")
+                candidate = tracker.accept(EvidenceEvent.queue(row(state)))
+                self.assertEqual(candidate.terminal_evidence, 1)
+                assessment = tracker.accept(EvidenceEvent.final(final_record(state, "0:1")))
+                self.assertTrue(assessment.final)
+                self.assertEqual(assessment.final_source, FinalSource.ACCOUNTING)
+                self.assertEqual(assessment.terminal_state, state)
+
+    def test_accept_finalizes_an_ordinary_terminal_state_on_the_first_read(self) -> None:
+        """Only the requeue-eligible states are held; every other final is
+        immediately authoritative on a single read, as before."""
+
+        for state in ("COMPLETED", "FAILED", "TIMEOUT", "OUT_OF_MEMORY", "CANCELLED"):
+            with self.subTest(state=state):
+                assessment = EvidenceTracker().accept(
+                    EvidenceEvent.final(final_record(state, "0:0"))
+                )
+                self.assertTrue(assessment.final)
+                self.assertEqual(assessment.final_source, FinalSource.ACCOUNTING)
+                self.assertEqual(assessment.terminal_state, state)
+
     def test_unknown_scheduler_state_is_uncertainty_not_death(self) -> None:
         assessment = EvidenceTracker().accept(EvidenceEvent.queue(row("FUTURE_STATE")))
         self.assertEqual(assessment.phase, AssessmentPhase.UNCERTAIN)

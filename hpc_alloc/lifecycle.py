@@ -39,6 +39,10 @@ class EvidenceEvent:
     row: QueueRow | None = None
     accounting: AccountingRecord | None = None
     detail: str = ""
+    # Set only by a caller that has already confirmed a requeue-eligible death
+    # out of band (its own two-observation loop), so accept() may finalize such a
+    # record even though this tracker itself has logged no prior evidence.
+    requeue_confirmed: bool = False
 
     @classmethod
     def queue(cls, row: QueueRow | None) -> "EvidenceEvent":
@@ -61,8 +65,14 @@ class EvidenceEvent:
         return cls(EvidenceKind.SCHEDULER_ERROR, detail=detail)
 
     @classmethod
-    def final(cls, record: AccountingRecord) -> "EvidenceEvent":
-        return cls(EvidenceKind.FINAL_ACCOUNTING, accounting=record)
+    def final(
+        cls, record: AccountingRecord, *, requeue_confirmed: bool = False
+    ) -> "EvidenceEvent":
+        return cls(
+            EvidenceKind.FINAL_ACCOUNTING,
+            accounting=record,
+            requeue_confirmed=requeue_confirmed,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -372,6 +382,28 @@ class EvidenceTracker:
             record = event.accounting
             if record is None or not record.final:
                 raise ValueError("final-accounting evidence requires a final record")
+            if (
+                record.state_code in REQUEUE_ELIGIBLE_FINAL
+                and self._terminal_evidence < 1
+                and not event.requeue_confirmed
+            ):
+                # The two-observation rule, enforced at the choke point every
+                # finalization routes through -- not left to each caller to
+                # remember.  NODE_FAIL and PREEMPTED are the states Slurm requeues
+                # under the same job ID, so a lone accounting read of one
+                # describes the same instant as the observation that produced it:
+                # finalizing on it would reap a job that is being restarted, and
+                # the requeued instance then runs untracked for its whole
+                # walltime.  A caller must either observe a genuine second time
+                # (which raises terminal_evidence) or, having confirmed the death
+                # through its own two-observation loop, pass
+                # EvidenceEvent.final(..., requeue_confirmed=True).
+                raise ValueError(
+                    "refusing to finalize a requeue-eligible job "
+                    f"({record.state_code}) from a single accounting read: Slurm "
+                    "may be requeueing it under the same job ID, so a second "
+                    "independent observation or requeue_confirmed=True is required"
+                )
             if record.state_code in _PROVES_STARTED:
                 self._ever_started = True
             self._scheduler_state = record.state_code
