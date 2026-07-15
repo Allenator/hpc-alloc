@@ -390,7 +390,7 @@ class EvidenceTracker:
                 raise ValueError("final-accounting evidence requires a final record")
             if (
                 record.state_code in REQUEUE_ELIGIBLE_FINAL
-                and self._terminal_evidence < 1
+                and self._terminal_evidence < 2
                 and not event.requeue_confirmed
             ):
                 # The two-observation rule, enforced at the choke point every
@@ -400,14 +400,17 @@ class EvidenceTracker:
                 # describes the same instant as the observation that produced it:
                 # finalizing on it would reap a job that is being restarted, and
                 # the requeued instance then runs untracked for its whole
-                # walltime.  A caller must either observe a genuine second time
-                # (which raises terminal_evidence) or, having confirmed the death
-                # through its own two-observation loop, pass
+                # walltime.  The threshold is < 2, not < 1: a single terminal
+                # candidate (terminal_evidence == 1) plus a same-cycle accounting
+                # read is one observation, not two -- the absent-first reap the <
+                # 1 gate admitted.  A caller must reach two INDEPENDENT
+                # observations (terminal_evidence >= 2) or, having confirmed the
+                # death through its own two-observation loop, pass
                 # EvidenceEvent.final(..., requeue_confirmed=True).
                 raise ValueError(
                     "refusing to finalize a requeue-eligible job "
-                    f"({record.state_code}) from a single accounting read: Slurm "
-                    "may be requeueing it under the same job ID, so a second "
+                    f"({record.state_code}) without two independent observations: "
+                    "Slurm may be requeueing it under the same job ID, so a second "
                     "independent observation or requeue_confirmed=True is required"
                 )
             if record.state_code in _PROVES_STARTED:

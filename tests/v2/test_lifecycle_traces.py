@@ -393,26 +393,35 @@ class LifecycleTraceTests(unittest.TestCase):
                 self.assertEqual(assessment.terminal_state, state)
                 self.assertTrue(assessment.ever_started)
 
-    def test_accept_admits_a_requeue_eligible_record_once_evidence_exists(self) -> None:
-        """The gate's admission boundary: terminal_evidence >= 1 is finalizable.
+    def test_accept_requires_two_observations_for_a_requeue_eligible_record(self) -> None:
+        """The gate's boundary: two INDEPENDENT observations (terminal_evidence >= 2).
 
-        accept() refuses a requeue-eligible record at terminal_evidence == 0 (the
-        refusal test above) and admits it from 1 upward.  This pins that boundary
-        directly.  The monitor and streaming callers enforce a STRICTER policy on
-        top -- they require a second INDEPENDENT observation (terminal_evidence ==
-        2) before finalizing a requeue-eligible accounting record, because one
-        observation plus a same-cycle accounting read describe the same instant
-        (see the absent-first reap tests in the monitor/streaming suites).  So
-        this te == 1 admission is the gate's floor, exercised here in isolation,
-        not a sequence any caller reaches for a requeue-eligible record.
+        One observation plus a same-cycle accounting read describe the same
+        instant, so a single terminal candidate (terminal_evidence == 1) is NOT
+        enough -- that is exactly the absent-first reap, which a terminal_evidence
+        < 1 gate admitted.  Only a genuine second observation
+        (terminal_evidence == 2), or an out-of-band confirmation, may finalize a
+        requeue-eligible record.
         """
 
         for state in ("NODE_FAIL", "PREEMPTED"):
             with self.subTest(state=state):
-                tracker = EvidenceTracker(ever_started=True, last_node="node01")
-                candidate = tracker.accept(EvidenceEvent.queue(row(state)))
+                # One observation -> a candidate at terminal_evidence == 1.  Still
+                # refused: this is the boundary a "< 1" gate let the reap through.
+                one_look = EvidenceTracker(ever_started=True, last_node="node01")
+                candidate = one_look.accept(EvidenceEvent.queue(row(state)))
                 self.assertEqual(candidate.terminal_evidence, 1)
-                assessment = tracker.accept(EvidenceEvent.final(final_record(state, "0:1")))
+                with self.assertRaisesRegex(ValueError, "requeue-eligible"):
+                    one_look.accept(EvidenceEvent.final(final_record(state, "0:1")))
+                self.assertFalse(one_look.assessment.final)
+
+                # A genuine second, independent observation -> terminal_evidence
+                # == 2, and only now does the accounting record finalize it.
+                two_looks = EvidenceTracker(ever_started=True, last_node="node01")
+                two_looks.accept(EvidenceEvent.queue(row(state)))
+                confirmed = two_looks.accept(EvidenceEvent.absent())
+                self.assertEqual(confirmed.terminal_evidence, 2)
+                assessment = two_looks.accept(EvidenceEvent.final(final_record(state, "0:1")))
                 self.assertTrue(assessment.final)
                 self.assertEqual(assessment.final_source, FinalSource.ACCOUNTING)
                 self.assertEqual(assessment.terminal_state, state)
