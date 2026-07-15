@@ -21,7 +21,13 @@ from .lifecycle import (
 from .models import FinalSource, JobRef
 from .monitor import accept_observation, break_lifecycle_evidence
 from .retry import PollBackoff, RetryBudget, observation_signature
-from .slurm import MAX_LOG_CHUNK_BYTES, LogSizeStatus, QueueRow, SlurmClient
+from .slurm import (
+    MAX_LOG_CHUNK_BYTES,
+    REQUEUE_ELIGIBLE_FINAL,
+    LogSizeStatus,
+    QueueRow,
+    SlurmClient,
+)
 
 
 AssessmentPublisher = Callable[
@@ -219,7 +225,17 @@ class LogFollower:
             except HpcAllocError as exc:
                 break_lifecycle_evidence(self.tracker, exc)
                 raise
-            if record is not None:
+            # A requeue-eligible accounting record may only finalize once the
+            # candidate is already twice-confirmed (phase FINAL / confirmed-queue,
+            # terminal_evidence == 2).  On a first TERMINAL_CANDIDATE -- including
+            # an absent candidate whose terminal_state never carried the
+            # requeue-eligible code, which awaits_requeue_confirmation cannot see
+            # -- a same-cycle NODE_FAIL/PREEMPTED read is the single-observation
+            # reap; leave the candidate and let the next poll re-observe.
+            if record is not None and (
+                assessment.phase is AssessmentPhase.FINAL
+                or record.state_code not in REQUEUE_ELIGIBLE_FINAL
+            ):
                 enriched = self.tracker.accept(EvidenceEvent.final(record))
                 assessment = self._publish_assessment(
                     enriched,

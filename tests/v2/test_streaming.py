@@ -253,6 +253,49 @@ class StreamingTests(unittest.TestCase):
         self.assertEqual(script.count("read_log_chunk"), 0)
         script.assert_complete()
 
+    def test_absent_first_requeue_eligible_accounting_defers_instead_of_reaping(self) -> None:
+        """The streaming poll must not reap a requeued job either.
+
+        Same absent-candidate door as the monitor path: an absent observation
+        leaves terminal_state empty, so awaits_requeue_confirmation does not
+        fire, but the NODE_FAIL accounting record is requeue-eligible and must
+        not finalize on this single poll.  The next poll re-observes and either
+        sees the job requeued or earns an independent second death observation.
+        """
+
+        node_fail = AccountingRecord(
+            job_id=self.ref.job_id,
+            state="NODE_FAIL",
+            exit_code="0:1",
+            job_name=self.ref.slurm_job_name,
+            comment=self.ref.slurm_comment,
+        )
+        script = StrictScript(
+            [
+                ExpectedCall("observe", result=None, args=(self.ref,)),
+                ExpectedCall(
+                    "final",
+                    result=node_fail,
+                    args=(self.ref,),
+                    kwargs={"attempts": (0,)},
+                ),
+                ExpectedCall(
+                    "log_size",
+                    result=LogSizeResult(LogSizeStatus.MISSING),
+                    args=(LOG_PATH,),
+                ),
+            ]
+        )
+        follower = self.follower(
+            script, tracker=EvidenceTracker(ever_started=True, last_node="node01")
+        )
+        result = follower.poll_once()
+        self.assertFalse(result.assessment.final)
+        self.assertEqual(result.assessment.phase, AssessmentPhase.TERMINAL_CANDIDATE)
+        self.assertEqual(result.assessment.terminal_evidence, 1)
+        self.assertEqual(script.count("read_log_chunk"), 0)
+        script.assert_complete()
+
     def test_publication_brackets_accounting_before_log_access(self) -> None:
         accounting = AccountingRecord(
             job_id=self.ref.job_id,

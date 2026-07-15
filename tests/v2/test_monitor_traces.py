@@ -137,6 +137,105 @@ class MonitorTraceTests(unittest.TestCase):
         self.assertFalse(result.accounting_checked)
         script.assert_complete()
 
+    def test_absent_first_requeue_eligible_accounting_does_not_reap_a_requeued_job(self) -> None:
+        """An ABSENT first sighting plus a NODE_FAIL accounting read must not reap.
+
+        awaits_requeue_confirmation defers a requeue-eligible *queue row*, but an
+        absent candidate carries no terminal_state, so that guard never fires.
+        The accounting record is itself requeue-eligible, so the same
+        single-observation reap applies: finalizing here would lose a job Slurm
+        is requeueing under the same ID, which reappears as PENDING on the
+        confirming observation.
+        """
+
+        managed = job(ever_started=True)
+        assert managed.ref is not None
+        node_fail = AccountingRecord(
+            job_id="12345",
+            state="NODE_FAIL",
+            exit_code="0:1",
+            job_name=JOB_NAME,
+            comment=COMMENT,
+        )
+        script = StrictScript(
+            [
+                ExpectedCall(
+                    "observe",
+                    result=None,
+                    args=(managed.ref,),
+                    kwargs={"auth": AuthMode.NONINTERACTIVE},
+                ),
+                ExpectedCall(
+                    "final",
+                    result=node_fail,
+                    args=(managed.ref,),
+                    kwargs={"attempts": (0,), "auth": AuthMode.NONINTERACTIVE},
+                ),
+                ExpectedCall(
+                    "observe",
+                    result=row("PENDING"),
+                    args=(managed.ref,),
+                    kwargs={"auth": AuthMode.NONINTERACTIVE},
+                ),
+            ]
+        )
+        clock = VirtualClock()
+        result = self.monitor(script, clock).assess(managed)
+        self.assertFalse(result.assessment.final)
+        self.assertEqual(result.assessment.phase, AssessmentPhase.REQUEUEING)
+        self.assertEqual(clock.sleeps, [3])
+        script.assert_complete()
+
+    def test_absent_first_requeue_eligible_finalizes_only_after_a_second_absence(self) -> None:
+        """A genuinely dead requeue-eligible job still finalizes -- but only on a
+        second, independent observation, never the first accounting read."""
+
+        managed = job(ever_started=True)
+        assert managed.ref is not None
+        node_fail = AccountingRecord(
+            job_id="12345",
+            state="NODE_FAIL",
+            exit_code="0:1",
+            job_name=JOB_NAME,
+            comment=COMMENT,
+        )
+        script = StrictScript(
+            [
+                ExpectedCall(
+                    "observe",
+                    result=None,
+                    args=(managed.ref,),
+                    kwargs={"auth": AuthMode.NONINTERACTIVE},
+                ),
+                ExpectedCall(
+                    "final",
+                    result=node_fail,
+                    args=(managed.ref,),
+                    kwargs={"attempts": (0,), "auth": AuthMode.NONINTERACTIVE},
+                ),
+                ExpectedCall(
+                    "observe",
+                    result=None,
+                    args=(managed.ref,),
+                    kwargs={"auth": AuthMode.NONINTERACTIVE},
+                ),
+                ExpectedCall(
+                    "final",
+                    result=node_fail,
+                    args=(managed.ref,),
+                    kwargs={"attempts": (0, 2, 2), "auth": AuthMode.NONINTERACTIVE},
+                ),
+            ]
+        )
+        clock = VirtualClock()
+        result = self.monitor(script, clock).assess(managed)
+        self.assertTrue(result.assessment.final)
+        self.assertEqual(result.assessment.final_source, FinalSource.ACCOUNTING)
+        self.assertEqual(result.assessment.terminal_state, "NODE_FAIL")
+        self.assertEqual(result.assessment.terminal_evidence, 2)
+        self.assertEqual(clock.sleeps, [3])
+        script.assert_complete()
+
     def test_two_absences_are_confirmed_but_accounting_is_still_consulted(self) -> None:
         managed = job(ever_started=True)
         assert managed.ref is not None

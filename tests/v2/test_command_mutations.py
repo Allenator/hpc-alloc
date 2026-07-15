@@ -2944,12 +2944,16 @@ host = "secondary.example.edu"
         """The other half of the requeue-eligible branch: a real death.
 
         A NODE_FAIL/PREEMPTED job that did NOT requeue (JobRequeue=0, or a node
-        failure with no requeue) is genuinely gone.  Re-observing shows it absent,
-        the confirming accounting read returns the terminal record, and it
-        finalizes -- preserving final_source=ACCOUNTING, terminal_state, exit_code,
-        started history, and log eligibility, exactly as the pre-fix direct-accept
-        did.  Without this, a regression that finalized it as CONFIRMED_QUEUE
-        (losing the terminal state and the streamable log) would pass unnoticed.
+        failure with no requeue) is genuinely gone.  But a single absent
+        observation cannot tell a genuinely dead job from one transiently gone
+        during the requeue window, so recovery must re-observe absent TWICE (an
+        independent confirmation) before it finalizes -- preserving
+        final_source=ACCOUNTING, terminal_state, exit_code, started history, and
+        log eligibility.  A single absent observation plus this record would reap
+        a job being requeued under the same ID; requiring the second look is the
+        fix.  A regression that finalized on the first look, or settled it into
+        CONFIRMED_QUEUE (losing the terminal state and the streamable log), fails
+        here.
         """
 
         owner = self.repository.get_or_create_machine_id("laptop")
@@ -2996,14 +3000,31 @@ host = "secondary.example.edu"
                             kwargs={"auth": AuthMode.NONINTERACTIVE},
                         ),
                         ExpectedCall("verify_accounting_identity"),
-                        # Re-observed absent (genuinely gone, not requeued) ...
+                        # First absent observation: a requeue-eligible accounting
+                        # record here is NOT proof of death -- the job may be
+                        # transiently gone mid-requeue -- so it must not finalize.
                         ExpectedCall("observe", result=None),
-                        # ... and the confirming accounting read finalizes it.
+                        ExpectedCall("final", result=record),
+                        # Second, independent absent observation confirms the
+                        # death; only now does the accounting read finalize it.
+                        ExpectedCall("observe", result=None),
                         ExpectedCall("final", result=record),
                     ]
                 )
 
-                with patch("hpc_alloc.commands.info"):
+                # _recover_submission builds its own JobMonitor with the default
+                # (real) sleeper for the confirmation delay.  Substitute a subclass
+                # that injects a no-op sleeper -- preserving the .tracker
+                # staticmethod the recovery flow also calls -- so the confirming
+                # second observation costs no wall-clock here.
+                class _NoWaitMonitor(JobMonitor):
+                    def __init__(self, client, **kwargs):
+                        kwargs.setdefault("sleeper", lambda _delay: None)
+                        super().__init__(client, **kwargs)
+
+                with patch("hpc_alloc.commands.info"), patch(
+                    "hpc_alloc.monitor.JobMonitor", _NoWaitMonitor
+                ):
                     self.assertTrue(
                         _recover_submission(
                             self.context, StrictProxy(script), operation, job

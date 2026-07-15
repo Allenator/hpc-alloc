@@ -21,7 +21,7 @@ from .lifecycle import (
     awaits_requeue_confirmation,
 )
 from .models import FinalSource, JobPhase, JobRecord
-from .slurm import AccountingRecord, QueueRow
+from .slurm import REQUEUE_ELIGIBLE_FINAL, AccountingRecord, QueueRow
 from .ssh import AuthMode
 
 
@@ -153,7 +153,14 @@ class JobMonitor:
             # the death with a genuinely independent second observation.
             if not awaits_requeue_confirmation(assessment):
                 record = exact_final((0,))
-                if record is not None:
+                # awaits_requeue_confirmation keys on the candidate's own state,
+                # but an absent (or otherwise state-less) candidate carries no
+                # requeue-eligible terminal_state -- so a requeue-eligible
+                # ACCOUNTING record slips past it into this same-cycle finalize.
+                # Defer on the record too: a NODE_FAIL/PREEMPTED accounting row is
+                # the same reap, and only the confirmation observation below (a
+                # genuinely independent second look) may finalize it.
+                if record is not None and record.state_code not in REQUEUE_ELIGIBLE_FINAL:
                     return MonitorResult(
                         tracker.accept(EvidenceEvent.final(record)),
                         accounting_checked,

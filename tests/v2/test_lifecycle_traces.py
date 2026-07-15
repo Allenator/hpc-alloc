@@ -106,16 +106,19 @@ class LifecycleTraceTests(unittest.TestCase):
         from hpc_alloc.slurm import TERMINAL_WITHOUT_START
 
         self.assertLessEqual(TERMINAL_WITHOUT_START, FINAL_STATES)
-        started_finals = FINAL_STATES - TERMINAL_WITHOUT_START
-        self.assertEqual(started_finals & TERMINAL_WITHOUT_START, frozenset())
-        self.assertEqual(started_finals | TERMINAL_WITHOUT_START, FINAL_STATES)
+        # The real disjoint-cover check: each final state's membership in the
+        # INDEPENDENTLY built _PROVES_STARTED must equal "not excluded".  (Testing
+        # started_finals against its own definition FINAL_STATES -
+        # TERMINAL_WITHOUT_START would be tautological, so it is not done here.)
         for state in FINAL_STATES:
             with self.subTest(state=state):
                 self.assertEqual(
                     state in _PROVES_STARTED, state not in TERMINAL_WITHOUT_START
                 )
+        # And the derived started-final set still equals the historical
+        # enumeration, so the consolidation changed no classification.
         self.assertEqual(
-            started_finals,
+            FINAL_STATES - TERMINAL_WITHOUT_START,
             {"COMPLETED", "FAILED", "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED", "TIMEOUT"},
         )
 
@@ -390,13 +393,18 @@ class LifecycleTraceTests(unittest.TestCase):
                 self.assertEqual(assessment.terminal_state, state)
                 self.assertTrue(assessment.ever_started)
 
-    def test_accept_finalizes_a_requeue_eligible_job_after_an_independent_look(self) -> None:
-        """The monitoring path reaches accept(final) only after a real second look.
+    def test_accept_admits_a_requeue_eligible_record_once_evidence_exists(self) -> None:
+        """The gate's admission boundary: terminal_evidence >= 1 is finalizable.
 
-        A first requeue-eligible observation makes a terminal candidate
-        (terminal_evidence == 1); the accounting read then refines a genuine
-        second observation rather than reaping on the first, so the gate admits
-        it without the out-of-band flag.
+        accept() refuses a requeue-eligible record at terminal_evidence == 0 (the
+        refusal test above) and admits it from 1 upward.  This pins that boundary
+        directly.  The monitor and streaming callers enforce a STRICTER policy on
+        top -- they require a second INDEPENDENT observation (terminal_evidence ==
+        2) before finalizing a requeue-eligible accounting record, because one
+        observation plus a same-cycle accounting read describe the same instant
+        (see the absent-first reap tests in the monitor/streaming suites).  So
+        this te == 1 admission is the gate's floor, exercised here in isolation,
+        not a sequence any caller reaches for a requeue-eligible record.
         """
 
         for state in ("NODE_FAIL", "PREEMPTED"):
