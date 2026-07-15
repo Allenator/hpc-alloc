@@ -22,11 +22,17 @@ _SLURM_TIME = re.compile(
     r"|[0-9]+-[0-9]+(?::[0-5][0-9](?::[0-5][0-9])?)?"
     r")$"
 )
-# ASCII digits only.  `\d` also matches full-width and Arabic-Indic digits, which
-# the scheduler rejects -- and because submission never retries, a value that
-# slips past pre-flight validation here fails remotely as an ambiguous
-# submission ("may have committed") instead of a clean ConfigInvalid.
-_MEMORY = re.compile(r"^[0-9]+(?:\.[0-9]+)?(?:[KMGTPE](?:i?B)?)?$", re.IGNORECASE)
+# The scheduler's --mem grammar is a whole number with an optional K/M/G/T unit
+# (a bare number is megabytes).  This validator's whole purpose is that anything
+# the scheduler will reject fails here as a clean ConfigInvalid rather than
+# remotely as an ambiguous "may have committed" submission (submission never
+# retries).  So it must be no more permissive than that grammar: the old pattern
+# also accepted a fractional part and B/iB/P/E suffixes ("64GB", "64GiB", "1.5G",
+# "64P"), none of which the scheduler accepts -- a typo there passed pre-flight
+# and then failed remotely as the exact ambiguous submission this check exists to
+# avoid.  ASCII digits only, too: `\d` also matches full-width/Arabic-Indic
+# digits, which the scheduler likewise rejects.
+_MEMORY = re.compile(r"^[0-9]+[KMGT]?$", re.IGNORECASE)
 _IDENTITY_PATH = re.compile(r"^(?:~/|/)[A-Za-z0-9_./@%+=:,~-]+$")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 

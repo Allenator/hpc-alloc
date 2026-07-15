@@ -122,6 +122,27 @@ grace = "grace.ycrc.yale.edu"
 
         self.assertEqual(Config.validate_resource_override("mem", "64G"), "64G")
 
+    def test_memory_matches_the_schedulers_mem_grammar(self) -> None:
+        """The validator must be no more permissive than the scheduler.
+
+        The scheduler's --mem is a whole number with an optional K/M/G/T unit.
+        The old pattern also accepted a fractional part and B/iB/P/E suffixes;
+        those pass pre-flight but the scheduler rejects them, so the submission
+        fails remotely as the exact ambiguous "may have committed" outcome this
+        check exists to avoid, over a pure typo.
+        """
+
+        for memory in ("1024", "500M", "16G", "64G", "2T", "500m", "16g"):
+            with self.subTest(accepted=memory):
+                self.assertEqual(
+                    Config.validate_resource_override("mem", memory), memory
+                )
+
+        for memory in ("64GB", "64GiB", "1.5G", "64P", "64E", "16 G", "G", ""):
+            with self.subTest(rejected=memory):
+                with self.assertRaisesRegex(ConfigInvalid, "mem"):
+                    Config.validate_resource_override("mem", memory)
+
     def test_all_documented_numeric_duration_forms_are_accepted(self) -> None:
         for duration in (
             b"90",

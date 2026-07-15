@@ -2923,15 +2923,105 @@ host = "secondary.example.edu"
             )
 
         recovered = self.repository.get_job(operation_id)
-        # The submission ambiguity is resolved (the job ID is adopted), but the
-        # job is NOT finalized -- the requeued instance is alive and tracked.
+        # The submission ambiguity is resolved (the job ID is adopted) and the
+        # job is adopted ALIVE and fully tracked -- the requeued instance's live
+        # state, not a fabricated final.  Asserting the concrete durable fields
+        # (not merely "not FINAL") is the point: a regression that settled it into
+        # the wrong non-final phase, or dropped the running node/start evidence,
+        # would break `status` and the SSH projection while still passing a bare
+        # phase != FINAL check.
         self.assertEqual(recovered.job_id, "12345")
-        self.assertNotEqual(recovered.phase, JobPhase.FINAL)
+        self.assertEqual(recovered.phase, JobPhase.ACTIVE)
+        self.assertEqual(recovered.current_node, "node01")
+        self.assertTrue(recovered.ever_started)
         self.assertEqual(
             self.repository.get_operation(operation_id).phase,
             OperationPhase.ACKNOWLEDGED,
         )
         script.assert_complete()
+
+    def test_submission_recovery_finalizes_a_genuinely_dead_requeue_eligible_job(self) -> None:
+        """The other half of the requeue-eligible branch: a real death.
+
+        A NODE_FAIL/PREEMPTED job that did NOT requeue (JobRequeue=0, or a node
+        failure with no requeue) is genuinely gone.  Re-observing shows it absent,
+        the confirming accounting read returns the terminal record, and it
+        finalizes -- preserving final_source=ACCOUNTING, terminal_state, exit_code,
+        started history, and log eligibility, exactly as the pre-fix direct-accept
+        did.  Without this, a regression that finalized it as CONFIRMED_QUEUE
+        (losing the terminal state and the streamable log) would pass unnoticed.
+        """
+
+        owner = self.repository.get_or_create_machine_id("laptop")
+        for index, state in enumerate(("NODE_FAIL", "PREEMPTED"), start=1):
+            with self.subTest(state=state):
+                operation_id = f"d{index}" + "e" * 30
+                logical_name = f"dead{index}"
+                job_name = slurm_job_name("allocation", operation_id)
+                comment = format_tag(
+                    owner, operation_id, "laptop", "allocation", logical_name
+                )
+                self.repository.reserve_submission(
+                    operation_id=operation_id,
+                    cluster="grace",
+                    logical_name=logical_name,
+                    kind=JobKind.ALLOCATION,
+                    owner_id=owner,
+                    slurm_job_name=job_name,
+                    slurm_comment=comment,
+                    resources=self.resources,
+                )
+                self.repository.mark_submission_ambiguous(operation_id, "reply lost")
+                operation = self.repository.get_operation(operation_id)
+                job = self.repository.get_job(operation_id)
+
+                record = AccountingRecord(
+                    job_id=str(12000 + index),
+                    state=state,
+                    exit_code="1:0",
+                    job_name=job_name,
+                    comment=comment,
+                )
+                script = StrictScript(
+                    [
+                        ExpectedCall(
+                            "scan",
+                            result=RawQueueScan(()),
+                            kwargs={"auth": AuthMode.NONINTERACTIVE},
+                        ),
+                        ExpectedCall(
+                            "find_accounting_by_name",
+                            result=record,
+                            args=(job_name,),
+                            kwargs={"auth": AuthMode.NONINTERACTIVE},
+                        ),
+                        ExpectedCall("verify_accounting_identity"),
+                        # Re-observed absent (genuinely gone, not requeued) ...
+                        ExpectedCall("observe", result=None),
+                        # ... and the confirming accounting read finalizes it.
+                        ExpectedCall("final", result=record),
+                    ]
+                )
+
+                with patch("hpc_alloc.commands.info"):
+                    self.assertTrue(
+                        _recover_submission(
+                            self.context, StrictProxy(script), operation, job
+                        )
+                    )
+
+                recovered = self.repository.get_job(operation_id)
+                self.assertEqual(recovered.phase, JobPhase.FINAL)
+                self.assertEqual(recovered.final_source, FinalSource.ACCOUNTING)
+                self.assertEqual(recovered.terminal_state, state)
+                self.assertEqual(recovered.exit_code, "1:0")
+                self.assertTrue(recovered.ever_started)
+                self.assertTrue(JobMonitor.tracker(recovered).assessment.log_eligible)
+                self.assertEqual(
+                    self.repository.get_operation(operation_id).phase,
+                    OperationPhase.ACKNOWLEDGED,
+                )
+                script.assert_complete()
 
     def test_explicit_recovery_cluster_mismatch_precedes_projection_and_mutation(self) -> None:
         self.configure_clusters()
