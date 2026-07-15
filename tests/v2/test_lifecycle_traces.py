@@ -92,6 +92,33 @@ class LifecycleTraceTests(unittest.TestCase):
                     1 if phase is AssessmentPhase.TERMINAL_CANDIDATE else 0,
                 )
 
+    def test_final_states_partition_into_started_and_run_less(self) -> None:
+        """The proves-started taxonomy is derived from FINAL_STATES, not copied.
+
+        _PROVES_STARTED's terminal members are FINAL_STATES minus the run-less
+        exclusion set, so the two modules cannot drift.  This pins the partition:
+        the exclusion set is a genuine subset, every final state is classified as
+        exactly one of started / run-less, and the derived started-final set still
+        equals the historical enumeration (the consolidation changed nothing).
+        """
+
+        from hpc_alloc.lifecycle import _PROVES_STARTED
+        from hpc_alloc.slurm import TERMINAL_WITHOUT_START
+
+        self.assertLessEqual(TERMINAL_WITHOUT_START, FINAL_STATES)
+        started_finals = FINAL_STATES - TERMINAL_WITHOUT_START
+        self.assertEqual(started_finals & TERMINAL_WITHOUT_START, frozenset())
+        self.assertEqual(started_finals | TERMINAL_WITHOUT_START, FINAL_STATES)
+        for state in FINAL_STATES:
+            with self.subTest(state=state):
+                self.assertEqual(
+                    state in _PROVES_STARTED, state not in TERMINAL_WITHOUT_START
+                )
+        self.assertEqual(
+            started_finals,
+            {"COMPLETED", "FAILED", "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED", "TIMEOUT"},
+        )
+
     def test_requeue_trace_preserves_started_history_and_clears_stale_node(self) -> None:
         tracker = EvidenceTracker()
 

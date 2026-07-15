@@ -11,7 +11,13 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from .models import EvidenceProvenance, FinalSource, JobPhase
-from .slurm import FINAL_STATES, REQUEUE_ELIGIBLE_FINAL, AccountingRecord, QueueRow
+from .slurm import (
+    FINAL_STATES,
+    REQUEUE_ELIGIBLE_FINAL,
+    TERMINAL_WITHOUT_START,
+    AccountingRecord,
+    QueueRow,
+)
 
 
 class AssessmentPhase(StrEnum):
@@ -122,15 +128,15 @@ _REQUEUEING = frozenset({"REQUEUED", "REQUEUE_FED", "REQUEUE_HOLD", "SPECIAL_EXI
 # state proves a cancellation never arrived.  SIGNALING is also in _ACTIVE, so
 # this set is consulted by scheduler state, not by phase.
 _CANCELLATION_DRAINING = frozenset({"SIGNALING", "COMPLETING", "STAGE_OUT"})
-_PROVES_STARTED = _ACTIVE | _STARTED_INACTIVE | _REQUEUEING | frozenset(
-    {
-        "COMPLETED",
-        "FAILED",
-        "NODE_FAIL",
-        "OUT_OF_MEMORY",
-        "PREEMPTED",
-        "TIMEOUT",
-    }
+# The terminal members are DERIVED from the scheduler taxonomy, not re-listed:
+# every final state except the run-less ones (TERMINAL_WITHOUT_START) proves the
+# job began executing.  Deriving keeps this set and FINAL_STATES from drifting
+# apart across the module boundary.
+_PROVES_STARTED = (
+    _ACTIVE
+    | _STARTED_INACTIVE
+    | _REQUEUEING
+    | (FINAL_STATES - TERMINAL_WITHOUT_START)
 )
 
 

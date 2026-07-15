@@ -48,6 +48,17 @@ FINAL_STATES = frozenset(
     }
 )
 
+# The final states a job can reach WITHOUT ever having run: the node never booted
+# (BOOT_FAIL), or the job was cancelled / hit its start deadline / had a
+# federation reservation revoked.  Every other final state implies execution
+# began.  This is the conservative split -- ever_started gates log streaming, so
+# a state where a start is uncertain is treated as "did not start" rather than
+# reaching for a log that may not exist.  Kept beside FINAL_STATES, and the two
+# are the sole source of the lifecycle layer's "proves started" taxonomy, so they
+# cannot drift: a newly added final state lands on exactly one side, and a
+# partition test in the lifecycle suite fails until it is classified.
+TERMINAL_WITHOUT_START = frozenset({"BOOT_FAIL", "CANCELLED", "DEADLINE", "REVOKED"})
+
 # The terminal states Slurm actually requeues a job out of.  With the default
 # JobRequeue=1, a NODE_FAIL job is restarted under the same job ID, and a
 # PreemptMode=REQUEUE preemption does the same -- so observing one of these
