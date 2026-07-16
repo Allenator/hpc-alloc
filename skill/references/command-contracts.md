@@ -27,7 +27,7 @@ Apply the shared `up` and `run` resource flags `--cluster`, `-p/--partition`, `-
 
 Accept numeric durations as `minutes`, `minutes:seconds`, `hours:minutes:seconds`, `days-hours`, `days-hours:minutes`, or `days-hours:minutes:seconds`. Require two-digit minute and second subfields from `00` through `59`; reject signs, whitespace, symbolic unlimited values, and every all-zero spelling.
 
-Use `--dry-run` to print a paste-ready `up` or `run` submission command without connecting or changing state. Execute the printed command in the target login shell so `${HOME:?}`, relative paths, and `~/...` paths resolve for that remote account.
+Use `--dry-run` to print a paste-ready `up` or `run` submission command without connecting or changing state. Execute the printed command in the target login shell so `${HOME:?}`, relative paths, and `~/...` paths resolve for that remote account. A command you paste and run yourself creates a real job that hpc-alloc does not journal or track; its comment carries a `dryrun-` tag precisely so `status` and recovery never mistake it for a tool-managed job.
 
 ## Selectors and cluster scope
 

@@ -70,7 +70,7 @@ hpc-alloc cancel bouchet:123456
 hpc-alloc down bouchet:dev
 ```
 
-Use `up --dry-run` or `run --dry-run` to print a paste-ready submission command without connecting or changing local state. The command keeps the remote home as `${HOME:?}`, so execute it in the target login shell; relative paths and `~/...` working directories then resolve beneath that account's home directory.
+Use `up --dry-run` or `run --dry-run` to print a paste-ready submission command without connecting or changing local state. The command keeps the remote home as `${HOME:?}`, so execute it in the target login shell; relative paths and `~/...` working directories then resolve beneath that account's home directory. If you paste and run that command yourself it creates a real job that hpc-alloc does not journal or track; its comment carries a `dryrun-` tag precisely so `status` and recovery never mistake it for a tool-managed job.
 
 ## Commands
 
