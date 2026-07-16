@@ -18,7 +18,8 @@ Use this reference to choose exact invocations and interpret public CLI results.
 | `hpc-alloc down NAME\|JOBID\|@OPERATION\|--all [--cluster C]` | Cancel one or all managed allocation jobs with exact verification and durable journaling. The target is required and is never inferred: a bare `down` exits 1 and lists the active allocations. |
 | `hpc-alloc ssh [--cluster C] [NAME\|JOBID\|@OPERATION] [-- CMD...]` | Open an interactive shell or replace the client process with SSH running a command on one active allocation. Place `--cluster` before the target because the remaining arguments belong to SSH. |
 | `hpc-alloc sync NAME\|JOBID\|@OPERATION SRC DST [--cluster C] [--pull] [--delete]` | Run rsync through one active allocation alias; treat `--delete` as destructive and require explicit intent. |
-| `hpc-alloc avail [--cluster C] [-p PARTITION] [--json]` | Summarize currently idle CPUs and free GPUs for one cluster. |
+| `hpc-alloc avail [--cluster C] [-p PARTITION] [--json]` | Summarize currently idle CPUs and free GPUs for one cluster. Idle GRES is not a schedulability guarantee — reserved or higher-priority-tier nodes can still queue you. |
+| `hpc-alloc avail --for [-G G] [-c N] [--mem M] [-t T] [-C X] [-p P] [--json]` | Probe the scheduler (a dry-run that submits no job) for where the given request would start soonest, across the eligible, GRES-matching partitions, ranked by estimated start. Estimates are advisory (the queue shifts). Restrict to one partition with `-p`; otherwise the eligible candidates are probed (bounded, and it says so when it caps the set). |
 | `hpc-alloc partitions [--cluster C] [--json]` | Report live partition limits, GRES, and feature data for one cluster; each partition also carries an `eligible` flag (true/false, or null when access data is unavailable) for whether the account, QOS, and groups may submit to it. |
 | `hpc-alloc recover [OPERATION_ID] [--cluster C] [--abandon] [--yes]` | Reconcile unresolved mutations without replaying them; restrict abandonment to one explicit operation and obtain confirmation unless `--yes` is explicitly authorized. |
 
@@ -63,7 +64,7 @@ Treat JSON stdout as the stable machine surface and do not parse display text.
 - Read each `jobs` entry through its canonical `selector`, `operation_id`, `jobid`, `cluster`, `name`, `kind`, lifecycle and terminal fields, resources, node, and alias. Keep a job finalized during the pass in `jobs` once rather than repeating it in `discovered`.
 - Read each `discovered` entry through `job_kind` plus `classification`; accept `untracked-owned`, `other-machine`, `unresolved-operation-match`, `duplicate-operation`, `local-final-conflict`, and `operation-identity-conflict` as classification values, and treat its canonical selector as evidence rather than mutation authority.
 - Read each `operations` entry through `operation_id`, target-job `selector`, `kind`, `phase`, `cluster`, `target`, `jobid`, and `detail`.
-- Read `why --json` as one job assessment and diagnosis, `avail --json` as `{ "partitions": { ... } }`, and `partitions --json` as an array of partition objects, each carrying an `eligible` flag (true, false, or null when access data is unavailable).
+- Read `why --json` as one job assessment and diagnosis, `avail --json` as `{ "partitions": { ... } }`, `avail --for --json` as `{ "for": { resolved request }, "probes": [ { "partition", "schedulable", "start", "detail" } ] }` ordered soonest-first, and `partitions --json` as an array of partition objects, each carrying an `eligible` flag (true, false, or null when access data is unavailable).
 - Reject assumptions about v1 fields such as `allocs`, heuristic `orphan`, `recent`, or legacy JSON aliases.
 
 ## Exit, stream, and signal policy

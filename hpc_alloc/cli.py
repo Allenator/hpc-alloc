@@ -113,9 +113,20 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--delete", action="store_true")
     add_cluster_flag(sync)
 
-    avail = sub.add_parser("avail", help="show free CPUs and GPUs")
+    avail = sub.add_parser("avail", help="show free capacity, or probe where a request schedules (--for)")
     add_cluster_flag(avail)
-    avail.add_argument("-p", "--partition")
+    avail.add_argument("-p", "--partition", help="Slurm partition")
+    avail.add_argument(
+        "--for",
+        dest="probe",
+        action="store_true",
+        help="probe where the request (-G/-c/--mem/-t/-C) would schedule soonest",
+    )
+    avail.add_argument("-t", "--time", help="walltime in Slurm format")
+    avail.add_argument("-c", "--cpus", type=int, help="CPUs per task")
+    avail.add_argument("--mem", help="memory per node, e.g. 8G")
+    avail.add_argument("-G", "--gpus", help="GPU request, e.g. h200:1")
+    avail.add_argument("-C", "--constraint", help="Slurm node constraint")
     avail.add_argument("--json", action="store_true")
 
     partitions = sub.add_parser("partitions", help="list Slurm partitions")

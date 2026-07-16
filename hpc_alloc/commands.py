@@ -793,7 +793,7 @@ def _resource_values(args: Any, config: Config, cluster: str) -> dict[str, Any]:
             cluster,
             fallback=DEFAULT_GPU_PARTITION if gpus else DEFAULT_PARTITION,
         )
-        if gpus:
+        if gpus and not getattr(args, "probe", False):
             info(f"--gpus given without --partition; using {partition!r}")
     walltime = getattr(args, "time", None)
     if walltime is None:
@@ -955,12 +955,128 @@ def cmd_partitions(
     return 0
 
 
+_MAX_PROBES = 8
+
+
+def _partition_gpu_types(availability_text: str) -> dict[str, set[str]]:
+    """Map each partition to the GPU types it offers, from the availability dump."""
+
+    types: dict[str, set[str]] = {}
+    for line in availability_text.splitlines():
+        fields = line.split()
+        if len(fields) < 6:
+            continue
+        found = types.setdefault(fields[0].rstrip("*"), set())
+        for gpu_type, _count in re.findall(r"gpu:(?:([^:,()\s]+):)?(\d+)", fields[3] or ""):
+            found.add(gpu_type or "gpu")
+    return types
+
+
+def _probe_candidates(
+    ctx: Any, client: Any, cluster: str, resources: dict, gpu_types: dict[str, set[str]]
+) -> tuple[list[str], bool]:
+    """Eligible partitions that offer the requested resources; (candidates, capped)."""
+
+    from .eligibility import partition_eligibility
+
+    snapshot = _eligibility_snapshot(ctx, client, cluster)
+    gpus = resources.get("gpus")
+    want_type = gpus.split(":")[0] if gpus and ":" in gpus else None
+    candidates: list[str] = []
+    for name, types in sorted(gpu_types.items()):
+        if snapshot is not None:
+            access, rules = snapshot
+            rule = rules.get(name)
+            if rule is not None and not partition_eligibility(rule, access)[0]:
+                continue
+        if gpus and (not types or (want_type is not None and want_type not in types)):
+            continue
+        candidates.append(name)
+    return candidates[:_MAX_PROBES], len(candidates) > _MAX_PROBES
+
+
+def _avail_probe(args: Any, ctx: Any, client: Any, cluster: str) -> int:
+    from .schedulability import parse_probe, rank_probes
+
+    resources = _resource_values(args, ctx.config, cluster)
+    capped = False
+    if getattr(args, "partition", None):
+        _preflight_partition_eligibility(ctx, client, cluster, resources["partition"])
+        candidates = [resources["partition"]]
+    else:
+        candidates, capped = _probe_candidates(
+            ctx, client, cluster, resources, _partition_gpu_types(client.availability())
+        )
+    ranked = rank_probes(
+        [
+            parse_probe(
+                partition,
+                client.schedule_probe(
+                    partition=partition,
+                    walltime=resources["time"],
+                    cpus=resources["cpus"],
+                    mem=resources.get("mem"),
+                    gpus=resources.get("gpus"),
+                    constraint=resources.get("constraint"),
+                ),
+            )
+            for partition in candidates
+        ]
+    )
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "for": {
+                        key: resources.get(key)
+                        for key in ("time", "cpus", "mem", "gpus", "constraint")
+                    },
+                    "probes": [
+                        {
+                            "partition": result.partition,
+                            "schedulable": result.schedulable,
+                            "start": result.start,
+                            "detail": result.detail,
+                        }
+                        for result in ranked
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return 0
+    if not ranked:
+        info("no eligible partition offers the requested resources")
+        return 0
+    spec = " ".join(
+        part
+        for part in (
+            f"-G {resources['gpus']}" if resources.get("gpus") else "",
+            f"-c {resources['cpus']}",
+            f"-t {resources['time']}",
+            f"--mem {resources['mem']}" if resources.get("mem") else "",
+        )
+        if part
+    )
+    info(f"schedulability for `{spec}` on {cluster} (estimates are advisory):")
+    width = max(len("PARTITION"), *(len(result.partition) for result in ranked))
+    print(f"{'PARTITION'.ljust(width)}  WOULD START")
+    for result in ranked:
+        when = result.start if result.schedulable else f"not schedulable — {result.detail}"
+        print(f"{result.partition.ljust(width)}  {when}")
+    if capped:
+        info(f"(probed the first {_MAX_PROBES} eligible partitions)")
+    return 0
+
+
 def cmd_avail(
     args: Any, *, ctx: Any, paths: AppPaths, entrypoint: Path, **_kwargs: Any
 ) -> int:
     cluster = ctx.config.resolve_cluster(args.cluster)
     transport, client = _services(ctx, paths, entrypoint, cluster)
     transport.bootstrap(cluster)
+    if getattr(args, "probe", False):
+        return _avail_probe(args, ctx, client, cluster)
     text = client.availability()
     payload: dict[str, Any] = {}
     for line in text.splitlines():
@@ -1030,7 +1146,8 @@ def cmd_avail(
     if any(part["gpus"] for part in payload.values()):
         print(
             "note: free GPU counts show idle GRES, not schedulability — reserved "
-            "or higher-priority-tier nodes can still leave you queued"
+            "or higher-priority-tier nodes can still leave you queued; use "
+            "`avail --for -G TYPE:N -c N -t T` to see where a request schedules soonest"
         )
     return 0
 
