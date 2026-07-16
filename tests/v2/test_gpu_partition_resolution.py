@@ -175,6 +175,14 @@ class DedicatedPartitionTests(unittest.TestCase):
         self.assertTrue(_is_dedicated_gpu_partition("gpu_h200"))
         self.assertTrue(_is_dedicated_gpu_partition("gpu"))
 
+    def test_custom_globs_replace_the_default(self) -> None:
+        globs = ("preempt*", "*-short")
+        self.assertFalse(_is_dedicated_gpu_partition("preempt_gpu", globs))
+        self.assertFalse(_is_dedicated_gpu_partition("gpu-short", globs))
+        # Names matched only by the built-in default are dedicated under a custom set.
+        self.assertTrue(_is_dedicated_gpu_partition("scavenge_gpu", globs))
+        self.assertTrue(_is_dedicated_gpu_partition("gpu_h200", globs))
+
 
 class ResolveGpuPartitionTests(unittest.TestCase):
     def _resolve(self, resources, client=None):

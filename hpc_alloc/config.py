@@ -88,6 +88,27 @@ def _positive_int(
     return value
 
 
+def _string_list(
+    table: Mapping[str, Any], key: str, section: str, path: Path
+) -> tuple[str, ...] | None:
+    value = table.get(key)
+    if value is None:
+        return None
+    if (
+        not isinstance(value, list)
+        or not value
+        or not all(
+            isinstance(item, str) and item and not _CONTROL.search(item) for item in value
+        )
+    ):
+        raise ConfigInvalid(
+            f"[{section}].{key} must be a non-empty list of non-empty strings "
+            "without control characters",
+            path=path,
+        )
+    return tuple(value)
+
+
 def _normalize_host(host: str) -> str | None:
     bracketed = host.startswith("[") or host.endswith("]")
     if bracketed:
@@ -137,6 +158,9 @@ class DefaultsConfig:
     cpus: int | None = None
     mem: str | None = None
     idle_timeout: int | None = None
+    # fnmatch globs for partitions to treat as non-dedicated (preemptible/short),
+    # which GPU auto-selection excludes; None -> the built-in default.
+    nondedicated_partition_globs: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +173,7 @@ class ClusterConfig:
     cpus: int | None = None
     mem: str | None = None
     idle_timeout: int | None = None
+    nondedicated_partition_globs: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,12 +228,23 @@ class Config:
             )
 
         defaults_raw = _table(raw.get("defaults", {}), "defaults", config_path)
-        _reject_unknown(defaults_raw, cls.RESOURCE_KEYS | {"cluster"}, "defaults", config_path)
+        _reject_unknown(
+            defaults_raw,
+            cls.RESOURCE_KEYS | {"cluster", "nondedicated_partition_globs"},
+            "defaults",
+            config_path,
+        )
         default_cluster = _string(defaults_raw, "cluster", "defaults", config_path)
         if default_cluster is not None and not IDENTIFIER_RE.fullmatch(default_cluster):
             raise ConfigInvalid("[defaults].cluster is not a valid cluster name", path=config_path)
         defaults_values = cls._resource_values(defaults_raw, "defaults", config_path)
-        defaults = DefaultsConfig(cluster=default_cluster, **defaults_values)
+        defaults = DefaultsConfig(
+            cluster=default_cluster,
+            nondedicated_partition_globs=_string_list(
+                defaults_raw, "nondedicated_partition_globs", "defaults", config_path
+            ),
+            **defaults_values,
+        )
 
         cluster_tables = _table(raw.get("cluster"), "cluster", config_path)
         if not cluster_tables:
@@ -219,7 +255,12 @@ class Config:
                 raise ConfigInvalid(f"cluster name {name!r} is invalid", path=config_path)
             section = f"cluster.{name}"
             table = _table(value, section, config_path)
-            _reject_unknown(table, cls.RESOURCE_KEYS | {"host"}, section, config_path)
+            _reject_unknown(
+                table,
+                cls.RESOURCE_KEYS | {"host", "nondedicated_partition_globs"},
+                section,
+                config_path,
+            )
             host = _string(table, "host", section, config_path, required=True)
             assert host is not None
             normalized_host = _normalize_host(host)
@@ -228,6 +269,9 @@ class Config:
             clusters[name] = ClusterConfig(
                 name=name,
                 host=normalized_host,
+                nondedicated_partition_globs=_string_list(
+                    table, "nondedicated_partition_globs", section, config_path
+                ),
                 **cls._resource_values(table, section, config_path),
             )
 
@@ -292,6 +336,18 @@ class Config:
             return cluster_value
         default_value = getattr(self.defaults, key)
         return default_value if default_value is not None else fallback
+
+    def nondedicated_globs(self, cluster: str | None = None) -> tuple[str, ...] | None:
+        """Configured non-dedicated partition globs (cluster over defaults), or None.
+
+        None means "unset"; the caller applies the built-in default so the single
+        source of that default lives with the selection logic, not here.
+        """
+
+        selected = self.cluster(cluster)
+        if selected.nondedicated_partition_globs is not None:
+            return selected.nondedicated_partition_globs
+        return self.defaults.nondedicated_partition_globs
 
     @classmethod
     def validate_resource_override(cls, key: str, value: Any) -> Any:

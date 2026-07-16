@@ -54,6 +54,37 @@ class ConfigValidationTests(unittest.TestCase):
             "unconfigured cluster",
         )
 
+    def test_nondedicated_globs_cluster_overrides_defaults(self) -> None:
+        payload = b"""\
+[identity]
+netid = "ab1234"
+[defaults]
+cluster = "grace"
+nondedicated_partition_globs = ["scavenge*"]
+[cluster.grace]
+host = "grace.ycrc.yale.edu"
+nondedicated_partition_globs = ["preempt*", "*-short"]
+[cluster.other]
+host = "other.ycrc.yale.edu"
+"""
+        config = self.load_bytes(payload)
+        self.assertEqual(config.nondedicated_globs("grace"), ("preempt*", "*-short"))
+        self.assertEqual(config.nondedicated_globs("other"), ("scavenge*",))  # from defaults
+
+    def test_nondedicated_globs_absent_is_none(self) -> None:
+        # None means "unset"; the selection logic applies the built-in default.
+        self.assertIsNone(self.load_bytes(VALID_CONFIG).nondedicated_globs("grace"))
+
+    def test_nondedicated_globs_must_be_a_nonempty_string_list(self) -> None:
+        self.assert_invalid(
+            VALID_CONFIG + b'nondedicated_partition_globs = "scavenge*"\n',
+            "must be a non-empty list",
+        )
+        self.assert_invalid(
+            VALID_CONFIG + b"nondedicated_partition_globs = []\n",
+            "must be a non-empty list",
+        )
+
     def test_cluster_table_shape_is_validated(self) -> None:
         payload = b"""\
 [identity]

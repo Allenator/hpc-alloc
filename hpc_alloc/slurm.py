@@ -183,6 +183,31 @@ class SubmissionResult:
     raw_output: str
 
 
+def _core_resource_argv(*, walltime: str, cpus: int) -> list[str]:
+    """The invariant resource flags a real submission and a dry-run probe share."""
+
+    return [f"--time={walltime}", "--nodes=1", "--ntasks=1", f"--cpus-per-task={int(cpus)}"]
+
+
+def _optional_resource_argv(
+    *, mem: str | None, gpus: str | None, constraint: str | None
+) -> list[str]:
+    """The optional resource flags a real submission and a dry-run probe share.
+
+    Kept beside the invariant flags so the probe cannot drift from the real
+    request it is meant to estimate.
+    """
+
+    argv: list[str] = []
+    if mem:
+        argv.append(f"--mem={mem}")
+    if gpus:
+        argv.append(f"--gpus={gpus}")
+    if constraint:
+        argv.append(f"--constraint={constraint}")
+    return argv
+
+
 @dataclass(frozen=True, slots=True)
 class SubmissionSpec:
     """Semantic batch submission; command construction remains in this module."""
@@ -239,20 +264,12 @@ class SubmissionSpec:
             "--parsable",
             f"--job-name={self.job_name}",
             f"--comment={self.comment}",
-            f"--time={self.walltime}",
-            "--nodes=1",
-            "--ntasks=1",
-            f"--cpus-per-task={self.cpus}",
+            *_core_resource_argv(walltime=self.walltime, cpus=self.cpus),
             "--output",
             self.logfile,
             f"--partition={self.partition}",
+            *_optional_resource_argv(mem=self.mem, gpus=self.gpus, constraint=self.constraint),
         ]
-        if self.mem:
-            argv.append(f"--mem={self.mem}")
-        if self.gpus:
-            argv.append(f"--gpus={self.gpus}")
-        if self.constraint:
-            argv.append(f"--constraint={self.constraint}")
         if self.chdir:
             argv.append(f"--chdir={self.chdir}")
         argv += ["--wrap", self.wrap]
@@ -1331,19 +1348,12 @@ class SlurmClient:
         argv = [
             "sbatch",
             "--test-only",
-            f"--time={walltime}",
-            "--nodes=1",
-            "--ntasks=1",
-            f"--cpus-per-task={int(cpus)}",
+            *_core_resource_argv(walltime=walltime, cpus=cpus),
             f"--partition={partition}",
+            *_optional_resource_argv(mem=mem, gpus=gpus, constraint=constraint),
+            "--wrap",
+            "true",
         ]
-        if mem:
-            argv.append(f"--mem={mem}")
-        if gpus:
-            argv.append(f"--gpus={gpus}")
-        if constraint:
-            argv.append(f"--constraint={constraint}")
-        argv += ["--wrap", "true"]
         command = f"{shlex.join(argv)} 2>&1 || true"
         return self._text_read(command, "schedule probe", auth=auth)
 

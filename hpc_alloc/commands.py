@@ -6,6 +6,7 @@ lifecycle policy, and durable transactions remain in their dedicated modules.
 
 from __future__ import annotations
 
+import fnmatch
 import ipaddress
 import json
 import os
@@ -1056,6 +1057,7 @@ def _avail_probe(args: Any, ctx: Any, client: Any, cluster: str) -> int:
     for_request = {
         key: resources.get(key) for key in ("time", "cpus", "mem", "gpus", "constraint")
     }
+    globs = _nondedicated_globs(ctx, cluster)
     capped = False
     if getattr(args, "partition", None):
         # A read-only probe never raises on eligibility: the probe itself reports
@@ -1112,7 +1114,7 @@ def _avail_probe(args: Any, ctx: Any, client: Any, cluster: str) -> int:
                     "probes": [
                         {
                             "partition": result.partition,
-                            "preemptible": not _is_dedicated_gpu_partition(result.partition),
+                            "preemptible": not _is_dedicated_gpu_partition(result.partition, globs),
                             "schedulable": result.schedulable,
                             "start": result.start,
                             "detail": result.detail,
@@ -1143,7 +1145,7 @@ def _avail_probe(args: Any, ctx: Any, client: Any, cluster: str) -> int:
     width = max(len("PARTITION"), *(len(result.partition) for result in ranked))
     print(f"{'PARTITION'.ljust(width)}  WOULD START")
     for result in ranked:
-        marker = "" if _is_dedicated_gpu_partition(result.partition) else "  (preemptible)"
+        marker = "" if _is_dedicated_gpu_partition(result.partition, globs) else "  (preemptible)"
         when = result.start if result.schedulable else f"not schedulable — {result.detail}"
         print(f"{result.partition.ljust(width)}  {when}{marker}")
     if capped:
@@ -1724,10 +1726,28 @@ def _preflight_partition_eligibility(
         )
 
 
-def _is_dedicated_gpu_partition(name: str) -> bool:
-    """A steady partition, excluding preemptible (`scavenge*`) and short (`*devel`)."""
+# The built-in non-dedicated (preemptible/short) partition globs, used when a
+# cluster does not configure its own `nondedicated_partition_globs`.  Sole home
+# of this default: `Config.nondedicated_globs` returns configured-or-None.
+_DEFAULT_NONDEDICATED_GLOBS = ("scavenge*", "*devel")
 
-    return not (name.startswith("scavenge") or name.endswith("devel"))
+
+def _is_dedicated_gpu_partition(
+    name: str, globs: tuple[str, ...] = _DEFAULT_NONDEDICATED_GLOBS
+) -> bool:
+    """A steady partition -- not matched by any non-dedicated (preemptible/short) glob."""
+
+    return not any(fnmatch.fnmatch(name, glob) for glob in globs)
+
+
+def _nondedicated_globs(ctx: Any, cluster: str) -> tuple[str, ...]:
+    """The cluster's non-dedicated globs, falling back to the built-in default."""
+
+    try:
+        configured = ctx.config.nondedicated_globs(cluster)
+    except Exception:
+        configured = None
+    return configured if configured is not None else _DEFAULT_NONDEDICATED_GLOBS
 
 
 def _resolve_gpu_partition(
@@ -1773,10 +1793,11 @@ def _resolve_gpu_partition(
     # prove ineligible, but if that would leave nothing it is dropped, so an
     # eligibility gap can never turn an otherwise-single choice into a refusal --
     # the authoritative submit rejects a real access error instead.
+    globs = _nondedicated_globs(ctx, cluster)
     dedicated = [
         name
         for name in sorted(name for name, types in offered.items() if want_type in types)
-        if _is_dedicated_gpu_partition(name)
+        if _is_dedicated_gpu_partition(name, globs)
     ]
     snapshot = _eligibility_snapshot(ctx, client, cluster, fetch=fetch)
     allowed = [
@@ -1801,7 +1822,7 @@ def _resolve_gpu_partition(
     preemptible = [
         name
         for name in sorted(name for name, types in offered.items() if want_type in types)
-        if not _is_dedicated_gpu_partition(name)
+        if not _is_dedicated_gpu_partition(name, globs)
     ]
     if preemptible:
         raise ConfigInvalid(
