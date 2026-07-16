@@ -376,7 +376,8 @@ def _render_initial_config(netid: str, cluster: str, host: str, identity_file: s
         "# time = \"4:00:00\"\n"
         "# cpus = 2\n"
         "# mem = \"16G\"\n"
-        "# idle_timeout = 30\n\n"
+        "# idle_timeout = 30\n"
+        "# nondedicated_partition_globs = [\"scavenge*\", \"*devel\"]\n\n"
         f"[cluster.{cluster}]\n"
         f"host = {_toml_string(host)}\n"
     )
