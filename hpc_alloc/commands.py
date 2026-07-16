@@ -1158,14 +1158,39 @@ def cmd_avail(
     for part in payload.values():
         for gpu in part["gpus"].values():
             gpu["free"] = gpu["total"] - gpu["used"]
+    # Annotate each partition with local access eligibility, exactly as
+    # `partitions` does (best effort; None when the data is unavailable or the
+    # partition is unknown), so idle capacity is not read as "yours to use".
+    from .eligibility import partition_eligibility
+
+    snapshot = _eligibility_snapshot(ctx, client, cluster)
+    access, part_rules = snapshot if snapshot is not None else (None, {})
+    for name, part in payload.items():
+        rule = part_rules.get(name)
+        part["eligible"] = (
+            None if access is None or rule is None else partition_eligibility(rule, access)[0]
+        )
     if args.json:
         print(json.dumps({"partitions": payload}, indent=2))
         return 0
     if not payload:
         info("no matching partitions")
         return 0
-    fmt = "{:<14} {:<22} {:<16} {}"
-    print(fmt.format("PARTITION", "NODES idle/mix/alloc/off", "CPUS free/total", "GPUS free/total"))
+
+    def eligible_cell(part: dict) -> str:
+        value = part.get("eligible")
+        return "?" if value is None else ("yes" if value else "no")
+
+    fmt = "{:<14} {:<8} {:<22} {:<16} {}"
+    print(
+        fmt.format(
+            "PARTITION",
+            "ELIGIBLE",
+            "NODES idle/mix/alloc/off",
+            "CPUS free/total",
+            "GPUS free/total",
+        )
+    )
     for name, part in sorted(payload.items()):
         nodes = part["nodes"]
         gpus = "  ".join(
@@ -1174,6 +1199,7 @@ def cmd_avail(
         print(
             fmt.format(
                 name,
+                eligible_cell(part),
                 f"{nodes['idle']}/{nodes['mix']}/{nodes['alloc']}/{nodes['other']}",
                 f"{part['cpus_idle']}/{part['cpus_total']}",
                 gpus,
