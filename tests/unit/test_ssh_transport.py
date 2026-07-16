@@ -554,7 +554,7 @@ class SshTransportTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             transport = self.transport(runner, Path(directory))
-            with self.assertRaises(AuthRequired):
+            with self.assertRaisesRegex(AuthRequired, r"--push"):
                 transport.bootstrap("grace", AuthMode.NONINTERACTIVE)
         self.assertEqual(len(calls), 2)
         self.assertTrue(any("BatchMode=yes" in call for call in calls))

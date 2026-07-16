@@ -88,6 +88,17 @@ class StreamingTests(unittest.TestCase):
         self.assertEqual(script.count("read_log_chunk"), 0)
         script.assert_complete()
 
+    def test_queued_follow_nudges_toward_why_estimate_once(self) -> None:
+        notes: list[str] = []
+        script = StrictScript(
+            [ExpectedCall("observe", result=row("PENDING", reason="Resources"), args=(self.ref,))]
+        )
+        result = self.follower(script, notes=notes).poll_once()
+        self.assertEqual(result.assessment.phase, AssessmentPhase.QUEUED)
+        hints = [n for n in notes if "hpc-alloc why" in n and "estimated start" in n]
+        self.assertEqual(len(hints), 1, notes)
+        self.assertIn(self.ref.job_id, hints[0])
+
     def test_observation_failure_records_uncertainty_and_touches_no_log(self) -> None:
         script = StrictScript(
             [ExpectedCall("observe", result=TransportLost("VPN dropped"), args=(self.ref,))]

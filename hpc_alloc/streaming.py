@@ -105,6 +105,14 @@ class LogFollower:
         self.offset = 0
         self.total_bytes_written = 0
         self._last_note = float("-inf")
+        # A queued job's estimated start lives in `why`, not in the follow
+        # stream; nudge toward it once so a long queue does not read as a hang.
+        self._start_hint_shown = False
+        self._selector = (
+            f"{ref.cluster}:{self.job_id}"
+            if isinstance(ref, JobRef) and ref.cluster
+            else self.job_id
+        )
 
     def rebase(self, tracker: EvidenceTracker) -> None:
         """Replace lifecycle evidence without restarting the byte stream.
@@ -158,6 +166,11 @@ class LogFollower:
             message += f" (reason: {assessment.detail})"
         self.info(message)
         self._last_note = now
+        if assessment.phase == AssessmentPhase.QUEUED and not self._start_hint_shown:
+            self._start_hint_shown = True
+            self.info(
+                f"  still queued — `hpc-alloc why {self._selector}` shows the estimated start"
+            )
 
     def _stream_to_size(self, target_size: int, *, best_effort: bool = False) -> int:
         """Write chunks up to one captured size without chasing later growth."""

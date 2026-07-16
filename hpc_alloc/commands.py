@@ -671,7 +671,15 @@ def cmd_setup(args: Any, *, paths: AppPaths, entrypoint: Path) -> int:
     info(f"configured cluster {cluster!r} ({host}) for NetID {netid!r}")
     print("Your SSH public key:")
     print("  " + encoded_key)
-    print("\nNext: upload it at https://sshkeys.ycrc.yale.edu/, then run hpc-alloc connect")
+    if existing_key is None:
+        # A key generated just now is certainly not registered with the cluster.
+        print("\nNext: upload it at https://sshkeys.ycrc.yale.edu/, then run hpc-alloc connect")
+    else:
+        # A reused key may already be registered; do not imply a re-upload is needed.
+        print(
+            "\nNext: if this key is not already registered with YCRC, upload it at "
+            "https://sshkeys.ycrc.yale.edu/; then run hpc-alloc connect"
+        )
     return 0
 
 
@@ -999,6 +1007,11 @@ def cmd_avail(
                 f"{part['cpus_idle']}/{part['cpus_total']}",
                 gpus,
             )
+        )
+    if any(part["gpus"] for part in payload.values()):
+        print(
+            "note: free GPU counts show idle GRES, not schedulability — reserved "
+            "or higher-priority-tier nodes can still leave you queued"
         )
     return 0
 

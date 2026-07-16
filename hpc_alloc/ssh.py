@@ -549,8 +549,10 @@ class SshTransport:
         if status == ProbeStatus.AUTH:
             if auth_mode == AuthMode.NONINTERACTIVE or not can_prompt():
                 raise AuthRequired(
-                    f"{login_alias(cluster)} requires interactive authentication; "
-                    f"run `hpc-alloc connect --cluster {cluster}`"
+                    f"{login_alias(cluster)} requires authentication; run "
+                    f"`hpc-alloc connect --push --cluster {cluster}` for one Duo push "
+                    f"(no terminal needed), or `hpc-alloc connect --cluster {cluster}` "
+                    f"in an interactive terminal"
                 )
             self.info(f"connecting to {login_alias(cluster)} (answer the Duo prompt)")
             result = self._run(
