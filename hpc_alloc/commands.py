@@ -923,16 +923,35 @@ def cmd_partitions(
     parsed = [line.split("|") for line in text.strip().splitlines() if line.strip()]
     keys = ["partition", "avail", "timelimit", "nodes", "cpus", "memory", "gres", "features"]
     rows = [dict(zip(keys, row)) for row in parsed[1:] if len(row) == len(keys)]
+    # Annotate each partition with local access eligibility (best effort; None
+    # when the data is unavailable or the partition is unknown).
+    from .eligibility import partition_eligibility
+
+    snapshot = _eligibility_snapshot(ctx, client, cluster)
+    access, part_rules = snapshot if snapshot is not None else (None, {})
+    for row in rows:
+        rule = part_rules.get(row["partition"].rstrip("*"))
+        row["eligible"] = (
+            None if access is None or rule is None else partition_eligibility(rule, access)[0]
+        )
     if args.json:
         print(json.dumps(rows, indent=2))
         return 0
     if not rows:
         info("no partitions returned")
         return 0
-    widths = {key: max(len(key), *(len(str(row.get(key, ""))) for row in rows)) for key in keys}
-    print("  ".join(key.upper().ljust(widths[key]) for key in keys))
+    display_keys = [*keys, "eligible"]
+
+    def cell(row: dict, key: str) -> str:
+        if key == "eligible":
+            value = row.get("eligible")
+            return "?" if value is None else ("yes" if value else "no")
+        return str(row.get(key, ""))
+
+    widths = {key: max(len(key), *(len(cell(row, key)) for row in rows)) for key in display_keys}
+    print("  ".join(key.upper().ljust(widths[key]) for key in display_keys))
     for row in rows:
-        print("  ".join(str(row.get(key, "")).ljust(widths[key]) for key in keys))
+        print("  ".join(cell(row, key).ljust(widths[key]) for key in display_keys))
     return 0
 
 

@@ -89,10 +89,12 @@ Use `up --dry-run` or `run --dry-run` to print a paste-ready submission command 
 | `ssh [--cluster NAME] [NAME\|JOBID\|@OPERATION] [-- CMD...]` | Open an allocation shell or run a command there. |
 | `sync (NAME\|JOBID\|@OPERATION) SRC DST [--cluster NAME] [--pull] [--delete]` | Transfer files with rsync through the allocation alias. rsync expands the remote path through the remote login shell — which is what makes `'~/project'` work — so the remote path is restricted to `A-Za-z0-9_@%+=:,./~-` and a path containing a space, quote, glob, or `$(...)` is rejected rather than silently re-split by that shell. |
 | `avail [--cluster NAME] [-p PARTITION] [--json]` | Summarize idle CPUs and free GPUs for one cluster. |
-| `partitions [--cluster NAME] [--json]` | Show live partition limits, GRES, and feature data for one cluster. |
+| `partitions [--cluster NAME] [--json]` | Show live partition limits, GRES, and feature data for one cluster, plus whether your account may submit to each (`eligible`). |
 | `recover [OPERATION_ID] [--cluster NAME] [--abandon] [--yes]` | Reconcile ambiguous submit/cancel operations by exact queue or accounting identity, or explicitly abandon one local intent. |
 
 Resource flags shared by `up` and `run` are `--cluster`, `-p/--partition`, `-t/--time`, `-c/--cpus`, `--mem`, `-G/--gpus`, `-C/--constraint`, and `--dry-run`. `up` additionally accepts `--idle-timeout`, `--no-wait`, and `--wait-timeout`. `--idle-timeout` guards against a GPU allocation sitting idle, so it requires `-G/--gpus` and is rejected without it.
+
+Before dispatching, `up` and `run` check the resolved partition against your account, QOS, and group access and refuse a partition you cannot use locally — so a pure access error is reported immediately instead of becoming an ambiguous submission to recover. The check is best-effort: it falls open and submits normally whenever the access data cannot be read.
 
 Numeric Slurm durations support all six documented forms: `minutes`, `minutes:seconds`, `hours:minutes:seconds`, `days-hours`, `days-hours:minutes`, and `days-hours:minutes:seconds`. Minute and second subfields must be two digits from `00` through `59`; signs, whitespace, and symbolic values such as `INFINITE` or `UNLIMITED` are not accepted. Every all-zero spelling is also rejected because Slurm interprets a zero duration as requesting no time limit; specify an explicit, finite nonzero duration instead.
 
@@ -235,7 +237,7 @@ The v2 JSON surfaces are intentionally explicit:
 - `status --json` returns exactly three top-level arrays: `jobs`, `discovered`, and `operations`. `jobs` carry a canonical `selector` plus operation, scheduler, lifecycle, terminal, resource, node, and alias fields. A job finalized during reconciliation appears once in `jobs`, not again as a discovered conflict. `discovered` separates `job_kind` (`allocation` or `run`) from `classification` (`untracked-owned`, `other-machine`, `unresolved-operation-match`, `duplicate-operation`, `local-final-conflict`, or `operation-identity-conflict`). `operations` contains unresolved submit/cancel journal rows, their target-job `selector`, and recovery details.
 - `why --json` returns one job assessment and diagnosis.
 - `avail --json` returns `{ "partitions": { ... } }`.
-- `partitions --json` returns an array of partition objects.
+- `partitions --json` returns an array of partition objects, each with an `eligible` flag (`true`, `false`, or `null` when access data is unavailable).
 
 Consumers should use `kind` for managed jobs, `job_kind` plus `classification` for discovered rows, and canonical `selector` values for later actions. Do not parse display text. There are no v1 JSON aliases.
 

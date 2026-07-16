@@ -19,10 +19,10 @@ Use this reference to choose exact invocations and interpret public CLI results.
 | `hpc-alloc ssh [--cluster C] [NAME\|JOBID\|@OPERATION] [-- CMD...]` | Open an interactive shell or replace the client process with SSH running a command on one active allocation. Place `--cluster` before the target because the remaining arguments belong to SSH. |
 | `hpc-alloc sync NAME\|JOBID\|@OPERATION SRC DST [--cluster C] [--pull] [--delete]` | Run rsync through one active allocation alias; treat `--delete` as destructive and require explicit intent. |
 | `hpc-alloc avail [--cluster C] [-p PARTITION] [--json]` | Summarize currently idle CPUs and free GPUs for one cluster. |
-| `hpc-alloc partitions [--cluster C] [--json]` | Report live partition limits, GRES, and feature data for one cluster. |
+| `hpc-alloc partitions [--cluster C] [--json]` | Report live partition limits, GRES, and feature data for one cluster; each partition also carries an `eligible` flag (true/false, or null when access data is unavailable) for whether the account, QOS, and groups may submit to it. |
 | `hpc-alloc recover [OPERATION_ID] [--cluster C] [--abandon] [--yes]` | Reconcile unresolved mutations without replaying them; restrict abandonment to one explicit operation and obtain confirmation unless `--yes` is explicitly authorized. |
 
-Apply the shared `up` and `run` resource flags `--cluster`, `-p/--partition`, `-t/--time`, `-c/--cpus`, `--mem`, `-G/--gpus`, `-C/--constraint`, and `--dry-run`. Resolve resource values in this order: CLI flag, selected `[cluster.NAME]`, `[defaults]`, then built-in fallback.
+Apply the shared `up` and `run` resource flags `--cluster`, `-p/--partition`, `-t/--time`, `-c/--cpus`, `--mem`, `-G/--gpus`, `-C/--constraint`, and `--dry-run`. Resolve resource values in this order: CLI flag, selected `[cluster.NAME]`, `[defaults]`, then built-in fallback. Before dispatching, `up` and `run` refuse locally a resolved partition the account, QOS, or groups cannot use — so an access error is caught before submission rather than becoming an ambiguous mutation to recover; the check falls open (submits normally) when the access data is unavailable.
 
 Accept numeric durations as `minutes`, `minutes:seconds`, `hours:minutes:seconds`, `days-hours`, `days-hours:minutes`, or `days-hours:minutes:seconds`. Require two-digit minute and second subfields from `00` through `59`; reject signs, whitespace, symbolic unlimited values, and every all-zero spelling.
 
@@ -63,7 +63,7 @@ Treat JSON stdout as the stable machine surface and do not parse display text.
 - Read each `jobs` entry through its canonical `selector`, `operation_id`, `jobid`, `cluster`, `name`, `kind`, lifecycle and terminal fields, resources, node, and alias. Keep a job finalized during the pass in `jobs` once rather than repeating it in `discovered`.
 - Read each `discovered` entry through `job_kind` plus `classification`; accept `untracked-owned`, `other-machine`, `unresolved-operation-match`, `duplicate-operation`, `local-final-conflict`, and `operation-identity-conflict` as classification values, and treat its canonical selector as evidence rather than mutation authority.
 - Read each `operations` entry through `operation_id`, target-job `selector`, `kind`, `phase`, `cluster`, `target`, `jobid`, and `detail`.
-- Read `why --json` as one job assessment and diagnosis, `avail --json` as `{ "partitions": { ... } }`, and `partitions --json` as an array of partition objects.
+- Read `why --json` as one job assessment and diagnosis, `avail --json` as `{ "partitions": { ... } }`, and `partitions --json` as an array of partition objects, each carrying an `eligible` flag (true, false, or null when access data is unavailable).
 - Reject assumptions about v1 fields such as `allocs`, heuristic `orphan`, `recent`, or legacy JSON aliases.
 
 ## Exit, stream, and signal policy
