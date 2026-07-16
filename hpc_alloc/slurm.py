@@ -1271,6 +1271,31 @@ class SlurmClient:
     def reservations(self, *, auth: AuthMode = AuthMode.NONINTERACTIVE) -> str:
         return self._text_read("scontrol -o show reservation", "scontrol reservations", auth=auth)
 
+    def user_access(self, netid: str, *, auth: AuthMode = AuthMode.NONINTERACTIVE) -> str:
+        """Raw unix groups and scheduler associations, for local eligibility gating.
+
+        Best-effort by design: the pipeline always exits 0, so a cluster that is
+        missing the accounting tool simply yields no association rows and the
+        caller falls open rather than blocking a submit.
+        """
+
+        netid_q = shlex.quote(netid)
+        command = (
+            "printf 'GROUPS '; id -Gn 2>/dev/null; printf 'ASSOC\\n'; "
+            f"sacctmgr -n -P show assoc user={netid_q} format=Account,Partition,QOS "
+            "2>/dev/null; true"
+        )
+        return self._text_read(command, "user access", auth=auth)
+
+    def partition_access(self, *, auth: AuthMode = AuthMode.NONINTERACTIVE) -> str:
+        """Raw one-line-per-partition access rules, for local eligibility gating."""
+
+        return self._text_read(
+            "scontrol -o show partition 2>/dev/null || true",
+            "partition access",
+            auth=auth,
+        )
+
 
 __all__ = [
     "AccountingRecord",

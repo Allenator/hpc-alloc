@@ -24,6 +24,7 @@ runtime_modules=(
   hpc_alloc.commands
   hpc_alloc.config
   hpc_alloc.context
+  hpc_alloc.eligibility
   hpc_alloc.errors
   hpc_alloc.lifecycle
   hpc_alloc.locking
