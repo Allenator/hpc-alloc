@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import io
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
 
-from hpc_alloc.commands import _is_dedicated_gpu_partition, _resolve_gpu_partition
+from hpc_alloc.commands import (
+    _eligibility_snapshot,
+    _is_dedicated_gpu_partition,
+    _resolve_gpu_partition,
+    _topology_snapshot,
+)
 from hpc_alloc.errors import ConfigInvalid, TransportLost
 
 
@@ -86,6 +91,80 @@ def _ctx() -> SimpleNamespace:
 
 def _resources(gpus, partition="gpu") -> dict:
     return {"partition": partition, "gpus": gpus}
+
+
+class TopologyCacheTests(unittest.TestCase):
+    def test_topology_snapshot_caches_then_serves_offline(self) -> None:
+        ctx = _ctx()
+        first = _topology_snapshot(ctx, FakeClient(), "bouchet")
+        assert first is not None
+        self.assertEqual(first["gpu_h200"], {"h200"})
+        # A warm cluster is served offline (no client); a cold one yields None.
+        self.assertEqual(_topology_snapshot(ctx, None, "bouchet", fetch=False), first)
+        self.assertIsNone(_topology_snapshot(ctx, None, "elsewhere", fetch=False))
+
+    def test_offline_resolve_defers_when_cold_and_selects_when_warm(self) -> None:
+        # This is the "warm eagerly on connect" story: cold, the offline resolve
+        # defers (None); after both caches are warmed (as connect does), the same
+        # offline resolve picks the eligible partition with no client at all.
+        ctx = _ctx()
+        self.assertIsNone(
+            _resolve_gpu_partition(ctx, None, "bouchet", _resources("h200:1"), fetch=False)
+        )
+        _topology_snapshot(ctx, FakeClient(), "bouchet")
+        _eligibility_snapshot(ctx, FakeClient(), "bouchet")
+        chosen = _resolve_gpu_partition(
+            ctx, None, "bouchet", _resources("h200:1"), fetch=False
+        )
+        self.assertEqual(chosen, "gpu_h200")
+
+
+class DryRunOfflineResolveTests(unittest.TestCase):
+    def _dry_run(self, *, warm: bool):
+        from hpc_alloc.commands import _submit_job
+        from hpc_alloc.models import JobKind
+
+        ctx = _ctx()
+        if warm:  # as `connect` does: warm both accelerator caches
+            _topology_snapshot(ctx, FakeClient(), "bouchet")
+            _eligibility_snapshot(ctx, FakeClient(), "bouchet")
+        resources = {
+            "partition": "gpu",
+            "gpus": "h200:1",
+            "time": "1:00:00",
+            "cpus": 2,
+            "mem": None,
+            "constraint": None,
+            "chdir": None,
+        }
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            _submit_job(
+                ctx=ctx,
+                paths=None,
+                entrypoint=None,
+                cluster="bouchet",
+                kind=JobKind.ALLOCATION,
+                logical_name="dev",
+                resources=resources,
+                wrap="sleep infinity",
+                logfile_template=".hpc-alloc/alloc-{operation_id}.log",
+                dry_run=True,
+            )
+        return out.getvalue(), err.getvalue()
+
+    def test_warm_cache_prints_the_resolved_partition(self) -> None:
+        # #9: with a warm topology+access cache the dry-run command matches what a
+        # real submit would do -- the resolved partition, not the static default.
+        out, err = self._dry_run(warm=True)
+        self.assertIn("--partition=gpu_h200", out)
+        self.assertNotIn("stays offline", err)
+
+    def test_cold_cache_warns_and_keeps_the_static_default(self) -> None:
+        out, err = self._dry_run(warm=False)
+        self.assertIn("--partition=gpu", out)
+        self.assertNotIn("--partition=gpu_h200", out)
+        self.assertIn("stays offline", err)
 
 
 class DedicatedPartitionTests(unittest.TestCase):

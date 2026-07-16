@@ -895,6 +895,16 @@ def cmd_connect(
     if result.returncode != 0:
         raise HpcAllocError(result.stderr.strip() or f"hostname failed on {cluster}")
     info(f"login OK: {result.stdout_text.strip()}")
+    # Warm the Layer-0 accelerator caches (access rules + GPU topology) while the
+    # master is up, so a later `up`/`run` can refuse an ineligible partition and
+    # resolve a typed GPU request from cache -- offline, with no round-trip.  Both
+    # helpers are internally fail-open; the guard is belt-and-suspenders so a
+    # warming hiccup can never fail an otherwise-healthy `connect`.
+    try:
+        _eligibility_snapshot(ctx, _client, cluster)
+        _topology_snapshot(ctx, _client, cluster)
+    except Exception:
+        pass
     host_key_failure: HostKeyChanged | None = None
     # Health-check exactly the aliases the projection published -- the same set
     # `heal` retires.  Deriving it from current_node instead silently skipped
@@ -1518,6 +1528,7 @@ def _reconcile_name_holder(
 
 
 _ELIGIBILITY_CACHE_KEY = "partition_eligibility"
+_TOPOLOGY_CACHE_KEY = "gpu_topology"
 
 
 def _eligibility_snapshot(
@@ -1577,6 +1588,44 @@ def _eligibility_snapshot(
         # the accounting tool, an unexpected reply, a corrupt cache row -- falls
         # open to the authoritative submit.  Exception, not BaseException, so a
         # Ctrl-C still stops.
+        return None
+
+
+def _topology_snapshot(
+    ctx: Any, client: Any, cluster: str, *, fetch: bool = True
+) -> dict[str, set[str]] | None:
+    """Cached map of partition -> offered GPU types, or None to fall open.
+
+    Offered GRES is stable (hardware does not move), so it is cached like the
+    access rules.  Returns None on any problem, or -- with ``fetch=False`` -- on
+    a cache miss, so an offline resolve (dry-run, or a warm-cache pre-submit
+    resolve) consults the cache without contacting the cluster and otherwise
+    falls open.
+    """
+
+    from datetime import datetime, timedelta, timezone
+
+    try:
+        cached = ctx.state.get_cluster_cache(cluster, _TOPOLOGY_CACHE_KEY)
+        if isinstance(cached, dict) and cached:
+            return {
+                name: set(types)
+                for name, types in cached.items()
+                if isinstance(types, list)
+            }
+        if not fetch:
+            return None
+        offered = _partition_gpu_types(client.availability())
+        if not offered:
+            return None
+        ctx.state.set_cluster_cache(
+            cluster,
+            _TOPOLOGY_CACHE_KEY,
+            {name: sorted(types) for name, types in offered.items()},
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=4),
+        )
+        return offered
+    except Exception:
         return None
 
 
@@ -1642,17 +1691,21 @@ def _is_dedicated_gpu_partition(name: str) -> bool:
     return not (name.startswith("scavenge") or name.endswith("devel"))
 
 
-def _resolve_gpu_partition(ctx: Any, client: Any, cluster: str, resources: dict) -> str:
+def _resolve_gpu_partition(
+    ctx: Any, client: Any, cluster: str, resources: dict, *, fetch: bool = True
+) -> str | None:
     """Steer a typed GPU request to a partition that actually offers that type.
 
-    Only the real submit path calls this, and only when `-G TYPE:N` was given
-    without an explicit `-p` (the partition defaulted).  A bare count (`-G 2`)
-    or a plain default keeps the static default unchanged.
+    Called when `-G TYPE:N` was given without an explicit `-p` (the partition
+    defaulted).  A bare count (`-G 2`) or a plain default keeps the static
+    default unchanged.
 
     Auto-selects when the choice is unambiguous, otherwise refuses locally with
     guidance rather than dispatching a request the scheduler cannot satisfy.
-    Fails open: any availability fetch or parse problem returns the static
-    default, so the submit then behaves exactly as it did before.
+    With ``fetch=False`` (dry-run, or the offline pre-submit resolve) it uses
+    only a warm topology cache and returns None on a miss, so the caller falls
+    back (warn, or resolve live after connecting).  With ``fetch=True`` any fetch
+    or parse problem fails open to the static default.
     """
 
     from .eligibility import AccessVerdict
@@ -1662,14 +1715,14 @@ def _resolve_gpu_partition(ctx: Any, client: Any, cluster: str, resources: dict)
     if not gpus or ":" not in gpus:
         return default_partition
     want_type = gpus.split(":")[0]
-    try:
-        offered = _partition_gpu_types(client.availability())
-    except Exception:
-        # Fail open: a convenience selection must never block a real submit on a
-        # fetch or parse problem.  Fall back to the static default and let the
-        # normal path (and its remote errors) proceed exactly as before.
-        # Exception, never BaseException, so a Ctrl-C still stops.  (Precedent:
-        # `_eligibility_snapshot`.)
+    offered = _topology_snapshot(ctx, client, cluster, fetch=fetch)
+    if offered is None:
+        if not fetch:
+            # Offline with a cold topology cache: cannot resolve now; the caller
+            # warns (dry-run) or resolves live after connecting.
+            return None
+        # A live fetch or parse problem: fail open to the static default and let
+        # the normal path (and its remote errors) proceed exactly as before.
         info(f"--gpus given without --partition; using {default_partition!r}")
         return default_partition
     # 1. The static default genuinely offers the type -> keep it unchanged.
@@ -1686,7 +1739,7 @@ def _resolve_gpu_partition(ctx: Any, client: Any, cluster: str, resources: dict)
         for name in sorted(name for name, types in offered.items() if want_type in types)
         if _is_dedicated_gpu_partition(name)
     ]
-    snapshot = _eligibility_snapshot(ctx, client, cluster)
+    snapshot = _eligibility_snapshot(ctx, client, cluster, fetch=fetch)
     allowed = [
         name
         for name in dedicated
@@ -1754,20 +1807,32 @@ def _submit_job(
         )
 
     if dry_run:
-        # A dry run is offline by contract -- it must not connect -- so it cannot
-        # resolve the cluster's GPU topology.  Rather than silently print a
-        # possibly-unschedulable `--partition=<default> --gpus=<type>` command,
-        # warn when a specific GPU type was requested without an explicit
-        # partition, and point at the ways to resolve it.
+        # A dry run is offline by contract -- it must not connect.  Resolve the
+        # GPU partition from a WARM topology cache when one exists (fetch=False
+        # touches only the local cache, so no client or connection is needed and
+        # there is no side effect), so the printed command matches what a real
+        # submit would do.  On a cold cache it cannot resolve offline, so it warns
+        # and prints the static default instead.
         gpus = resources.get("gpus")
         if gpus and ":" in gpus and not partition_explicit:
-            info(
-                f"--dry-run stays offline and cannot pick a partition for "
-                f"--gpus {gpus}; the command below uses "
-                f"{resources['partition']!r}, which may not offer "
-                f"{gpus.split(':')[0]} — pass -p PARTITION, or run "
-                f"`hpc-alloc avail --for -G {gpus}` first"
-            )
+            try:
+                resolved = _resolve_gpu_partition(
+                    ctx, None, cluster, resources, fetch=False
+                )
+            except ConfigInvalid:
+                # An offline-provable impossible or ambiguous pick: keep dry-run's
+                # always-prints contract and fall back to the warning below.
+                resolved = None
+            if resolved is not None:
+                resources["partition"] = resolved
+            else:
+                info(
+                    f"--dry-run stays offline; with no cached topology it cannot "
+                    f"pick a partition for --gpus {gpus}. The command below uses "
+                    f"{resources['partition']!r}, which may not offer "
+                    f"{gpus.split(':')[0]} — pass -p PARTITION, or run "
+                    f"`hpc-alloc avail --for -G {gpus}` first"
+                )
         print(build_spec(f"dryrun-{operation_id[:12]}").command())
         return None
     transport, client = _services(ctx, paths, entrypoint, cluster)
@@ -1777,7 +1842,14 @@ def _submit_job(
     # Fails open to the static default; may refuse an ambiguous/impossible pick.
     if not partition_explicit and resources.get("gpus"):
         resources["partition"] = _resolve_gpu_partition(ctx, client, cluster, resources)
-    _preflight_partition_eligibility(ctx, client, cluster, resources["partition"])
+    # Access check from cache only (fetch=False): the typed-GPU resolve just above
+    # warms it, and `connect` warms it otherwise, so a provably-ineligible
+    # partition is refused here -- before name reconciliation, preparation, and
+    # the submission itself, and without spending a round-trip.  A cold cache
+    # no-ops and the authoritative submit (Layer 1) stays the real gate.
+    _preflight_partition_eligibility(
+        ctx, client, cluster, resources["partition"], fetch=False
+    )
     owner_id = ctx.state.get_or_create_machine_id(host)
     spec = build_spec(owner_id)
     _reconcile_name_holder(ctx, client, cluster, kind, logical_name)
