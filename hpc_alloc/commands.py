@@ -1327,6 +1327,78 @@ def _reconcile_name_holder(
         return
 
 
+_ELIGIBILITY_CACHE_KEY = "partition_eligibility"
+
+
+def _eligibility_snapshot(ctx: Any, client: Any, cluster: str) -> tuple[Any, dict] | None:
+    """Cached (user access, partition rules) for `cluster`, or None to fall open.
+
+    Access rules change rarely, so this is cached per cluster for an hour.  Any
+    fetch or parse failure returns None, so the pre-flight never blocks a real
+    submission on missing or malformed data.
+    """
+
+    from datetime import datetime, timedelta, timezone
+
+    from .eligibility import parse_partition_rules, parse_user_access
+
+    cached = ctx.state.get_cluster_cache(cluster, _ELIGIBILITY_CACHE_KEY)
+    if not (
+        isinstance(cached, dict)
+        and isinstance(cached.get("user"), str)
+        and isinstance(cached.get("partitions"), str)
+    ):
+        try:
+            user_text = client.user_access(ctx.config.identity.netid)
+            partition_text = client.partition_access()
+        except Exception:
+            # Best-effort: eligibility is a convenience gate that must never break
+            # a submission.  Any fetch problem -- transport loss, a scheduler
+            # without the accounting tool, an unexpected reply -- falls open to
+            # the normal submit path, which still catches a genuine access error
+            # remotely.  Exception, never BaseException, so a Ctrl-C still stops.
+            return None
+        cached = {"user": user_text, "partitions": partition_text}
+        ctx.state.set_cluster_cache(
+            cluster,
+            _ELIGIBILITY_CACHE_KEY,
+            cached,
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+    access = parse_user_access(cached["user"])
+    rules = parse_partition_rules(cached["partitions"])
+    if access is None or not rules:
+        return None
+    return access, rules
+
+
+def _preflight_partition_eligibility(
+    ctx: Any, client: Any, cluster: str, partition: str
+) -> None:
+    """Refuse a partition the account/QOS/groups cannot use, before any dispatch.
+
+    Fails open: an unknown partition or missing eligibility data proceeds to the
+    normal submit, which still catches a genuine access error remotely (as an
+    ambiguous submission to be recovered).
+    """
+
+    from .eligibility import partition_eligibility
+
+    snapshot = _eligibility_snapshot(ctx, client, cluster)
+    if snapshot is None:
+        return
+    access, rules = snapshot
+    rule = rules.get(partition)
+    if rule is None:
+        return
+    eligible, reason = partition_eligibility(rule, access)
+    if not eligible:
+        raise ConfigInvalid(
+            f"partition {partition!r} on {cluster} is not available to your "
+            f"account/QOS: {reason}; no submission attempted"
+        )
+
+
 def _submit_job(
     *,
     ctx: Any,
@@ -1375,6 +1447,7 @@ def _submit_job(
         return None
     transport, client = _services(ctx, paths, entrypoint, cluster)
     transport.bootstrap(cluster, AuthMode.INTERACTIVE_BOOTSTRAP)
+    _preflight_partition_eligibility(ctx, client, cluster, resources["partition"])
     _reconcile_name_holder(ctx, client, cluster, kind, logical_name)
     # Retry-safe filesystem preparation is deliberately outside the durable
     # scheduler mutation boundary.  It cannot submit a job, so any failure
