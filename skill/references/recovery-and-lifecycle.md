@@ -27,7 +27,7 @@ For accounting and accounting-based recovery, request full-width identity column
 
 ## Reconcile submission uncertainty
 
-Treat submission directory preparation as idempotent and separate from the batch mutation. After the one `sbatch` call is dispatched, accept only return code 0 plus one trusted scalar job ID as acknowledgement; treat every other reply as ambiguous without retry.
+Treat submission directory preparation as idempotent and separate from the batch mutation. After the one `sbatch` call is dispatched, accept only return code 0 plus one trusted scalar job ID as acknowledgement; treat every other reply as ambiguous without retry — except the scheduler's own pre-dispatch rejection banner (`Batch job submission failed:` for a bad account, QOS, partition, constraint, or submit limit), which proves no job was created and closes the operation as a clean `SUBMIT_FAILED`, not an ambiguous mutation to reconcile.
 
 If interruption rolls back the local reservation before its transaction commits, emit no recovery guidance because no operation exists and the remote submit was never entered. If interruption or transport loss occurs after dispatch may have begun, preserve the normal interrupt or error result, print `do not resubmit`, and use the exact recovery command; include a trusted job ID when the remote acknowledgement arrived but the local write failed.
 
