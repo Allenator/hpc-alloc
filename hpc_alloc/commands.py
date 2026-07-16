@@ -793,7 +793,12 @@ def _resource_values(args: Any, config: Config, cluster: str) -> dict[str, Any]:
             cluster,
             fallback=DEFAULT_GPU_PARTITION if gpus else DEFAULT_PARTITION,
         )
-        if gpus and not getattr(args, "probe", False):
+        # A bare-count request (`-G 2`) keeps the static default and announces it
+        # here.  A specific-type request (`-G h200:1`) defers its message: the
+        # real submit path re-selects a partition that actually offers the type
+        # (and the dry-run path warns it cannot), so announcing the static
+        # default now would be misleading.
+        if gpus and ":" not in gpus and not getattr(args, "probe", False):
             info(f"--gpus given without --partition; using {partition!r}")
     walltime = getattr(args, "time", None)
     if walltime is None:
@@ -1004,8 +1009,39 @@ def _avail_probe(args: Any, ctx: Any, client: Any, cluster: str) -> int:
         _preflight_partition_eligibility(ctx, client, cluster, resources["partition"])
         candidates = [resources["partition"]]
     else:
+        gpu_types = _partition_gpu_types(client.availability())
+        gpus = resources.get("gpus")
+        want_type = gpus.split(":")[0] if gpus and ":" in gpus else None
+        if want_type is not None and not any(
+            want_type in types for types in gpu_types.values()
+        ):
+            # A specific type that no partition offers is almost certainly a typo
+            # or a retired type.  Say so explicitly, so it reads differently from
+            # "the type exists but nothing is free right now" (empty probes).
+            known = sorted({kind for types in gpu_types.values() for kind in types})
+            message = (
+                f"unknown or unavailable GPU type {want_type!r}; "
+                f"known: {', '.join(known) if known else '(none)'}"
+            )
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "for": {
+                                key: resources.get(key)
+                                for key in ("time", "cpus", "mem", "gpus", "constraint")
+                            },
+                            "probes": [],
+                            "error": message,
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                info(message)
+            return 0
         candidates, capped = _probe_candidates(
-            ctx, client, cluster, resources, _partition_gpu_types(client.availability())
+            ctx, client, cluster, resources, gpu_types
         )
     ranked = rank_probes(
         [
@@ -1535,6 +1571,74 @@ def _preflight_partition_eligibility(
         )
 
 
+def _is_dedicated_gpu_partition(name: str) -> bool:
+    """A steady partition, excluding preemptible (`scavenge*`) and short (`*devel`)."""
+
+    return not (name.startswith("scavenge") or name.endswith("devel"))
+
+
+def _resolve_gpu_partition(ctx: Any, client: Any, cluster: str, resources: dict) -> str:
+    """Steer a typed GPU request to a partition that actually offers that type.
+
+    Only the real submit path calls this, and only when `-G TYPE:N` was given
+    without an explicit `-p` (the partition defaulted).  A bare count (`-G 2`)
+    or a plain default keeps the static default unchanged.
+
+    Auto-selects when the choice is unambiguous, otherwise refuses locally with
+    guidance rather than dispatching a request the scheduler cannot satisfy.
+    Fails open: any availability fetch or parse problem returns the static
+    default, so the submit then behaves exactly as it did before.
+    """
+
+    from .eligibility import partition_eligibility
+
+    gpus = resources.get("gpus")
+    default_partition = resources["partition"]
+    if not gpus or ":" not in gpus:
+        return default_partition
+    want_type = gpus.split(":")[0]
+    try:
+        offered = _partition_gpu_types(client.availability())
+    except Exception:
+        # Fail open: a convenience selection must never block a real submit on a
+        # fetch or parse problem.  Fall back to the static default and let the
+        # normal path (and its remote errors) proceed exactly as before.
+        # Exception, never BaseException, so a Ctrl-C still stops.  (Precedent:
+        # `_eligibility_snapshot`.)
+        info(f"--gpus given without --partition; using {default_partition!r}")
+        return default_partition
+    # 1. The static default genuinely offers the type -> keep it unchanged.
+    if want_type in offered.get(default_partition, set()):
+        info(f"--gpus given without --partition; using {default_partition!r}")
+        return default_partition
+    # 2/3. Eligible, dedicated partitions that offer the type.
+    snapshot = _eligibility_snapshot(ctx, client, cluster)
+    candidates: list[str] = []
+    for name in sorted(name for name, types in offered.items() if want_type in types):
+        if not _is_dedicated_gpu_partition(name):
+            continue
+        if snapshot is not None:
+            access, rules = snapshot
+            rule = rules.get(name)
+            if rule is not None and not partition_eligibility(rule, access)[0]:
+                continue
+        candidates.append(name)
+    if len(candidates) == 1:
+        chosen = candidates[0]
+        info(f"--gpus {gpus} given without --partition; using {chosen!r}")
+        return chosen
+    if len(candidates) > 1:
+        raise ConfigInvalid(
+            f"multiple eligible partitions offer {want_type} GPUs on {cluster}: "
+            f"{', '.join(candidates)}; choose one with -p PARTITION or see "
+            f"`hpc-alloc avail --for -G {gpus}`"
+        )
+    raise ConfigInvalid(
+        f"no eligible partition offers {want_type} GPUs on {cluster}; check the "
+        f"type, run `hpc-alloc avail --for -G {gpus}`, or pass -p PARTITION"
+    )
+
+
 def _submit_job(
     *,
     ctx: Any,
@@ -1547,6 +1651,7 @@ def _submit_job(
     wrap: str,
     logfile_template: str,
     dry_run: bool,
+    partition_explicit: bool = False,
 ) -> Any:
     from .slurm import SubmissionSpec
     from .ssh import AuthMode
@@ -1556,34 +1661,55 @@ def _submit_job(
     operation_id = uuid.uuid4().hex
     logfile = logfile_template.format(operation_id=operation_id)
     host = machine_host()
-    owner_id = (
-        f"dryrun-{operation_id[:12]}"
-        if dry_run
-        else ctx.state.get_or_create_machine_id(host)
-    )
-    spec = SubmissionSpec(
-        operation_id=operation_id,
-        owner_id=owner_id,
-        owner_host=host,
-        kind=kind,
-        logical_name=logical_name,
-        partition=resources["partition"],
-        walltime=resources["time"],
-        cpus=resources["cpus"],
-        mem=resources.get("mem"),
-        gpus=resources.get("gpus"),
-        constraint=resources.get("constraint"),
-        chdir=resources.get("chdir"),
-        wrap=wrap,
-        logfile=logfile,
-        log_directory=REMOTE_LOG_DIR,
-    )
+
+    def build_spec(owner_id: str) -> SubmissionSpec:
+        # Read `resources["partition"]` at call time so the spec embeds the GPU
+        # partition after it has been corrected on the real path below.
+        return SubmissionSpec(
+            operation_id=operation_id,
+            owner_id=owner_id,
+            owner_host=host,
+            kind=kind,
+            logical_name=logical_name,
+            partition=resources["partition"],
+            walltime=resources["time"],
+            cpus=resources["cpus"],
+            mem=resources.get("mem"),
+            gpus=resources.get("gpus"),
+            constraint=resources.get("constraint"),
+            chdir=resources.get("chdir"),
+            wrap=wrap,
+            logfile=logfile,
+            log_directory=REMOTE_LOG_DIR,
+        )
+
     if dry_run:
-        print(spec.command())
+        # A dry run is offline by contract -- it must not connect -- so it cannot
+        # resolve the cluster's GPU topology.  Rather than silently print a
+        # possibly-unschedulable `--partition=<default> --gpus=<type>` command,
+        # warn when a specific GPU type was requested without an explicit
+        # partition, and point at the ways to resolve it.
+        gpus = resources.get("gpus")
+        if gpus and ":" in gpus and not partition_explicit:
+            info(
+                f"--dry-run stays offline and cannot pick a partition for "
+                f"--gpus {gpus}; the command below uses "
+                f"{resources['partition']!r}, which may not offer "
+                f"{gpus.split(':')[0]} — pass -p PARTITION, or run "
+                f"`hpc-alloc avail --for -G {gpus}` first"
+            )
+        print(build_spec(f"dryrun-{operation_id[:12]}").command())
         return None
     transport, client = _services(ctx, paths, entrypoint, cluster)
     transport.bootstrap(cluster, AuthMode.INTERACTIVE_BOOTSTRAP)
+    # With the transport up, steer a typed `-G TYPE:N` request that was given
+    # without an explicit `-p` to a partition that actually offers that type.
+    # Fails open to the static default; may refuse an ambiguous/impossible pick.
+    if not partition_explicit and resources.get("gpus"):
+        resources["partition"] = _resolve_gpu_partition(ctx, client, cluster, resources)
     _preflight_partition_eligibility(ctx, client, cluster, resources["partition"])
+    owner_id = ctx.state.get_or_create_machine_id(host)
+    spec = build_spec(owner_id)
     _reconcile_name_holder(ctx, client, cluster, kind, logical_name)
     # Retry-safe filesystem preparation is deliberately outside the durable
     # scheduler mutation boundary.  It cannot submit a job, so any failure
@@ -1900,6 +2026,7 @@ def cmd_up(
         wrap=_sleeper_command(resources["idle_timeout"]),
         logfile_template=f"{REMOTE_LOG_DIR}/alloc-{{operation_id}}.log",
         dry_run=args.dry_run,
+        partition_explicit=getattr(args, "partition", None) is not None,
     )
     if job is None:
         return 0
@@ -2242,6 +2369,7 @@ def cmd_run(
         wrap=wrap,
         logfile_template=logfile,
         dry_run=args.dry_run,
+        partition_explicit=getattr(args, "partition", None) is not None,
     )
     if job is None:
         return 0
