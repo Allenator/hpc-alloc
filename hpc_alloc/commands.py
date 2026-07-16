@@ -1735,9 +1735,14 @@ _DEFAULT_NONDEDICATED_GLOBS = ("scavenge*", "*devel")
 def _is_dedicated_gpu_partition(
     name: str, globs: tuple[str, ...] = _DEFAULT_NONDEDICATED_GLOBS
 ) -> bool:
-    """A steady partition -- not matched by any non-dedicated (preemptible/short) glob."""
+    """A steady partition -- not matched by any non-dedicated (preemptible/short) glob.
 
-    return not any(fnmatch.fnmatch(name, glob) for glob in globs)
+    Uses ``fnmatchcase`` so matching is case-sensitive on every platform, since
+    Slurm partition names are case-sensitive (plain ``fnmatch`` would fold case
+    on Windows).
+    """
+
+    return not any(fnmatch.fnmatchcase(name, glob) for glob in globs)
 
 
 def _nondedicated_globs(ctx: Any, cluster: str) -> tuple[str, ...]:
