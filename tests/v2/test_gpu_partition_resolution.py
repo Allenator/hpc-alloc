@@ -131,7 +131,7 @@ class ResolveGpuPartitionTests(unittest.TestCase):
 
     def test_no_partition_offers_type_is_refused(self) -> None:
         with self.assertRaisesRegex(
-            ConfigInvalid, r"no eligible partition offers notagpu GPUs on bouchet"
+            ConfigInvalid, r"no partition offers notagpu GPUs on bouchet"
         ):
             self._resolve(_resources("notagpu:1"))
 
@@ -143,9 +143,21 @@ class ResolveGpuPartitionTests(unittest.TestCase):
         avail += "\ngpu_devel    mix host gpu:l40s:4 gpu:l40s:0 0/4/0/4"
         client = FakeClient(availability=avail)
         with self.assertRaisesRegex(
-            ConfigInvalid, r"no eligible partition offers l40s GPUs on bouchet"
+            ConfigInvalid, r"no partition offers l40s GPUs on bouchet"
         ):
             self._resolve(_resources("l40s:1"), client=client)
+
+    def test_single_ineligible_dedicated_partition_is_still_selected(self) -> None:
+        # h200x is offered by exactly one dedicated partition, priority_gpu, which
+        # the user is ineligible for.  Eligibility is a tie-breaker, not a gate: a
+        # lone candidate is still auto-selected so the authoritative submit can
+        # reject the access error cleanly, instead of refusing here on a mirror.
+        avail = "priority_gpu mix host gpu:h200x:8 gpu:h200x:0 0/8/0/8"
+        chosen, stderr = self._resolve(
+            _resources("h200x:1"), client=FakeClient(availability=avail)
+        )
+        self.assertEqual(chosen, "priority_gpu")
+        self.assertIn("priority_gpu", stderr)
 
     def test_multiple_dedicated_eligible_partitions_are_refused(self) -> None:
         # Two steady, eligible partitions offer b200: refuse and list both.
@@ -161,7 +173,7 @@ class ResolveGpuPartitionTests(unittest.TestCase):
 
         client = TwoB200Client(availability=avail)
         with self.assertRaisesRegex(
-            ConfigInvalid, r"multiple eligible partitions offer b200.*gpu_b200, gpu_b200x"
+            ConfigInvalid, r"multiple partitions offer b200.*gpu_b200, gpu_b200x"
         ):
             self._resolve(_resources("b200:1"), client=client)
 

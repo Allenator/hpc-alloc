@@ -930,15 +930,12 @@ def cmd_partitions(
     keys = ["partition", "avail", "timelimit", "nodes", "cpus", "memory", "gres", "features"]
     rows = [dict(zip(keys, row)) for row in parsed[1:] if len(row) == len(keys)]
     # Annotate each partition with local access eligibility (best effort; None
-    # when the data is unavailable or the partition is unknown).
-    from .eligibility import partition_eligibility
-
+    # when the data is unavailable, the partition is unknown, or access is not
+    # provable either way).
     snapshot = _eligibility_snapshot(ctx, client, cluster)
-    access, part_rules = snapshot if snapshot is not None else (None, {})
     for row in rows:
-        rule = part_rules.get(row["partition"].rstrip("*"))
-        row["eligible"] = (
-            None if access is None or rule is None else partition_eligibility(rule, access)[0]
+        row["eligible"] = _eligible_flag(
+            _partition_verdict(snapshot, row["partition"].rstrip("*"))
         )
     if args.json:
         print(json.dumps(rows, indent=2))
@@ -983,18 +980,17 @@ def _probe_candidates(
 ) -> tuple[list[str], bool]:
     """Eligible partitions that offer the requested resources; (candidates, capped)."""
 
-    from .eligibility import partition_eligibility
+    from .eligibility import AccessVerdict
 
     snapshot = _eligibility_snapshot(ctx, client, cluster)
     gpus = resources.get("gpus")
     want_type = gpus.split(":")[0] if gpus and ":" in gpus else None
     candidates: list[str] = []
     for name, types in sorted(gpu_types.items()):
-        if snapshot is not None:
-            access, rules = snapshot
-            rule = rules.get(name)
-            if rule is not None and not partition_eligibility(rule, access)[0]:
-                continue
+        # Advisory: exclude only a proven DENY; UNKNOWN partitions are still
+        # probed, so idle-but-unresolved access never hides a usable partition.
+        if _partition_verdict(snapshot, name) is AccessVerdict.DENY:
+            continue
         if gpus and (not types or (want_type is not None and want_type not in types)):
             continue
         candidates.append(name)
@@ -1160,17 +1156,12 @@ def cmd_avail(
         for gpu in part["gpus"].values():
             gpu["free"] = gpu["total"] - gpu["used"]
     # Annotate each partition with local access eligibility, exactly as
-    # `partitions` does (best effort; None when the data is unavailable or the
-    # partition is unknown), so idle capacity is not read as "yours to use".
-    from .eligibility import partition_eligibility
-
+    # `partitions` does (best effort; None when the data is unavailable, the
+    # partition is unknown, or access is not provable), so idle capacity is not
+    # read as "yours to use".
     snapshot = _eligibility_snapshot(ctx, client, cluster)
-    access, part_rules = snapshot if snapshot is not None else (None, {})
     for name, part in payload.items():
-        rule = part_rules.get(name)
-        part["eligible"] = (
-            None if access is None or rule is None else partition_eligibility(rule, access)[0]
-        )
+        part["eligible"] = _eligible_flag(_partition_verdict(snapshot, name))
     if args.json:
         print(json.dumps({"partitions": payload}, indent=2))
         return 0
@@ -1529,69 +1520,116 @@ def _reconcile_name_holder(
 _ELIGIBILITY_CACHE_KEY = "partition_eligibility"
 
 
-def _eligibility_snapshot(ctx: Any, client: Any, cluster: str) -> tuple[Any, dict] | None:
+def _eligibility_snapshot(
+    ctx: Any, client: Any, cluster: str, *, fetch: bool = True
+) -> tuple[Any, dict] | None:
     """Cached (user access, partition rules) for `cluster`, or None to fall open.
 
-    Access rules change rarely, so this is cached per cluster for an hour.  Any
-    fetch or parse failure returns None, so the pre-flight never blocks a real
-    submission on missing or malformed data.
+    Access rules change rarely, so a usable snapshot is cached per cluster for a
+    few hours (matching the login master's lifetime, so a `connect`-warmed cache
+    stays warm).  Every failure path returns None, so the accelerator never
+    blocks a submission on missing, malformed, or uncached data:
+
+    * the whole body is guarded, so even a corrupt cache row falls open;
+    * a fresh read that parses to nothing is NOT cached, so a transient empty
+      reply cannot poison the cache for the whole TTL -- the next call refetches;
+    * with ``fetch=False`` a cache miss returns None without contacting the
+      cluster, for the pre-connection check that must stay offline.
     """
 
     from datetime import datetime, timedelta, timezone
 
     from .eligibility import parse_partition_rules, parse_user_access
 
-    cached = ctx.state.get_cluster_cache(cluster, _ELIGIBILITY_CACHE_KEY)
-    if not (
-        isinstance(cached, dict)
-        and isinstance(cached.get("user"), str)
-        and isinstance(cached.get("partitions"), str)
-    ):
-        try:
+    try:
+        cached = ctx.state.get_cluster_cache(cluster, _ELIGIBILITY_CACHE_KEY)
+        from_fetch = False
+        if (
+            isinstance(cached, dict)
+            and isinstance(cached.get("user"), str)
+            and isinstance(cached.get("partitions"), str)
+        ):
+            user_text, partition_text = cached["user"], cached["partitions"]
+        elif fetch:
             user_text = client.user_access(ctx.config.identity.netid)
             partition_text = client.partition_access()
-        except Exception:
-            # Best-effort: eligibility is a convenience gate that must never break
-            # a submission.  Any fetch problem -- transport loss, a scheduler
-            # without the accounting tool, an unexpected reply -- falls open to
-            # the normal submit path, which still catches a genuine access error
-            # remotely.  Exception, never BaseException, so a Ctrl-C still stops.
+            from_fetch = True
+        else:
             return None
-        cached = {"user": user_text, "partitions": partition_text}
-        ctx.state.set_cluster_cache(
-            cluster,
-            _ELIGIBILITY_CACHE_KEY,
-            cached,
-            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
-        )
-    access = parse_user_access(cached["user"])
-    rules = parse_partition_rules(cached["partitions"])
-    if access is None or not rules:
+        access = parse_user_access(user_text)
+        rules = parse_partition_rules(partition_text)
+        if access is None or not rules:
+            # Unusable (no associations, or no partition rules).  Never cache a
+            # fresh-but-empty read: that would silently disable the accelerator
+            # for the whole TTL even after the scheduler recovers.
+            return None
+        if from_fetch:
+            ctx.state.set_cluster_cache(
+                cluster,
+                _ELIGIBILITY_CACHE_KEY,
+                {"user": user_text, "partitions": partition_text},
+                expires_at=datetime.now(timezone.utc) + timedelta(hours=4),
+            )
+        return access, rules
+    except Exception:
+        # Best-effort: eligibility is a convenience accelerator that must never
+        # break a submission.  Any problem -- transport loss, a scheduler without
+        # the accounting tool, an unexpected reply, a corrupt cache row -- falls
+        # open to the authoritative submit.  Exception, not BaseException, so a
+        # Ctrl-C still stops.
         return None
-    return access, rules
+
+
+def _partition_verdict(snapshot: tuple[Any, dict] | None, name: str) -> Any:
+    """AccessVerdict for one partition from an eligibility snapshot.
+
+    UNKNOWN when the snapshot is absent or the partition has no rule, so absent
+    data is uniformly treated as "do not block, do not claim eligible".
+    """
+
+    from .eligibility import AccessVerdict, partition_eligibility
+
+    if snapshot is None:
+        return AccessVerdict.UNKNOWN
+    access, rules = snapshot
+    rule = rules.get(name)
+    if rule is None:
+        return AccessVerdict.UNKNOWN
+    return partition_eligibility(rule, access)[0]
+
+
+def _eligible_flag(verdict: Any) -> bool | None:
+    """Map an AccessVerdict to the True/False/None the JSON `eligible` field uses."""
+
+    from .eligibility import AccessVerdict
+
+    if verdict is AccessVerdict.UNKNOWN:
+        return None
+    return verdict is AccessVerdict.ALLOW
 
 
 def _preflight_partition_eligibility(
-    ctx: Any, client: Any, cluster: str, partition: str
+    ctx: Any, client: Any, cluster: str, partition: str, *, fetch: bool = True
 ) -> None:
-    """Refuse a partition the account/QOS/groups cannot use, before any dispatch.
+    """Refuse a partition the account/QOS/groups PROVABLY cannot use.
 
-    Fails open: an unknown partition or missing eligibility data proceeds to the
-    normal submit, which still catches a genuine access error remotely (as an
-    ambiguous submission to be recovered).
+    The Layer-0 accelerator: it raises only on a proven ``DENY`` and falls open
+    on ALLOW, UNKNOWN, or absent data, so the authoritative submit stays the real
+    gate.  With ``fetch=False`` it consults only a warm cache, for the
+    pre-connection check that must not contact the cluster.
     """
 
-    from .eligibility import partition_eligibility
+    from .eligibility import AccessVerdict, partition_eligibility
 
-    snapshot = _eligibility_snapshot(ctx, client, cluster)
+    snapshot = _eligibility_snapshot(ctx, client, cluster, fetch=fetch)
     if snapshot is None:
         return
     access, rules = snapshot
     rule = rules.get(partition)
     if rule is None:
         return
-    eligible, reason = partition_eligibility(rule, access)
-    if not eligible:
+    verdict, reason = partition_eligibility(rule, access)
+    if verdict is AccessVerdict.DENY:
         raise ConfigInvalid(
             f"partition {partition!r} on {cluster} is not available to your "
             f"account/QOS: {reason}; no submission attempted"
@@ -1617,7 +1655,7 @@ def _resolve_gpu_partition(ctx: Any, client: Any, cluster: str, resources: dict)
     default, so the submit then behaves exactly as it did before.
     """
 
-    from .eligibility import partition_eligibility
+    from .eligibility import AccessVerdict
 
     gpus = resources.get("gpus")
     default_partition = resources["partition"]
@@ -1638,30 +1676,35 @@ def _resolve_gpu_partition(ctx: Any, client: Any, cluster: str, resources: dict)
     if want_type in offered.get(default_partition, set()):
         info(f"--gpus given without --partition; using {default_partition!r}")
         return default_partition
-    # 2/3. Eligible, dedicated partitions that offer the type.
+    # 2/3. Dedicated partitions that offer the type.  Eligibility is a
+    # tie-breaker, never a gate: it narrows the set toward partitions we cannot
+    # prove ineligible, but if that would leave nothing it is dropped, so an
+    # eligibility gap can never turn an otherwise-single choice into a refusal --
+    # the authoritative submit rejects a real access error instead.
+    dedicated = [
+        name
+        for name in sorted(name for name, types in offered.items() if want_type in types)
+        if _is_dedicated_gpu_partition(name)
+    ]
     snapshot = _eligibility_snapshot(ctx, client, cluster)
-    candidates: list[str] = []
-    for name in sorted(name for name, types in offered.items() if want_type in types):
-        if not _is_dedicated_gpu_partition(name):
-            continue
-        if snapshot is not None:
-            access, rules = snapshot
-            rule = rules.get(name)
-            if rule is not None and not partition_eligibility(rule, access)[0]:
-                continue
-        candidates.append(name)
+    allowed = [
+        name
+        for name in dedicated
+        if _partition_verdict(snapshot, name) is not AccessVerdict.DENY
+    ]
+    candidates = allowed or dedicated
     if len(candidates) == 1:
         chosen = candidates[0]
         info(f"--gpus {gpus} given without --partition; using {chosen!r}")
         return chosen
     if len(candidates) > 1:
         raise ConfigInvalid(
-            f"multiple eligible partitions offer {want_type} GPUs on {cluster}: "
+            f"multiple partitions offer {want_type} GPUs on {cluster}: "
             f"{', '.join(candidates)}; choose one with -p PARTITION or see "
             f"`hpc-alloc avail --for -G {gpus}`"
         )
     raise ConfigInvalid(
-        f"no eligible partition offers {want_type} GPUs on {cluster}; check the "
+        f"no partition offers {want_type} GPUs on {cluster}; check the "
         f"type, run `hpc-alloc avail --for -G {gpus}`, or pass -p PARTITION"
     )
 
