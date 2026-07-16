@@ -92,10 +92,20 @@ class RuntimeContext:
 
         if command == "dry-run":
             cluster_name = config.resolve_cluster(explicit_cluster)
+            # A dry run must not initialize or mutate the journal, but it may READ
+            # the disposable per-cluster caches (GPU topology, access rules) to
+            # resolve a typed GPU partition offline.  Open an already-existing
+            # database WITHOUT initializing it -- never creating one -- so the read
+            # stays journal-free; a missing database simply leaves the caches cold.
+            dry_state = (
+                StateRepository(app_paths.state_db)
+                if Path(app_paths.state_db).exists()
+                else None
+            )
             return cls(
                 paths=app_paths,
                 config=config,
-                state=None,
+                state=dry_state,
                 cluster_name=cluster_name,
                 cluster=config.clusters[cluster_name],
             )
