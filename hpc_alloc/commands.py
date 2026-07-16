@@ -1586,7 +1586,8 @@ def _eligibility_snapshot(
     * a fresh read that parses to nothing is NOT cached, so a transient empty
       reply cannot poison the cache for the whole TTL -- the next call refetches;
     * with ``fetch=False`` a cache miss returns None without contacting the
-      cluster, for the pre-connection check that must stay offline.
+      cluster, for a cache-only check (the submit access pre-flight, warmed by
+      `connect`) and for the offline dry-run resolve.
     """
 
     from datetime import datetime, timedelta, timezone
@@ -1705,8 +1706,9 @@ def _preflight_partition_eligibility(
 
     The Layer-0 accelerator: it raises only on a proven ``DENY`` and falls open
     on ALLOW, UNKNOWN, or absent data, so the authoritative submit stays the real
-    gate.  With ``fetch=False`` it consults only a warm cache, for the
-    pre-connection check that must not contact the cluster.
+    gate.  The submit path calls it with ``fetch=False`` so it consults only a
+    warm cache (warmed by `connect`, or by the typed-GPU resolve that ran just
+    before it) and never spends a round-trip; a cold cache simply no-ops.
     """
 
     from .eligibility import AccessVerdict, partition_eligibility
@@ -1765,11 +1767,11 @@ def _resolve_gpu_partition(
     default unchanged.
 
     Auto-selects when the choice is unambiguous, otherwise refuses locally with
-    guidance rather than dispatching a request the scheduler cannot satisfy.
-    With ``fetch=False`` (dry-run, or the offline pre-submit resolve) it uses
-    only a warm topology cache and returns None on a miss, so the caller falls
-    back (warn, or resolve live after connecting).  With ``fetch=True`` any fetch
-    or parse problem fails open to the static default.
+    guidance rather than dispatching a request the scheduler cannot satisfy.  The
+    real submit path calls it with ``fetch=True``, so a topology fetch or parse
+    problem fails open to the static default.  ``--dry-run`` calls it with
+    ``fetch=False``, so it uses only a warm topology cache and returns None on a
+    miss (the dry run then warns to pass ``-p``).
     """
 
     from .eligibility import AccessVerdict
@@ -1782,8 +1784,8 @@ def _resolve_gpu_partition(
     offered = _topology_snapshot(ctx, client, cluster, fetch=fetch)
     if offered is None:
         if not fetch:
-            # Offline with a cold topology cache: cannot resolve now; the caller
-            # warns (dry-run) or resolves live after connecting.
+            # Offline (dry-run) with a cold topology cache: cannot resolve now,
+            # so the caller warns and prints the static default.
             return None
         # A live fetch or parse problem: fail open to the static default and let
         # the normal path (and its remote errors) proceed exactly as before.
