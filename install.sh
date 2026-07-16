@@ -34,6 +34,7 @@ runtime_modules=(
   hpc_alloc.output
   hpc_alloc.paths
   hpc_alloc.retry
+  hpc_alloc.schedulability
   hpc_alloc.selectors
   hpc_alloc.slurm
   hpc_alloc.ssh

@@ -1296,6 +1296,45 @@ class SlurmClient:
             auth=auth,
         )
 
+    def schedule_probe(
+        self,
+        *,
+        partition: str,
+        walltime: str,
+        cpus: int,
+        mem: str | None = None,
+        gpus: str | None = None,
+        constraint: str | None = None,
+        auth: AuthMode = AuthMode.NONINTERACTIVE,
+    ) -> str:
+        """Raw scheduler dry-run output for a hypothetical request (no side effect).
+
+        Asks the scheduler when the request would start, without submitting a
+        job; the reported id is discarded.  The pipeline always exits 0 so a
+        rejection, or a scheduler without dry-run support, is captured as text
+        rather than raised as a transport error.  Built with the same flags as a
+        real submission so the estimate reflects the same request.
+        """
+
+        argv = [
+            "sbatch",
+            "--test-only",
+            f"--time={walltime}",
+            "--nodes=1",
+            "--ntasks=1",
+            f"--cpus-per-task={int(cpus)}",
+            f"--partition={partition}",
+        ]
+        if mem:
+            argv.append(f"--mem={mem}")
+        if gpus:
+            argv.append(f"--gpus={gpus}")
+        if constraint:
+            argv.append(f"--constraint={constraint}")
+        argv += ["--wrap", "true"]
+        command = f"{shlex.join(argv)} 2>&1 || true"
+        return self._text_read(command, "schedule probe", auth=auth)
+
 
 __all__ = [
     "AccountingRecord",
