@@ -8,6 +8,7 @@ from hpc_alloc.errors import (
     HostKeyChanged,
     JobIdReused,
     RemoteCommandFailed,
+    SubmissionRejected,
     TransportLost,
 )
 from hpc_alloc.models import JobKind, JobRef
@@ -156,6 +157,36 @@ class SlurmMutationTests(unittest.TestCase):
 
         script = StrictScript([ExpectedCall("run", result=malformed_ack)])
         with self.assertRaisesRegex(AmbiguousSubmission, "untrustworthy reply"):
+            self.client(script).submit("sbatch --parsable --wrap true")
+        self.assertEqual(script.count("run"), 1)
+        script.assert_complete()
+
+    def test_submit_rejection_banner_is_a_clean_no_commit_not_ambiguous(self) -> None:
+        # slurmctld's "Batch job submission failed:" banner is emitted only for a
+        # pre-dispatch rejection, so it must classify as a definite no-commit.
+        def rejected(_cluster: str, command: str, **kwargs: object) -> RemoteResult:
+            self.assertIn("sbatch --parsable", command)
+            self.assertEqual(kwargs["retry"], RetryPolicy.NEVER)
+            return framed(
+                b"",
+                command_rc=1,
+                stderr="sbatch: error: Batch job submission failed: Invalid qos specification",
+            )
+
+        script = StrictScript([ExpectedCall("run", result=rejected)])
+        with self.assertRaisesRegex(SubmissionRejected, "Invalid qos specification"):
+            self.client(script).submit("sbatch --parsable --wrap true")
+        self.assertEqual(script.count("run"), 1)
+        script.assert_complete()
+
+    def test_submit_nonzero_without_banner_stays_conservatively_ambiguous(self) -> None:
+        # Any nonzero status that is NOT the rejection banner could have committed
+        # (a reply lost after dispatch), so it must remain ambiguous.
+        def nonzero(_cluster: str, command: str, **kwargs: object) -> RemoteResult:
+            return framed(b"", command_rc=1, stderr="sbatch: error: slurm_submit connection timed out")
+
+        script = StrictScript([ExpectedCall("run", result=nonzero)])
+        with self.assertRaisesRegex(AmbiguousSubmission, "may have committed"):
             self.client(script).submit("sbatch --parsable --wrap true")
         self.assertEqual(script.count("run"), 1)
         script.assert_complete()

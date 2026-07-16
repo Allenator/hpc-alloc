@@ -36,6 +36,7 @@ from .errors import (
     OperationBusy,
     RecordNotFound,
     StateConflict,
+    SubmissionRejected,
     TransportLost,
 )
 from .locking import (
@@ -1769,6 +1770,15 @@ def _submit_job(
                 # These typed SSH failures prove the mutation was never
                 # dispatched.  Clear the flag before the failure write so an
                 # interrupt there cannot create false ambiguity.
+                dispatch_may_have_started = False
+                ctx.state.fail_submission(operation_id, str(exc))
+                raise
+            except SubmissionRejected as exc:
+                # The scheduler rejected the request before creating a job (its
+                # "Batch job submission failed:" banner is a definite no-commit).
+                # Like the SSH failures above this proves no mutation, so close
+                # the prepared intent cleanly rather than leaving an ambiguous
+                # operation for recovery to reconcile.
                 dispatch_may_have_started = False
                 ctx.state.fail_submission(operation_id, str(exc))
                 raise

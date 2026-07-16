@@ -30,6 +30,7 @@ from hpc_alloc.errors import (
     OperationBusy,
     SchedulerUnavailable,
     StateConflict,
+    SubmissionRejected,
     TransportLost,
 )
 from hpc_alloc.locking import operation_scope_lock
@@ -295,6 +296,32 @@ host = "secondary.example.edu"
         )
 
         with self.assertRaises(HostKeyChanged) as raised:
+            self.invoke(transport, StrictProxy(client_script))
+
+        self.assertIs(raised.exception, failure)
+        operation = self.repository.get_operation(OPERATION_ID)
+        job = self.repository.get_job(OPERATION_ID)
+        self.assertEqual(operation.phase, OperationPhase.FAILED)
+        self.assertEqual(job.phase, JobPhase.FINAL)
+        self.assertEqual(job.terminal_state, "SUBMIT_FAILED")
+        transport_script.assert_complete()
+        client_script.assert_complete()
+
+    def test_submit_rejection_closes_prepared_intent_without_ambiguity(self) -> None:
+        # A pre-dispatch rejection proves no job was created, so the prepared
+        # intent must close cleanly (no ambiguous operation left for recovery).
+        transport, transport_script = self.transport()
+        failure = SubmissionRejected(
+            "sbatch rejected the submission: Batch job submission failed: Invalid qos specification"
+        )
+        client_script = StrictScript(
+            [
+                ExpectedCall("prepare_submission"),
+                ExpectedCall("submit", result=failure),
+            ]
+        )
+
+        with self.assertRaises(SubmissionRejected) as raised:
             self.invoke(transport, StrictProxy(client_script))
 
         self.assertIs(raised.exception, failure)

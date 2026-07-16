@@ -114,6 +114,19 @@ class AmbiguousSubmission(HpcAllocError):
     """Submission may have committed, but no trustworthy reply was received."""
 
 
+class SubmissionRejected(HpcAllocError):
+    """The scheduler rejected the request before creating a job -- a no-commit.
+
+    Distinguished from :class:`AmbiguousSubmission`: the scheduler prints its own
+    ``Batch job submission failed:`` banner with a nonzero status only for a
+    pre-dispatch validation failure (bad account, QOS, partition, constraint, or
+    a submit limit), which slurmctld rejects before any job exists.  A reply lost
+    *after* a real commit surfaces as a transport error instead, never that
+    banner.  So this is a clean local failure with nothing to reconcile -- it
+    must never be treated as an ambiguous mutation to recover.
+    """
+
+
 class IdentityMismatch(HpcAllocError):
     """A live Slurm job does not match the exact durable job identity."""
 

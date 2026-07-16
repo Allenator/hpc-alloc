@@ -27,6 +27,7 @@ from .errors import (
     ProtocolViolation,
     RemoteCommandFailed,
     SchedulerUnavailable,
+    SubmissionRejected,
 )
 from .models import JobKind, JobRef
 from .ownership import COMPUTE_NODE_RE, format_tag, slurm_job_name
@@ -69,6 +70,13 @@ TERMINAL_WITHOUT_START = frozenset({"BOOT_FAIL", "CANCELLED", "DEADLINE", "REVOK
 REQUEUE_ELIGIBLE_FINAL = frozenset({"NODE_FAIL", "PREEMPTED"})
 
 _SQUEUE_INVALID_SINGLETON = "slurm_load_jobs error: Invalid job id specified"
+
+# sbatch prints this banner (to stderr, with a nonzero exit) only when slurmctld
+# rejects the request before creating a job -- a bad account, QOS, partition,
+# constraint, or a submit limit.  It is a definite no-commit signal: a reply lost
+# *after* a real commit surfaces as a transport error, not this text.  Matched to
+# turn such a rejection into a clean failure instead of a conservative ambiguity.
+_SUBMISSION_REJECTED_RE = re.compile(r"Batch job submission failed:", re.IGNORECASE)
 _SACCT_BASE_FIELDS = (
     "JobIDRaw",
     "State",
@@ -921,6 +929,10 @@ class SlurmClient:
             detail = framed.stderr.strip()
             if not detail and framed.payload:
                 detail = framed.payload.decode("utf-8", errors="replace").strip()
+            if _SUBMISSION_REJECTED_RE.search(detail):
+                # A pre-dispatch rejection: slurmctld refused before any job was
+                # created, so this is definitive and needs no reconciliation.
+                raise SubmissionRejected(f"sbatch rejected the submission: {detail}")
             raise AmbiguousSubmission(
                 "sbatch returned a nonzero status after dispatch and may have committed"
                 + (f": {detail}" if detail else f" (exit {framed.returncode})")
