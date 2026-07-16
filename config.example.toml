@@ -43,6 +43,12 @@ host = "bouchet.ycrc.yale.edu"
 # mem = "16G"
 # idle_timeout = 30
 
+# Partitions to treat as non-dedicated (preemptible or short-lived): they are
+# excluded from `-G TYPE:N` GPU auto-selection and flagged in `avail --for`.
+# fnmatch globs; defaults to the values below. Settable here or in [defaults];
+# override only when a cluster names those pools differently.
+# nondedicated_partition_globs = ["scavenge*", "*devel"]
+
 # Additional clusters use the section name as the --cluster value. Names and
 # job IDs are convenience selectors; resolve ambiguity with cluster:@operation_id.
 #
