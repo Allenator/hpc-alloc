@@ -63,18 +63,20 @@ class ProbeCandidateTests(unittest.TestCase):
 
     def test_typed_request_filters_by_eligibility_and_gres(self) -> None:
         candidates, capped = _probe_candidates(
-            _ctx(), FakeClient(), "bouchet", {"gpus": "b200:1"}, _partition_gpu_types(AVAIL)
+            _ctx(), FakeClient(), "bouchet", {"gpus": "b200:1"}, _partition_gpu_types(AVAIL), AVAIL
         )
         # b200-offering AND eligible only: gpu_b200, gpu_devel.  priority_gpu is
         # excluded (ineligible), gpu_h200 is the wrong type, day has no GPU.
-        self.assertEqual(candidates, ["gpu_b200", "gpu_devel"])
+        # Ordered by free b200 capacity: gpu_devel (8 free) before gpu_b200 (4).
+        self.assertEqual(candidates, ["gpu_devel", "gpu_b200"])
         self.assertFalse(capped)
 
     def test_untyped_gpu_request_matches_any_eligible_gpu_partition(self) -> None:
         candidates, _ = _probe_candidates(
-            _ctx(), FakeClient(), "bouchet", {"gpus": "1"}, _partition_gpu_types(AVAIL)
+            _ctx(), FakeClient(), "bouchet", {"gpus": "1"}, _partition_gpu_types(AVAIL), AVAIL
         )
-        self.assertEqual(candidates, ["gpu_b200", "gpu_devel", "gpu_h200"])
+        # Ordered by free GPU capacity: gpu_devel (8), gpu_b200 (4), gpu_h200 (0).
+        self.assertEqual(candidates, ["gpu_devel", "gpu_b200", "gpu_h200"])
 
 
 if __name__ == "__main__":

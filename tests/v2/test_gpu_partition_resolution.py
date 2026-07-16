@@ -214,15 +214,17 @@ class ResolveGpuPartitionTests(unittest.TestCase):
         ):
             self._resolve(_resources("notagpu:1"))
 
-    def test_type_only_on_preemptible_or_short_partitions_is_refused(self) -> None:
-        # l40s exists only on scavenge_gpu and gpu_devel here: no steady, eligible
-        # partition offers it, so the tool refuses rather than auto-picking a
-        # preemptible or short pool.
+    def test_type_only_on_preemptible_or_short_partitions_names_them(self) -> None:
+        # l40s exists only on scavenge_gpu and gpu_devel here: no steady partition
+        # offers it, so the tool refuses to auto-pick a preemptible/short pool but
+        # NAMES them (with -p guidance), so the refusal agrees with `avail --for`
+        # rather than claiming nothing offers the type.
         avail = AVAIL + "\nscavenge_gpu mix host gpu:l40s:4 gpu:l40s:0 0/4/0/4"
         avail += "\ngpu_devel    mix host gpu:l40s:4 gpu:l40s:0 0/4/0/4"
         client = FakeClient(availability=avail)
         with self.assertRaisesRegex(
-            ConfigInvalid, r"no partition offers l40s GPUs on bouchet"
+            ConfigInvalid,
+            r"no steady partition offers l40s GPUs.*preemptible.*gpu_devel, scavenge_gpu",
         ):
             self._resolve(_resources("l40s:1"), client=client)
 
