@@ -1652,11 +1652,21 @@ def _topology_snapshot(
     try:
         cached = ctx.state.get_cluster_cache(cluster, _TOPOLOGY_CACHE_KEY)
         if isinstance(cached, dict) and cached:
-            return {
-                name: set(types)
-                for name, types in cached.items()
-                if isinstance(types, list)
-            }
+            # All or nothing.  Filtering per entry silently dropped the rows it
+            # could not read: every row unreadable yielded {}, which is not None
+            # and so reads downstream as "this cluster offers no such GPU" --
+            # sending the user to check their spelling.  Worse, a PARTLY
+            # unreadable row yielded a partial map and the resolver auto-selected
+            # from it with no error at all.  The row is JSON, so the element
+            # check is not redundant: [1, 2] is a list, and a set of ints matches
+            # no GPU type.  A row we cannot read in full is a miss, and falling
+            # through lets a fetch overwrite the bad row rather than stranding it
+            # until its TTL.
+            if all(
+                isinstance(types, list) and all(isinstance(t, str) for t in types)
+                for types in cached.values()
+            ):
+                return {name: set(types) for name, types in cached.items()}
         if not fetch:
             return None
         offered = _partition_gpu_types(client.availability())

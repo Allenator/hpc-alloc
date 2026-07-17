@@ -6,6 +6,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
 
 from hpc_alloc.commands import (
+    _TOPOLOGY_CACHE_KEY,
     _eligibility_snapshot,
     _is_dedicated_gpu_partition,
     _resolve_gpu_partition,
@@ -102,6 +103,35 @@ class TopologyCacheTests(unittest.TestCase):
         # A warm cluster is served offline (no client); a cold one yields None.
         self.assertEqual(_topology_snapshot(ctx, None, "bouchet", fetch=False), first)
         self.assertIsNone(_topology_snapshot(ctx, None, "elsewhere", fetch=False))
+
+    def test_a_row_it_cannot_read_in_full_is_a_miss_not_an_empty_cluster(self) -> None:
+        """An unreadable cache row must defer, never describe the cluster.
+
+        Filtering per entry dropped what it could not read: an all-bad row
+        became {}, which is not None and so read downstream as "no partition
+        offers this GPU" -- blaming the user's spelling for a bad cache.  A
+        partly-bad row was worse: a partial map the resolver auto-selected from
+        with no error.  The element check is not redundant; the row is JSON, so
+        [1, 2] is a list whose set matches no GPU type.
+        """
+
+        for label, row in (
+            ("all values unreadable", {"gpu_h200": "h200"}),
+            ("one value unreadable", {"gpu_h200": ["h200"], "priority_gpu": "h200"}),
+            ("non-str elements", {"gpu_h200": [1, 2]}),
+        ):
+            with self.subTest(row=label):
+                ctx = _ctx()
+                ctx.state.set_cluster_cache("bouchet", _TOPOLOGY_CACHE_KEY, row)
+                self.assertIsNone(
+                    _topology_snapshot(ctx, None, "bouchet", fetch=False),
+                    "an unreadable row was reported as cluster topology",
+                )
+                # ...and a fetch overwrites it rather than stranding it to TTL.
+                self.assertEqual(
+                    _topology_snapshot(ctx, FakeClient(), "bouchet")["gpu_h200"],
+                    {"h200"},
+                )
 
     def test_offline_resolve_defers_when_cold_and_selects_when_warm(self) -> None:
         # This is the "warm eagerly on connect" story: cold, the offline resolve
