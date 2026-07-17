@@ -1290,6 +1290,7 @@ def _reconcile_status(
     *, ctx: Any, paths: AppPaths, entrypoint: Path
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     from .errors import AuthRequired, HostKeyChanged, SchedulerUnavailable
+    from .lifecycle import AssessmentPhase
     from .monitor import JobMonitor
     from .ssh import AuthMode
 
@@ -1335,7 +1336,7 @@ def _reconcile_status(
             continue
         if scans.get(job.cluster) is None:
             payload = _assessment_payload(job, JobMonitor.tracker(job).assessment)
-            payload["phase"] = "UNCERTAIN"
+            payload["phase"] = AssessmentPhase.UNCERTAIN.value
             rows.append(payload)
             continue
         client = clients[job.cluster]
@@ -1374,7 +1375,7 @@ def _reconcile_status(
             payload = _assessment_payload(
                 durable, JobMonitor.tracker(durable).assessment
             )
-            payload["phase"] = "UNCERTAIN"
+            payload["phase"] = AssessmentPhase.UNCERTAIN.value
             rows.append(payload)
             continue
         rows.append(_assessment_payload(updated, assessment))
