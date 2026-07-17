@@ -21,6 +21,7 @@ from hpc_alloc.ssh_config import (
     allocation_alias,
     atomic_write_600,
     compute_host_key_alias,
+    managed_compute_endpoints,
     render,
     sync_managed_config,
 )
@@ -87,6 +88,57 @@ class SshConfigTests(unittest.TestCase):
         self.assertNotIn("HostName [", text)
 
     @unittest.skipUnless(shutil.which("ssh"), "OpenSSH client is unavailable")
+    def test_a_file_we_did_not_write_publishes_no_compute_alias(self) -> None:
+        """The managed header is the "did we write this?" gate in front of leasing.
+
+        Everything below the header can be shaped exactly like our own
+        projection, so without the header check a hand-edited or stale file at
+        the managed path would have its HostName leased back to an allocation
+        that still holds its node -- and `hpc-alloc ssh` would follow it.  The
+        gate is otherwise invisible to the suite: every other test renders both
+        sides, so the header always agrees with itself and deleting the check
+        changes nothing.
+        """
+
+        config = SimpleNamespace(
+            identity=SimpleNamespace(netid="ab1234"),
+            ssh=SimpleNamespace(identity_file=None),
+            clusters={"grace": SimpleNamespace(host="grace.example.edu")},
+        )
+        jobs = [
+            SimpleNamespace(
+                cluster="grace",
+                logical_name="dev",
+                kind=JobKind.ALLOCATION,
+                current_node="node01",
+            )
+        ]
+        alias = allocation_alias("grace", "dev")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ssh_config"
+            ours = render(config, jobs, Path(directory) / "known_hosts")
+
+            # Assert the projection is readable first: a foreign file that
+            # parses to nothing proves nothing unless our own parses to
+            # something.
+            path.write_text(ours)
+            self.assertEqual(set(managed_compute_endpoints(path)), {alias})
+
+            # Byte-identical but for the header a foreign writer would not have.
+            foreign = ours.replace(
+                ours.splitlines()[0],
+                "# Managed by some other tool — regenerated; do not edit.",
+                1,
+            )
+            self.assertIn(f"Host {alias}", foreign)
+            path.write_text(foreign)
+            self.assertEqual(
+                managed_compute_endpoints(path),
+                {},
+                "a file hpc-alloc did not write had its compute stanzas trusted",
+            )
+
     def test_openssh_accepts_rendered_scoped_ipv6_hostname(self) -> None:
         config = SimpleNamespace(
             identity=SimpleNamespace(netid="ab1234"),
