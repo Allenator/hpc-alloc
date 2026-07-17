@@ -1771,9 +1771,19 @@ def _resolve_gpu_partition(
     Auto-selects when the choice is unambiguous, otherwise refuses locally with
     guidance rather than dispatching a request the scheduler cannot satisfy.  The
     real submit path calls it with ``fetch=True``, so a topology fetch or parse
-    problem fails open to the static default.  ``--dry-run`` calls it with
-    ``fetch=False``, so it uses only a warm topology cache and returns None on a
-    miss (the dry run then warns to pass ``-p``).
+    problem fails open to the static default.
+
+    ``--dry-run`` calls it with ``fetch=False``, where None means "cannot resolve
+    from the local cache" and the caller warns instead of printing a partition.
+    That covers two causes, and the caller must not name either: a cold topology
+    cache, and an ambiguity that only exists because the access rules which would
+    narrow it are themselves uncached.  Eligibility is the tie-breaker (below),
+    so without it ``allowed`` degenerates to ``dedicated`` and a pick the real
+    submit makes silently looks like a refusal.  Reporting that refusal would
+    contradict the submit this is supposed to preview -- and name partitions the
+    account cannot use -- so defer instead.  A refusal that does NOT depend on
+    the tie-breaker (no partition offers the type, or only preemptible ones do)
+    is authoritative offline and still raises.
     """
 
     from .eligibility import AccessVerdict
@@ -1820,6 +1830,15 @@ def _resolve_gpu_partition(
         info(f"--gpus {gpus} given without --partition; using {chosen!r}")
         return chosen
     if len(candidates) > 1:
+        if not fetch and snapshot is None:
+            # Offline with no cached access rules.  This set is wide only
+            # because the tie-breaker that narrows it is missing, so the
+            # ambiguity is an artifact of the cold cache rather than a fact
+            # about the cluster: the real submit fetches the rules and picks
+            # silently.  Defer to the caller's offline warning rather than
+            # raise a refusal that would contradict the submit and name
+            # partitions the account may not even be allowed to use.
+            return None
         raise ConfigInvalid(
             f"multiple partitions offer {want_type} GPUs on {cluster}: "
             f"{', '.join(candidates)}; choose one with -p PARTITION or see "
@@ -1898,13 +1917,13 @@ def _submit_job(
         # and prints the static default instead.
         gpus = resources.get("gpus")
         if gpus and ":" in gpus and not partition_explicit:
-            # The offline resolve reports its two outcomes differently: a cold
-            # topology cache returns None, while a warm cache that proves the
-            # pick impossible or ambiguous raises.  Keep them apart.  Collapsing
-            # the raise into None reported "no cached topology" for the one case
-            # where the cache is warm, so the reader was sent to fix the thing
-            # that was not broken while the real reason -- already stated
-            # precisely by the resolver -- was discarded.
+            # The offline resolve reports two outcomes: None means it cannot
+            # resolve from the local cache (either cache being cold will do),
+            # and a raise means a refusal that holds without the cache it is
+            # missing.  Keep them apart.  Collapsing the raise into None once
+            # reported "no cached topology" while the topology cache was warm;
+            # naming a cause the caller cannot actually distinguish is what
+            # produced that, so the deferral below names none.
             try:
                 resolved = _resolve_gpu_partition(
                     ctx, None, cluster, resources, fetch=False
@@ -1922,12 +1941,25 @@ def _submit_job(
                     resources["partition"] = resolved
                 else:
                     info(
-                        f"--dry-run stays offline; with no cached topology it cannot "
-                        f"pick a partition for --gpus {gpus}. The command below uses "
-                        f"{resources['partition']!r}, which may not offer "
-                        f"{gpus.split(':')[0]} — pass -p PARTITION, or run "
+                        f"--dry-run stays offline and cannot resolve a partition "
+                        f"for --gpus {gpus} from the local cache. The command below "
+                        f"uses {resources['partition']!r}, which may not offer "
+                        f"{gpus.split(':')[0]} — try `hpc-alloc connect` to warm the "
+                        f"cache, pass -p PARTITION, or run "
                         f"`hpc-alloc avail --for -G {gpus}` first"
                     )
+        # The submit runs this same warm-cache check before dispatching, and
+        # refuses on a proven DENY.  Without it here a dry-run could print a
+        # partition -- a lone denied candidate, or an explicit -p -- that the
+        # submit will reject, with no warning at all: the one thing a preview
+        # must never do.  Warn rather than raise, to keep the always-prints
+        # contract; a cold cache no-ops, exactly as it does on the submit path.
+        try:
+            _preflight_partition_eligibility(
+                ctx, None, cluster, resources["partition"], fetch=False
+            )
+        except ConfigInvalid as error:
+            info(f"--dry-run: {error}")
         print(build_spec(f"dryrun-{operation_id[:12]}").command())
         return None
     transport, client = _services(ctx, paths, entrypoint, cluster)

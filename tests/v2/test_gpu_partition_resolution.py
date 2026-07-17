@@ -120,18 +120,26 @@ class TopologyCacheTests(unittest.TestCase):
 
 
 class DryRunOfflineResolveTests(unittest.TestCase):
-    def _dry_run(self, *, warm: bool, warm_eligibility: bool = True):
+    def _dry_run(
+        self,
+        *,
+        warm: bool,
+        warm_eligibility: bool = True,
+        client: object | None = None,
+        gpus: str = "h200:1",
+    ):
         from hpc_alloc.commands import _submit_job
         from hpc_alloc.models import JobKind
 
+        client = client or FakeClient()
         ctx = _ctx()
         if warm:  # as `connect` does: warm both accelerator caches
-            _topology_snapshot(ctx, FakeClient(), "bouchet")
+            _topology_snapshot(ctx, client, "bouchet")
             if warm_eligibility:
-                _eligibility_snapshot(ctx, FakeClient(), "bouchet")
+                _eligibility_snapshot(ctx, client, "bouchet")
         resources = {
             "partition": "gpu",
-            "gpus": "h200:1",
+            "gpus": gpus,
             "time": "1:00:00",
             "cpus": 2,
             "mem": None,
@@ -167,26 +175,85 @@ class DryRunOfflineResolveTests(unittest.TestCase):
         self.assertNotIn("--partition=gpu_h200", out)
         self.assertIn("stays offline", err)
 
-    def test_warm_cache_that_cannot_pick_reports_the_real_reason(self) -> None:
-        """A warm cache can still refuse, and the reason is not a cold cache.
+    def test_cold_access_rules_defer_rather_than_invent_an_ambiguity(self) -> None:
+        """Topology warm, access rules cold: defer; never refuse.
 
-        Topology is cached here; the pick is ambiguous only because eligibility
-        -- which is what narrows the account-gated `priority_gpu` away -- is not.
-        The offline resolve signals a cold cache by returning None and an
-        impossible or ambiguous pick by raising, so collapsing the raise into
-        None reports "no cached topology" for the one case where the topology
-        cache is warm, sending the reader to fix the thing that is not broken.
+        Eligibility is the tie-breaker that narrows the account-gated
+        `priority_gpu` away, so without it `allowed` degenerates to `dedicated`
+        and a pick the real submit makes silently looks ambiguous.  Reporting
+        that as a refusal contradicts the submit this previews and recommends a
+        partition the account is denied.  An earlier version of this test
+        asserted that refusal was correct.
+
+        This is the check that fails if the deferral is reverted, so it asserts
+        the deferral is PRESENT and the refusal ABSENT -- either alone would
+        pass against the wrong behaviour.
         """
 
         out, err = self._dry_run(warm=True, warm_eligibility=False)
-        # Still prints a command: --dry-run's always-prints contract holds.
-        self.assertIn("--partition=gpu", out)
+        self.assertIn("--partition=gpu", out)  # always-prints contract holds
         self.assertNotIn("--partition=gpu_h200", out)
-        # ...but says why, in the resolver's own words.
-        self.assertIn("multiple partitions offer h200", err)
-        self.assertIn("-p PARTITION", err)
+        self.assertIn("cannot resolve a partition", err)
+        self.assertNotIn("multiple partitions offer", err)
         self.assertNotIn("no cached topology", err)
-        self.assertNotIn("stays offline", err)
+
+    def test_the_state_that_defers_is_the_state_the_submit_resolves(self) -> None:
+        """Pin the pair, not each side: deferring is only right because the
+        submit picks.  Asserting the dry-run alone would still pass if the
+        resolver deferred for a bad reason."""
+
+        ctx = _ctx()
+        _topology_snapshot(ctx, FakeClient(), "bouchet")  # eligibility left cold
+        self.assertIsNone(
+            _resolve_gpu_partition(ctx, None, "bouchet", _resources("h200:1"), fetch=False)
+        )
+        self.assertEqual(
+            _resolve_gpu_partition(
+                ctx, FakeClient(), "bouchet", _resources("h200:1"), fetch=True
+            ),
+            "gpu_h200",
+        )
+
+    def test_a_genuine_ambiguity_on_warm_caches_is_still_reported(self) -> None:
+        """The deferral must not swallow a real refusal.
+
+        Two dedicated partitions the account can actually use offer b200, so
+        the tie-breaker is present and cannot narrow: the submit would refuse,
+        and the dry-run must say so.  This fails if the deferral is written
+        over-broadly as `if not fetch: return None`.
+        """
+
+        avail = AVAIL + "\ngpu_b200x    mix host gpu:b200:8 gpu:b200:0 0/8/0/8"
+        parts = PARTS + (
+            "\nPartitionName=gpu_b200x AllowGroups=ALL AllowAccounts=ALL "
+            "AllowQos=normal State=UP"
+        )
+
+        class TwoB200Client(FakeClient):
+            def partition_access(self) -> str:
+                return parts
+
+        out, err = self._dry_run(
+            warm=True, client=TwoB200Client(availability=avail), gpus="b200:1"
+        )
+        self.assertIn("--partition=gpu", out)
+        self.assertIn("multiple partitions offer b200", err)
+        self.assertNotIn("cannot resolve a partition", err)
+
+    def test_a_denied_partition_is_flagged_rather_than_printed_silently(self) -> None:
+        """The submit refuses a warm-cache DENY before dispatch; the dry-run
+        used to print that partition with no warning at all -- a preview
+        contradicting the thing it previews, in the state the docs call
+        trustworthy.  h200x is offered only by priority_gpu, which this account
+        cannot use, so it is still selected (eligibility is a tie-breaker, not a
+        gate) and must now carry the warning the submit would raise."""
+
+        avail = "priority_gpu mix host gpu:h200x:8 gpu:h200x:0 0/8/0/8"
+        out, err = self._dry_run(
+            warm=True, client=FakeClient(availability=avail), gpus="h200x:1"
+        )
+        self.assertIn("--partition=priority_gpu", out)  # still printed
+        self.assertIn("not available to your account", err)  # ...but flagged
 
 
 class DedicatedPartitionTests(unittest.TestCase):
