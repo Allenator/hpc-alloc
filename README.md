@@ -86,7 +86,7 @@ Use `up --dry-run` or `run --dry-run` to print a paste-ready submission command 
 | `down NAME\|JOBID\|@OPERATION\|--all [--cluster NAME]` | Cancel one or all managed allocation jobs. The target is required: `down` is irreversible, so it never guesses which allocation you meant. |
 | `ssh [--cluster NAME] [NAME\|JOBID\|@OPERATION] [-- CMD...]` | Open an allocation shell or run a command there. |
 | `sync (NAME\|JOBID\|@OPERATION) SRC DST [--cluster NAME] [--pull] [--delete]` | Transfer files with rsync through the allocation alias. rsync expands the remote path through the remote login shell — which is what makes `'~/project'` work — so the remote path is restricted to `A-Za-z0-9_@%+=:,./~-` and a path containing a space, quote, glob, or `$(...)` is rejected rather than silently re-split by that shell. |
-| `avail [--cluster NAME] [-p PARTITION] [--json]` | Summarize idle CPUs and free GPUs for one cluster (idle GRES is not a schedulability guarantee), marking each partition with whether your account may submit to it (`ELIGIBLE` column; `eligible` in `--json`). With `--for` plus a request (`-G/-c/--mem/-t`), probe where that request would start soonest across the eligible partitions — a scheduler dry-run that submits no job, ranked by advisory estimated start; preemptible or short pools are shown but marked, and `--json` carries a `capped` flag when more eligible partitions existed than were probed. |
+| `avail [--cluster NAME] [-p PARTITION] [--json]` | Summarize idle CPUs and free GPUs for one cluster (idle GRES is not a schedulability guarantee), marking each partition with whether your account may submit to it (`ELIGIBLE` column; `eligible` in `--json`). With `--for` plus a request (`-G/-c/--mem/-t/-C`), probe where that request would start soonest across the eligible partitions — a scheduler dry-run that submits no job, ranked by advisory estimated start; preemptible or short pools are shown but marked, and `--json` carries a `capped` flag when more eligible partitions existed than were probed. |
 | `partitions [--cluster NAME] [--json]` | Show live partition limits, GRES, and feature data for one cluster, plus whether your account may submit to each (`eligible`). |
 | `recover [OPERATION_ID] [--cluster NAME] [--abandon] [--yes]` | Reconcile ambiguous submit/cancel operations by exact queue or accounting identity, or explicitly abandon one local intent. |
 
@@ -96,7 +96,7 @@ When you request a specific GPU type with `-G TYPE:N` but omit `-p/--partition`,
 
 Before dispatching, `up` and `run` refuse a partition your account, QOS, or groups PROVABLY cannot use — a best-effort accelerator that reads cached access rules (warmed by `connect`), so a clear access error is caught before the round-trips without a fetch. It falls open on any uncertainty (missing, empty, or partition-scoped access data), and the scheduler itself is the authoritative gate: a deterministic rejection is returned as a clean local failure (exit 1), not an ambiguous submission to recover.
 
-Numeric Slurm durations support all six documented forms: `minutes`, `minutes:seconds`, `hours:minutes:seconds`, `days-hours`, `days-hours:minutes`, and `days-hours:minutes:seconds`. Minute and second subfields must be two digits from `00` through `59`; signs, whitespace, and symbolic values such as `INFINITE` or `UNLIMITED` are not accepted. Every all-zero spelling is also rejected because Slurm interprets a zero duration as requesting no time limit; specify an explicit, finite nonzero duration instead.
+Numeric Slurm durations support all six documented forms: `minutes`, `minutes:seconds`, `hours:minutes:seconds`, `days-hours`, `days-hours:minutes`, and `days-hours:minutes:seconds`. Every subfield that follows a colon must be exactly two digits from `00` through `59`. A field that no colon precedes is unbounded and needs no padding, so `5` is five minutes, `90:30` is ninety minutes and thirty seconds, and `100:00:00` is a hundred hours. Signs, whitespace, and symbolic values such as `INFINITE` or `UNLIMITED` are not accepted. Every all-zero spelling is also rejected because Slurm interprets a zero duration as requesting no time limit; specify an explicit, finite nonzero duration instead.
 
 ## Authoritative configuration
 
@@ -145,9 +145,11 @@ The operation ID is the durable identity; Slurm job IDs can be recycled and logi
 cluster:@operation_id
 ```
 
-Commands that accept a managed job target also accept the convenience forms:
+Commands that accept a managed job target also accept the convenience forms, qualified or bare:
 
 ```text
+name
+jobid
 cluster:name
 cluster:jobid
 ```
@@ -238,9 +240,9 @@ Progress and recovery notices go to stderr. JSON stdout remains machine-only. Ar
 The JSON surfaces are intentionally explicit:
 
 - `config --json` returns `config_file`, `state_file`, `primary_cluster`, the validated `config`, and `effective` resource values.
-- `status --json` returns exactly three top-level arrays: `jobs`, `discovered`, and `operations`. `jobs` carry a canonical `selector` plus operation, scheduler, lifecycle, terminal, resource, node, and alias fields. A job finalized during reconciliation appears once in `jobs`, not again as a discovered conflict. `discovered` separates `job_kind` (`allocation` or `run`) from `classification` (`untracked-owned`, `other-machine`, `unresolved-operation-match`, `duplicate-operation`, `local-final-conflict`, or `operation-identity-conflict`). `operations` contains unresolved submit/cancel journal rows, their target-job `selector`, and recovery details.
+- `status --json` returns exactly three top-level arrays: `jobs`, `discovered`, and `operations`. `jobs` carry a canonical `selector` plus operation, scheduler, lifecycle, terminal, resource, node, and alias fields. A job finalized during reconciliation appears once in `jobs`, not again as a discovered conflict. `discovered` separates `job_kind` (`allocation` or `run`) from `classification` (`untracked-owned`, `other-machine`, `unresolved-operation-match`, `duplicate-operation`, `local-final-conflict`, or `operation-identity-conflict`). `operations` contains unresolved submit/cancel journal rows, each carrying `operation_id`, the target-job `selector`, `kind`, `phase`, `cluster`, `target`, `jobid`, and `detail`.
 - `why --json` returns one job assessment and diagnosis.
-- `avail --json` returns `{ "partitions": { ... } }`, where each partition object carries an `eligible` flag (true, false, or null when access data is unavailable); `avail --for --json` returns `{ "for": { resolved request }, "probes": [ { "partition", "schedulable", "start", "detail" } ] }`, ordered soonest-first, and instead carries an `error` string with empty `probes` when the requested `-G TYPE:N` names a GPU type no partition offers.
+- `avail --json` returns `{ "partitions": { ... } }`, where each partition object carries an `eligible` flag (true, false, or null when access data is unavailable); `avail --for --json` returns `{ "for": { resolved request }, "probes": [ { "partition", "preemptible", "schedulable", "start", "detail" } ], "capped": bool }`, ordered soonest-first, where `capped` is true when more eligible partitions existed than were probed. When the requested `-G TYPE:N` names a GPU type no partition offers, it instead carries an `error` string alongside empty `probes` and `capped` false.
 - `partitions --json` returns an array of partition objects, each with an `eligible` flag (`true`, `false`, or `null` when access data is unavailable).
 
 Consumers should use `kind` for managed jobs, `job_kind` plus `classification` for discovered rows, and canonical `selector` values for later actions. Do not parse display text.
