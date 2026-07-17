@@ -149,7 +149,25 @@ def payload_keys(function: object) -> list[str]:
 
 
 class JsonContractTests(unittest.TestCase):
-    """Every key the code emits is named in the contract an agent reads."""
+    """Every key the code emits is named wherever the JSON surface is documented.
+
+    Both copies are checked.  The JSON surface is the one contract a script
+    depends on, and the original drift -- a probe object that gained
+    `preemptible` while its documented shape did not -- was in the README copy
+    precisely because nothing tested it.  Duplication is fine here exactly
+    because it is pinned; see the module docstring.
+    """
+
+    #: Every section that documents the JSON surface, each held to the same bar.
+    BODIES = (
+        ("command-contracts.md", lambda: section(CONTRACTS, "## JSON contracts")),
+        ("README.md", lambda: section(README, "## JSON contracts")),
+    )
+
+    def assert_documented(self, token: str, message: str) -> None:
+        for name, load in self.BODIES:
+            with self.subTest(document=name):
+                self.assertTrue(mentions(load(), token), f"{name}: {message}")
 
     def setUp(self) -> None:
         self.body = section(CONTRACTS, "## JSON contracts")
@@ -157,34 +175,31 @@ class JsonContractTests(unittest.TestCase):
     def test_jobs_entry_keys_are_documented(self) -> None:
         emitted = set(payload_keys(_assessment_payload))
         self.assertTrue(emitted, "no keys extracted; the check would pass vacuously")
-        undocumented = {k for k in emitted if not mentions(self.body, k)}
-        self.assertEqual(
-            undocumented,
-            set(),
-            "status --json emits keys the JSON contract does not name, while that "
-            "same contract tells the reader to rely only on documented fields",
-        )
+        for key in sorted(emitted):
+            self.assert_documented(
+                key,
+                f"status --json emits {key!r}, which the JSON contract does not "
+                f"name, while telling the reader to rely only on documented fields",
+            )
 
     def test_wire_values_are_documented_not_enum_member_names(self) -> None:
         # `final_source` serialises as "confirmed-queue", never "CONFIRMED_QUEUE".
         # An agent matching the prose spelling finds nothing.
         for enum in (FinalSource, JobKind, OperationKind):
             for member in enum:
-                with self.subTest(enum=enum.__name__, value=member.value):
-                    self.assertTrue(
-                        mentions(self.body, member.value),
-                        f"{enum.__name__}.{member.name} serialises as "
-                        f"{member.value!r}; the JSON contract never names it",
-                    )
+                self.assert_documented(
+                    member.value,
+                    f"{enum.__name__}.{member.name} serialises as "
+                    f"{member.value!r}; the JSON contract never names it",
+                )
 
     def test_every_operation_phase_is_documented(self) -> None:
         # `recover` prints these back verbatim; three went unnamed for a year.
         for member in OperationPhase:
-            with self.subTest(phase=member.value):
-                self.assertTrue(
-                    mentions(self.body, member.value),
-                    f"OperationPhase.{member.name} is never named in the JSON contract",
-                )
+            self.assert_documented(
+                member.value,
+                f"OperationPhase.{member.name} is never named in the JSON contract",
+            )
 
     def test_avail_for_probe_keys_are_documented(self) -> None:
         # The original drift: the probe object gained `preemptible` and the
@@ -192,24 +207,20 @@ class JsonContractTests(unittest.TestCase):
         # the file, so only a section-scoped check catches it.
         literals = dict_literals_containing(COMMANDS, "schedulable")
         self.assertTrue(literals, "no probe dict literal found in commands.py")
-        for key in set().union(*literals):
-            with self.subTest(key=key):
-                self.assertTrue(
-                    mentions(self.body, key),
-                    f"avail --for probes carry {key!r}; the JSON contract omits it",
-                )
+        for key in sorted(set().union(*literals)):
+            self.assert_documented(
+                key, f"avail --for probes carry {key!r}; the JSON contract omits it"
+            )
 
     def test_avail_for_envelope_keys_are_documented(self) -> None:
         # Covers both the success payload and the unknown-GPU-type error one,
         # which still carries `capped`.
         literals = dict_literals_containing(COMMANDS, "probes")
         self.assertTrue(literals, "no avail --for payload literal found")
-        for key in set().union(*literals):
-            with self.subTest(key=key):
-                self.assertTrue(
-                    mentions(self.body, key),
-                    f"avail --for --json carries {key!r}; the JSON contract omits it",
-                )
+        for key in sorted(set().union(*literals)):
+            self.assert_documented(
+                key, f"avail --for --json carries {key!r}; the JSON contract omits it"
+            )
 
 
 class LifecycleContractTests(unittest.TestCase):
