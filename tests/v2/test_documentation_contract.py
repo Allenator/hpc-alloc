@@ -189,28 +189,40 @@ def payload_keys(function: object) -> list[str]:
 class FenceHandlingTests(unittest.TestCase):
     """A code sample must not stand in for documentation.
 
-    These pin the PROPERTY, not any one mechanism, because two independent
-    mechanisms hold it: `without_fences` blanks the block, and `quoted`'s
-    newline exclusion stops a multi-line span forming in the first place.
-    Either alone is sufficient, so neutering one leaves the token checks below
-    green -- only breaking both fails them.  That redundancy is deliberate but
-    worth stating, because it means these tests do NOT guard `without_fences`
-    on `quoted`'s path.
+    Two mechanisms defend `mentions`, against two different hazards, and each
+    needs its own case or it is not tested at all:
 
-    What `without_fences` uniquely carries is `section`: a shell comment inside
-    a fence matches the heading pattern, and only stripping the block prevents
-    it truncating a section.  test_a_comment_inside_a_fence_does_not_end_a_section
-    is the one check that fails when the helper is removed.
+    * `without_fences` blanks a ``` block.  Only this stops a sample that
+      happens to contain an inline span from documenting its own tokens.
+    * `quoted`'s newline exclusion stops a span crossing lines.  Only this
+      stops one stray backtick in prose swallowing whole paragraphs.
 
-    They exist because every other test in this file used the helper and none
-    exercised it: a helper whose removal no test notices is not a guard, it is
-    a comment.
+    THE FENCE BODIES MUST CARRY AN INLINE SPAN.  A bare word inside a fence has
+    no backticks for `quoted` to find, so a body like "```\\nSUBMITTING\\n```"
+    passes whether or not the block was stripped -- it cannot fail, and an
+    earlier version of these tests was written that way.  Reverting `_FENCE` to
+    match only column-zero closed fences left all of them green while deleting
+    the very support they are named for.  Each case below dies when its own
+    mechanism is removed; that is the bar, not "the suite went red somewhere".
     """
 
+    @staticmethod
+    def fenced(token: str, *, indent: str = "", closed: bool = True) -> str:
+        """A document whose ONLY mention of `token` is inside a code sample.
+
+        The sample names the token in an inline span, which is what makes the
+        case discriminating: unstripped, `quoted` finds that span and reports
+        the token as documented.
+        """
+
+        lines = [f"{indent}```text", f"{indent}see `{token}` here"]
+        if closed:
+            lines.append(f"{indent}```")
+        return "Prose that documents nothing.\n\n" + "\n".join(lines) + "\n"
+
     def test_a_fenced_sample_does_not_document_a_token(self) -> None:
-        fenced = "Prose that explains nothing.\n\n```text\nSUBMITTING\n```\n"
         self.assertFalse(
-            mentions(fenced, "SUBMITTING"),
+            mentions(self.fenced("SUBMITTING"), "SUBMITTING"),
             "a token inside a code sample counted as documented",
         )
         self.assertTrue(
@@ -219,14 +231,30 @@ class FenceHandlingTests(unittest.TestCase):
         )
 
     def test_an_indented_fence_is_still_stripped(self) -> None:
-        # A sample nested in a list item is the likeliest way one arrives.
-        nested = "- a field:\n\n  ```text\n  SUBMITTING\n  ```\n"
-        self.assertFalse(mentions(nested, "SUBMITTING"))
+        # A sample nested in a list item is the likeliest way one arrives, and
+        # CommonMark allows up to three spaces before a fence regardless.
+        self.assertFalse(
+            mentions(self.fenced("SUBMITTING", indent="  "), "SUBMITTING"),
+            "an indented fence leaked its tokens",
+        )
 
-    def test_an_unclosed_fence_does_not_silently_revert(self) -> None:
+    def test_an_unclosed_fence_is_still_stripped(self) -> None:
         # Runs to end of input rather than being skipped, so a malformed
         # document cannot quietly restore the pre-fix behaviour.
-        self.assertFalse(mentions("text\n\n```text\nSUBMITTING\n", "SUBMITTING"))
+        self.assertFalse(
+            mentions(self.fenced("SUBMITTING", closed=False), "SUBMITTING"),
+            "an unclosed fence leaked its tokens",
+        )
+
+    def test_a_stray_backtick_does_not_span_paragraphs(self) -> None:
+        # The other mechanism, and the other hazard: with `[^`]+` one unbalanced
+        # backtick makes a single span of everything up to the next one,
+        # swallowing tokens from unrelated paragraphs into a "documented" span.
+        body = "a stray ` in prose\n\nSUBMITTING appears bare here\n\nand `later`"
+        self.assertFalse(
+            mentions(body, "SUBMITTING"),
+            "a span crossed paragraphs and documented a bare word",
+        )
 
     def test_a_comment_inside_a_fence_does_not_end_a_section(self) -> None:
         body = (
