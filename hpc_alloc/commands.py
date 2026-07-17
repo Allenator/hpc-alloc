@@ -1897,24 +1897,36 @@ def _submit_job(
         # and prints the static default instead.
         gpus = resources.get("gpus")
         if gpus and ":" in gpus and not partition_explicit:
+            # The offline resolve reports its two outcomes differently: a cold
+            # topology cache returns None, while a warm cache that proves the
+            # pick impossible or ambiguous raises.  Keep them apart.  Collapsing
+            # the raise into None reported "no cached topology" for the one case
+            # where the cache is warm, so the reader was sent to fix the thing
+            # that was not broken while the real reason -- already stated
+            # precisely by the resolver -- was discarded.
             try:
                 resolved = _resolve_gpu_partition(
                     ctx, None, cluster, resources, fetch=False
                 )
-            except ConfigInvalid:
-                # An offline-provable impossible or ambiguous pick: keep dry-run's
-                # always-prints contract and fall back to the warning below.
-                resolved = None
-            if resolved is not None:
-                resources["partition"] = resolved
-            else:
+            except ConfigInvalid as error:
+                # Report it, but keep dry-run's always-prints contract: this is
+                # an offline preview, and the static default is still the
+                # partition a real submit would start from.
                 info(
-                    f"--dry-run stays offline; with no cached topology it cannot "
-                    f"pick a partition for --gpus {gpus}. The command below uses "
-                    f"{resources['partition']!r}, which may not offer "
-                    f"{gpus.split(':')[0]} — pass -p PARTITION, or run "
-                    f"`hpc-alloc avail --for -G {gpus}` first"
+                    f"--dry-run cannot pick a partition for --gpus {gpus}: {error}. "
+                    f"The command below uses {resources['partition']!r}"
                 )
+            else:
+                if resolved is not None:
+                    resources["partition"] = resolved
+                else:
+                    info(
+                        f"--dry-run stays offline; with no cached topology it cannot "
+                        f"pick a partition for --gpus {gpus}. The command below uses "
+                        f"{resources['partition']!r}, which may not offer "
+                        f"{gpus.split(':')[0]} — pass -p PARTITION, or run "
+                        f"`hpc-alloc avail --for -G {gpus}` first"
+                    )
         print(build_spec(f"dryrun-{operation_id[:12]}").command())
         return None
     transport, client = _services(ctx, paths, entrypoint, cluster)

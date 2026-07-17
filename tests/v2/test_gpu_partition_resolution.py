@@ -120,14 +120,15 @@ class TopologyCacheTests(unittest.TestCase):
 
 
 class DryRunOfflineResolveTests(unittest.TestCase):
-    def _dry_run(self, *, warm: bool):
+    def _dry_run(self, *, warm: bool, warm_eligibility: bool = True):
         from hpc_alloc.commands import _submit_job
         from hpc_alloc.models import JobKind
 
         ctx = _ctx()
         if warm:  # as `connect` does: warm both accelerator caches
             _topology_snapshot(ctx, FakeClient(), "bouchet")
-            _eligibility_snapshot(ctx, FakeClient(), "bouchet")
+            if warm_eligibility:
+                _eligibility_snapshot(ctx, FakeClient(), "bouchet")
         resources = {
             "partition": "gpu",
             "gpus": "h200:1",
@@ -165,6 +166,27 @@ class DryRunOfflineResolveTests(unittest.TestCase):
         self.assertIn("--partition=gpu", out)
         self.assertNotIn("--partition=gpu_h200", out)
         self.assertIn("stays offline", err)
+
+    def test_warm_cache_that_cannot_pick_reports_the_real_reason(self) -> None:
+        """A warm cache can still refuse, and the reason is not a cold cache.
+
+        Topology is cached here; the pick is ambiguous only because eligibility
+        -- which is what narrows the account-gated `priority_gpu` away -- is not.
+        The offline resolve signals a cold cache by returning None and an
+        impossible or ambiguous pick by raising, so collapsing the raise into
+        None reports "no cached topology" for the one case where the topology
+        cache is warm, sending the reader to fix the thing that is not broken.
+        """
+
+        out, err = self._dry_run(warm=True, warm_eligibility=False)
+        # Still prints a command: --dry-run's always-prints contract holds.
+        self.assertIn("--partition=gpu", out)
+        self.assertNotIn("--partition=gpu_h200", out)
+        # ...but says why, in the resolver's own words.
+        self.assertIn("multiple partitions offer h200", err)
+        self.assertIn("-p PARTITION", err)
+        self.assertNotIn("no cached topology", err)
+        self.assertNotIn("stays offline", err)
 
 
 class DedicatedPartitionTests(unittest.TestCase):
