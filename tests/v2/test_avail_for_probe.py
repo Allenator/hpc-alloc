@@ -90,16 +90,16 @@ class AvailForProbeTests(unittest.TestCase):
 
     def test_json_orders_by_capacity_flags_preemptible_and_reports_capped(self) -> None:
         payload = json.loads(self._run(ProbeClient(), gpus="b200:1"))
-        self.assertFalse(payload["capped"])  # #7: only two candidates
+        self.assertFalse(payload["capped"])  # only two candidates
         parts = [p["partition"] for p in payload["probes"]]
-        # #7: ordered by free b200 capacity -- gpu_devel (8) before gpu_b200 (4).
+        # ordered by free b200 capacity -- gpu_devel (8) before gpu_b200 (4).
         self.assertEqual(parts, ["gpu_devel", "gpu_b200"])
         flags = {p["partition"]: p["preemptible"] for p in payload["probes"]}
-        self.assertTrue(flags["gpu_devel"])   # #4a: *devel flagged preemptible
+        self.assertTrue(flags["gpu_devel"])   # *devel flagged preemptible
         self.assertFalse(flags["gpu_b200"])
 
     def test_explicit_ineligible_partition_is_reported_not_raised(self) -> None:
-        # #8: a read-only probe reports the partition instead of raising.
+        # a read-only probe reports the partition instead of raising.
         client = ProbeClient()
         payload = json.loads(self._run(client, partition="priority_gpu"))
         self.assertEqual([p["partition"] for p in payload["probes"]], ["priority_gpu"])
@@ -113,8 +113,8 @@ class AvailForProbeTests(unittest.TestCase):
                 _ctx(), ProbeClient(), "bouchet",
             )
         self.assertEqual(code, 0)
-        self.assertIn("-C bigmem", err.getvalue())  # #11: header via info() -> stderr
-        self.assertIn("(preemptible)", out.getvalue())  # #4a: marked in the stdout table
+        self.assertIn("-C bigmem", err.getvalue())  # header via info() -> stderr
+        self.assertIn("(preemptible)", out.getvalue())  # marked in the stdout table
 
     def test_unknown_gpu_type_reports_capped_false(self) -> None:
         payload = json.loads(self._run(ProbeClient(), gpus="notagpu:1"))

@@ -154,7 +154,7 @@ class DryRunOfflineResolveTests(unittest.TestCase):
         return out.getvalue(), err.getvalue()
 
     def test_warm_cache_prints_the_resolved_partition(self) -> None:
-        # #9: with a warm topology+access cache the dry-run command matches what a
+        # with a warm topology+access cache the dry-run command matches what a
         # real submit would do -- the resolved partition, not the static default.
         out, err = self._dry_run(warm=True)
         self.assertIn("--partition=gpu_h200", out)
