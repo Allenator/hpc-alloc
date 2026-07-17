@@ -81,7 +81,7 @@ Use `up --dry-run` or `run --dry-run` to print a paste-ready submission command 
 | `run [--cluster NAME] [resources] [--chdir DIR] [--detach] -- CMD...` | Submit a command. Foreground mode follows output and returns the accounting exit status or the documented final-state fallback. |
 | `status [--json]` | Reconcile locally journaled jobs and classify hpc-alloc-tagged queue rows across all configured clusters. |
 | `why [TARGET] [--cluster NAME] [--json]` | Explain a queued, running, uncertain, or final job selected by name, job ID, or `@operation`. |
-| `logs TARGET [--cluster NAME] [-n LINES] [-f]` | Read or follow a managed job log by convenience or durable selector. |
+| `logs TARGET [--cluster NAME] [-n/--lines LINES] [-f/--follow]` | Read or follow a managed job log by convenience or durable selector. |
 | `cancel (JOBID\|@OPERATION) [--cluster NAME]` | Cancel a managed job only after exact remote identity verification. |
 | `down NAME\|JOBID\|@OPERATION\|--all [--cluster NAME]` | Cancel one or all managed allocation jobs. The target is required: `down` is irreversible, so it never guesses which allocation you meant. |
 | `ssh [--cluster NAME] [NAME\|JOBID\|@OPERATION] [-- CMD...]` | Open an allocation shell or run a command there. |
