@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import ast
 import re
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -47,11 +48,11 @@ from hpc_alloc.cli import build_parser
 from hpc_alloc.commands import _assessment_payload
 from hpc_alloc.lifecycle import (
     _ACTIVE,
-    AssessmentPhase,
     _CANCELLATION_DRAINING,
     _QUEUED,
     _REQUEUEING,
     _STARTED_INACTIVE,
+    AssessmentPhase,
     REQUEUE_ELIGIBLE_FINAL,
 )
 from hpc_alloc.models import (
@@ -93,6 +94,32 @@ def dict_literals_containing(path: Path, key: str) -> list[list[str]]:
     return literals
 
 
+# Leading whitespace is allowed: CommonMark permits up to three spaces before a
+# fence, and a fence nested in a list item is indented further -- which is the
+# most natural way for someone to add a code sample to a field description.  An
+# unclosed fence runs to end of input rather than being ignored, so a malformed
+# document fails loudly instead of silently reverting to the old behaviour.
+_FENCE = re.compile(r"^[ \t]*```.*?(?:^[ \t]*```|\Z)", re.MULTILINE | re.DOTALL)
+
+
+def without_fences(text: str) -> str:
+    """Blank out fenced code blocks, preserving line count.
+
+    Fences break both helpers below.  A ``` fence reads to `quoted` as one
+    enormous code span, so every token inside it would count as documented --
+    a sample containing `SUBMITTING` would satisfy the check that the prose
+    documents `SUBMITTING`.  And a shell comment inside a fence ("# Inspect
+    ...") matches the heading pattern `section` scans for, truncating the
+    section at it.  Neither bites today, because no checked section contains a
+    fence; nothing stops one being added, and the first failure mode is silent.
+
+    FenceHandlingTests pins this.  Without them the helper is invisible:
+    neutering it to `return text` left every other test in this file green.
+    """
+
+    return _FENCE.sub(lambda m: "\n" * m.group().count("\n"), text)
+
+
 def section(path: Path, heading: str) -> str:
     """Return one Markdown section body, exclusive of later same-or-higher headings.
 
@@ -100,7 +127,7 @@ def section(path: Path, heading: str) -> str:
     searches an empty string passes for every token it is given.
     """
 
-    text = path.read_text()
+    text = without_fences(path.read_text())
     level = len(heading) - len(heading.lstrip("#"))
     match = re.search(rf"^{re.escape(heading)}\s*$", text, re.MULTILINE)
     if match is None:
@@ -111,9 +138,13 @@ def section(path: Path, heading: str) -> str:
 
 
 def quoted(body: str) -> set[str]:
-    """Every `backticked` token in a section, including those inside code spans."""
+    """Every `backticked` token in a section, excluding fenced code blocks.
 
-    return set(re.findall(r"`([^`]+)`", body))
+    Safe on raw text as well as on a `section` result, which strips fences
+    already; the second pass is what makes this usable on either.
+    """
+
+    return set(re.findall(r"`([^`\n]+)`", without_fences(body)))
 
 
 def mentions(body: str, token: str) -> bool:
@@ -155,6 +186,63 @@ def payload_keys(function: object) -> list[str]:
     return keys
 
 
+class FenceHandlingTests(unittest.TestCase):
+    """A code sample must not stand in for documentation.
+
+    These pin the PROPERTY, not any one mechanism, because two independent
+    mechanisms hold it: `without_fences` blanks the block, and `quoted`'s
+    newline exclusion stops a multi-line span forming in the first place.
+    Either alone is sufficient, so neutering one leaves the token checks below
+    green -- only breaking both fails them.  That redundancy is deliberate but
+    worth stating, because it means these tests do NOT guard `without_fences`
+    on `quoted`'s path.
+
+    What `without_fences` uniquely carries is `section`: a shell comment inside
+    a fence matches the heading pattern, and only stripping the block prevents
+    it truncating a section.  test_a_comment_inside_a_fence_does_not_end_a_section
+    is the one check that fails when the helper is removed.
+
+    They exist because every other test in this file used the helper and none
+    exercised it: a helper whose removal no test notices is not a guard, it is
+    a comment.
+    """
+
+    def test_a_fenced_sample_does_not_document_a_token(self) -> None:
+        fenced = "Prose that explains nothing.\n\n```text\nSUBMITTING\n```\n"
+        self.assertFalse(
+            mentions(fenced, "SUBMITTING"),
+            "a token inside a code sample counted as documented",
+        )
+        self.assertTrue(
+            mentions("Prose naming `SUBMITTING` explicitly.", "SUBMITTING"),
+            "sanity: real prose must still count, or the check is vacuous",
+        )
+
+    def test_an_indented_fence_is_still_stripped(self) -> None:
+        # A sample nested in a list item is the likeliest way one arrives.
+        nested = "- a field:\n\n  ```text\n  SUBMITTING\n  ```\n"
+        self.assertFalse(mentions(nested, "SUBMITTING"))
+
+    def test_an_unclosed_fence_does_not_silently_revert(self) -> None:
+        # Runs to end of input rather than being skipped, so a malformed
+        # document cannot quietly restore the pre-fix behaviour.
+        self.assertFalse(mentions("text\n\n```text\nSUBMITTING\n", "SUBMITTING"))
+
+    def test_a_comment_inside_a_fence_does_not_end_a_section(self) -> None:
+        body = (
+            "## Target\n\nprose `EARLY` here\n\n"
+            "```bash\n# Inspect something\necho hi\n```\n\n"
+            "prose `LATE` here\n\n## Next\n\nnot in the section\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "doc.md"
+            path.write_text(body)
+            extracted = section(path, "## Target")
+        self.assertIn("`EARLY`", extracted)
+        self.assertIn("`LATE`", extracted, "a '#' comment in a fence ended the section")
+        self.assertNotIn("not in the section", extracted)
+
+
 class JsonContractTests(unittest.TestCase):
     """Every key the code emits is named wherever the JSON surface is documented.
 
@@ -165,19 +253,19 @@ class JsonContractTests(unittest.TestCase):
     because it is pinned; see the module docstring.
     """
 
-    #: Every section that documents the JSON surface, each held to the same bar.
-    BODIES = (
-        ("command-contracts.md", lambda: section(CONTRACTS, "## JSON contracts")),
-        ("README.md", lambda: section(README, "## JSON contracts")),
-    )
+    @classmethod
+    def setUpClass(cls) -> None:
+        # Every section that documents the JSON surface, each held to the same
+        # bar, read once rather than per token.
+        cls.bodies = (
+            ("command-contracts.md", section(CONTRACTS, "## JSON contracts")),
+            ("README.md", section(README, "## JSON contracts")),
+        )
 
     def assert_documented(self, token: str, message: str) -> None:
-        for name, load in self.BODIES:
+        for name, body in self.bodies:
             with self.subTest(document=name):
-                self.assertTrue(mentions(load(), token), f"{name}: {message}")
-
-    def setUp(self) -> None:
-        self.body = section(CONTRACTS, "## JSON contracts")
+                self.assertTrue(mentions(body, token), f"{name}: {message}")
 
     def test_jobs_entry_keys_are_documented(self) -> None:
         emitted = set(payload_keys(_assessment_payload))
