@@ -90,7 +90,7 @@ Use `up --dry-run` or `run --dry-run` to print a paste-ready submission command 
 | `partitions [--cluster NAME] [--json]` | Show live partition limits, GRES, and feature data for one cluster, plus whether your account may submit to each (`eligible`). |
 | `recover [OPERATION_ID] [--cluster NAME] [--abandon] [--yes]` | Reconcile ambiguous submit/cancel operations by exact queue or accounting identity, or explicitly abandon one local intent. |
 
-Resource flags shared by `up` and `run` are `--cluster`, `-p/--partition`, `-t/--time`, `-c/--cpus`, `--mem`, `-G/--gpus`, `-C/--constraint`, and `--dry-run`. `up` additionally accepts `--idle-timeout`, `--no-wait`, and `--wait-timeout`. `--idle-timeout` guards against a GPU allocation sitting idle, so it requires `-G/--gpus` and is rejected without it.
+Resource flags shared by `up` and `run` are `--cluster`, `-p/--partition`, `-t/--time`, `-c/--cpus`, `--mem`, `-G/--gpus`, `-C/--constraint`, and `--dry-run`. `up` additionally accepts `--idle-timeout`, `--no-wait`, and `--wait-timeout`. Where a flag defaults, it does so quietly: `up --name` is `dev`, `up --wait-timeout` is 1800 seconds, `logs -n` is 100 lines, and `setup --cluster` is `bouchet` — the one `--cluster` anywhere with a default, since every other command resolves it from the config instead. `--idle-timeout` guards against a GPU allocation sitting idle, so it requires `-G/--gpus` and is rejected without it.
 
 When you request a specific GPU type with `-G TYPE:N` but omit `-p/--partition`, `up` and `run` select the partition: if the default partition already offers that type it is kept, otherwise the tool auto-selects the single dedicated partition that offers it and prints which it chose; it refuses locally when several qualify, and when only preemptible or short pools offer the type it names them with `-p` guidance rather than dispatching an unschedulable request. Dedicated means a partition not matched by the cluster's `nondedicated_partition_globs` (default `scavenge*`, `*devel`). Selection reads a cached GPU-topology map, so a `--dry-run` resolves offline from a warm cache and prints the same partition a real submit would. It always prints a command, and warns on stderr whenever it could not resolve one: on a cold cache it says the topology is not cached, and on a warm cache that cannot pick — several dedicated partitions qualify, or none does — it gives the same refusal a real submit would. Either way it prints the configured default, so the printed partition is only what a real submit would use when no warning accompanies it. A live submit instead falls open to the configured default if the topology cannot be read.
 
@@ -115,14 +115,16 @@ partition = "day"
 gpu_partition = "gpu"
 time = "4:00:00"
 cpus = 2
-mem = "16G"
 idle_timeout = 30
+# mem = "16G"   # no built-in default; omitted, Slurm applies cluster policy
 
 [cluster.bouchet]
 host = "bouchet.ycrc.yale.edu"
 ```
 
 `[identity].netid` and at least one `[cluster.NAME].host` are required. The `[ssh]` and `[defaults]` tables may be empty. Every resource key accepted in `[defaults]` may also appear in a cluster table; a cluster value overrides the global default.
+
+The values shown above are the built-in defaults, with one exception: `mem` has none. Set it only to impose a floor of your own — a value here applies to every job, GPU work included — and leave it out to let each cluster's policy decide.
 
 `[defaults]` or a `[cluster.NAME]` table may also set `nondedicated_partition_globs`, a non-empty list of fnmatch globs marking partitions as non-dedicated (preemptible or short-lived); these are excluded from `-G TYPE:N` GPU auto-selection and flagged in `avail --for`. It defaults to `["scavenge*", "*devel"]` — set it when a cluster names those pools differently.
 
@@ -220,7 +222,7 @@ Final evidence is monotonic. Later missing or weaker observations cannot erase p
 
 For a valid identity-checked `PENDING` observation, `why` preserves the core diagnosis if an optional start estimate, priority lookup, or reservation listing fails because of an ordinary scheduler or transport error. It omits only the failed enrichment. Authentication requirements and host-key changes remain fatal instead of being hidden as missing detail.
 
-Foreground and follow behavior is intentionally command-specific:
+Foreground and follow behavior is intentionally command-specific. Every bullet below treats Ctrl-C, SIGTERM, and SIGHUP identically, so closing the terminal on a foreground `run` releases its job rather than leaking it for the whole walltime:
 
 - Ctrl-C or SIGTERM while `up` is waiting does not cancel the acknowledged allocation. The CLI prints its canonical selector plus `status` and `down` guidance, then returns 130; the allocation may remain queued or running.
 - Ctrl-C or SIGTERM during foreground `run` attempts to cancel the exact job, reports whether cancellation was confirmed, and returns 130. A cancellation that may have dispatched prints its operation ID and exact recovery command.
@@ -233,7 +235,7 @@ Foreground and follow behavior is intentionally command-specific:
 
 Progress and recovery notices go to stderr. JSON stdout remains machine-only. Argparse usage failures, including missing required arguments and invalid typed values, print usage and exit 2 before command dispatch; post-parse configuration, validation, scheduler, protocol, and other hpc-alloc application failures normally use exit 1. Exit 2 and exit 3 are contextual rather than globally reserved: a foreground batch command may itself return either status, while `ssh` and `sync` can return delegated OpenSSH or rsync statuses. Typed authentication, host-key, and transport failures use exit 3, and a possibly dispatched cancellation may surface its recovery guidance through a transport-class failure. Interpret these statuses together with the invoked command and stderr.
 
-`up` uses exit 4 for "submitted, not ready yet": its wait expired while the allocation was still queued. This is neither success nor failure, and it is an ordinary outcome on a busy GPU partition. The job remains submitted, durable, and tracked, so it must not be resubmitted — wait for it with `status`, follow it with `logs -f`, or release it with `down`.
+`up` uses exit 4 for "submitted, not ready yet": its wait expired without an active allocation on a visible node. Still queued is the usual reason and an ordinary outcome on a busy GPU partition, but every other non-final state at the deadline reports 4 as well — requeueing, suspended, or an observation too uncertain to classify — so read the printed state rather than assuming the queue. This is neither success nor failure. The job remains submitted, durable, and tracked, so it must not be resubmitted — wait for it with `status`, follow it with `logs -f`, or release it with `down`.
 
 ## JSON contracts
 

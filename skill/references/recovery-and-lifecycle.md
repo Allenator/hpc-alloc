@@ -31,7 +31,9 @@ Treat submission directory preparation as idempotent and separate from the batch
 
 If interruption rolls back the local reservation before its transaction commits, emit no recovery guidance because no operation exists and the remote submit was never entered. If interruption or transport loss occurs after dispatch may have begun, preserve the normal interrupt or error result, print `do not resubmit`, and use the exact recovery command; include a trusted job ID when the remote acknowledgement arrived but the local write failed.
 
-Recover a submission by finding exactly one live queue row with both the operation-derived name and complete comment, or by verifying an exact accounting row under the omission rule above. Adopt the proved job and persist final accounting through the normal lifecycle engine when applicable. Leave zero, duplicate, malformed, or identity-conflicting results unresolved, and never submit again merely because the reply was lost.
+A typed authentication or host-key failure from the `sbatch` call itself is the second thing that proves no job was created: it means the command never reached the scheduler, so the operation closes as `FAILED` with no recovery guidance. Every other lost or unreadable reply stays ambiguous.
+
+Recover a submission by finding exactly one live queue row with both the operation-derived name and complete comment, or by verifying an exact accounting row under the omission rule above. Accounting recovery reads only the last 30 days (`sacct -S now-30days`), so an older operation finds no record and stays unresolved rather than being reconciled; that is an absent lookback, not proof the job never existed. Adopt the proved job and persist final accounting through the normal lifecycle engine when applicable. Leave zero, duplicate, malformed, or identity-conflicting results unresolved, and never submit again merely because the reply was lost.
 
 ## Reconcile cancellation uncertainty
 
@@ -58,7 +60,7 @@ Use these assessment phases as policy authority:
 - Treat `STARTED_INACTIVE` as previously started but not currently active; keep it log-eligible.
 - Treat `REQUEUEING` as previously started and potentially able to run again.
 - Treat `TERMINAL_CANDIDATE` as one successful non-live observation, not finality; preserve any active allocation's SSH projection until finality is confirmed.
-- Treat `FINAL` as durable terminal authority with `ACCOUNTING`, `CONFIRMED_QUEUE`, `SUBMIT_FAILED`, or `ABANDONED` provenance.
+- Treat `FINAL` as durable terminal authority with accounting, confirmed-queue, submit-failed, or abandoned provenance (`final_source` serializes those in exactly that lowercase-hyphen spelling).
 - Treat `UNCERTAIN` as process-local observation failure that must not overwrite prior successful durable evidence or authorize cleanup.
 
 `status --json` and `why --json` may also report the durable phase `SUBMITTING`, which is not an assessment phase: it means the submission has no acknowledged Slurm job ID yet, so there is nothing to assess. A real job may nevertheless be running on the cluster. Never treat it as "nothing was submitted" and never resubmit; reconcile the printed `hpc-alloc recover OPERATION_ID` first, exactly as for any unresolved operation.

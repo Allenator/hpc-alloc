@@ -49,6 +49,8 @@ cluster:jobid
 
 Allow name selectors only where the command contract permits them. Prefer one current non-final job over retained history for name and numeric selectors; when ambiguity remains, use one of the canonical selectors printed by the error. Require a selector qualifier and explicit `--cluster` to agree.
 
+Always name the target for `ssh` and `why`, the two commands whose target is optional. Omitted, they infer one: the single non-final allocation, or the one named `dev` when several exist, across every cluster unless `--cluster` narrows it. That inference is convenience for a person at a keyboard with one seat, not a contract to rely on — a bare `ssh -- CMD` runs the command wherever the inference lands. `down` deliberately refuses the same guess because it is irreversible.
+
 Never treat a numeric job ID as durable ownership. When Slurm recycles it, reconcile the old job through its exact operation identity, show the replacement separately, and never rebind or mutate the old record by the number alone.
 
 Poll every configured cluster for `status`; require a configured primary when several clusters make implicit selection ambiguous. Let other single-job reads use a selector qualifier or `--cluster`; let unfiltered `recover` and `down --all` span clusters, and use `--cluster` to restrict them.
@@ -63,7 +65,8 @@ Treat JSON stdout as the stable machine surface and do not parse display text.
 - Read `status --json` as exactly three top-level arrays: `jobs`, `discovered`, and `operations`.
 - Read each `jobs` entry through its canonical `selector`, `operation_id`, `jobid`, `cluster`, `name`, `kind`, lifecycle and terminal fields, resources, node, and alias. Keep a job finalized during the pass in `jobs` once rather than repeating it in `discovered`.
 - Read each `discovered` entry through `job_kind` plus `classification`; accept `untracked-owned`, `other-machine`, `unresolved-operation-match`, `duplicate-operation`, `local-final-conflict`, and `operation-identity-conflict` as classification values, and treat its canonical selector as evidence rather than mutation authority.
-- Read each `operations` entry through `operation_id`, target-job `selector`, `kind`, `phase`, `cluster`, `target`, `jobid`, and `detail`.
+- Read each `operations` entry through `operation_id`, target-job `selector`, `kind` (`submit` or `cancel`), `phase`, `cluster`, `target`, `jobid`, and `detail`. A `phase` is one of `PREPARED`, `ACKNOWLEDGED`, `AMBIGUOUS`, `CANCEL_PENDING`, `RESOLVED`, `FAILED`, or `ABANDONED`; only the unresolved ones reach this array, and `recover` prints the same spelling back.
+- Match wire values, not the names used in prose: a job's `final_source` serializes as `accounting`, `confirmed-queue`, `submit-failed`, or `abandoned`, and `job_kind` as `allocation` or `run`. Compare against those exact strings.
 - Read `why --json` as one job assessment and diagnosis, `avail --json` as `{ "partitions": { ... } }` where each partition object carries an `eligible` flag (true, false, or null when access data is unavailable), `avail --for --json` as `{ "for": { resolved request }, "probes": [ { "partition", "preemptible", "schedulable", "start", "detail" } ], "capped": bool }` ordered soonest-first, where `capped` is true when more eligible partitions existed than were probed (with an added `error` string, `capped` false, and empty `probes` when the requested GPU type is unknown or unavailable), and `partitions --json` as an array of partition objects, each carrying an `eligible` flag (true, false, or null when access data is unavailable).
 - Rely only on the documented JSON fields; do not assume any other keys exist.
 
@@ -71,16 +74,19 @@ Treat JSON stdout as the stable machine surface and do not parse display text.
 
 Treat argparse usage failures, including missing required arguments and invalid typed values, as exit 2; they print usage and occur before command dispatch. Interpret a post-parse hpc-alloc validation, scheduler, protocol, or application failure as exit 1. Interpret typed authentication, host-key, or transport failures as exit 3, but inspect stderr and command context because exit statuses can be passed through.
 
-Interpret exit 4 from `up` as "submitted, not ready yet": the wait expired while the allocation was still queued. This is neither success nor failure. The job is submitted, durable, and tracked, so never resubmit it — poll `hpc-alloc status`, follow it with `hpc-alloc logs CLUSTER:JOBID -f`, or release it with `hpc-alloc down NAME`. On a busy GPU partition this is an ordinary outcome, not an error.
+Interpret exit 4 from `up` as "submitted, not ready yet": the wait expired without an active allocation on a visible node. Still queued is the ordinary reason, but every other non-final outcome lands here too — requeueing, suspended, active before its node is visible, or an observation too uncertain to classify — so read the printed state rather than assuming the queue. This is neither success nor failure. The job is submitted, durable, and tracked, so never resubmit it — poll `hpc-alloc status`, follow it with `hpc-alloc logs CLUSTER:JOBID -f`, or release it with `hpc-alloc down NAME`. On a busy GPU partition this is an ordinary outcome, not an error.
 
 Let foreground `run` return the numeric batch exit status when exact accounting provides it. When confirmed queue finality has no accounting exit status, return 0 for `COMPLETED` and 1 otherwise; coerce any non-`COMPLETED` final state with numeric status 0 to 1.
 
 Allow `run` to pass through any numeric application exit, including 2 or 3. Allow `ssh` to replace the client with OpenSSH and `sync` to return rsync's status, including 2 or 3; do not diagnose those statuses as parser or VPN failures without supporting stderr and command context.
 
+Read every interrupt below as Ctrl-C, SIGTERM, and SIGHUP alike: all three route through one path, so closing the terminal releases a foreground `run` exactly as Ctrl-C would, rather than leaking it for its whole walltime.
+
 - On Ctrl-C or SIGTERM while `up` waits after submission, preserve 130, do not cancel the allocation, and use the printed canonical selector with `status` or `down`.
 - On an ordinary scheduler, transport, or log failure while foreground `run` follows, do not cancel the submitted job; use the printed selector to reattach with `logs -f`, cancel it, or inspect an already durable-final record.
 - On Ctrl-C or SIGTERM while foreground `run` follows, attempt exact cancellation and preserve 130 whether cancellation succeeds, fails, or becomes ambiguous; follow any printed recovery command.
 - On a closed stdout pipe while foreground `run` follows, attempt exact cancellation and return 141; follow any printed recovery command when cancellation cannot be confirmed.
+- On an interrupt or a closed pipe while `run --detach` prints its submission notices, return 130 or 141 and never cancel: a detached job is meant to outlive its client, so only foreground `run` cancels on the way out.
 - On Ctrl-C, SIGTERM, or a closed pipe during `logs -f`, detach without cancellation; return 130 for the interrupt or 141 for the broken pipe.
 - On a clean `logs -f` completion, return 0 regardless of the job's final Slurm state.
 - On interruption during direct `cancel` or `down`, close an undispatched cancellation intent when durable phase proves dispatch never began; after dispatch may have begun, preserve 130 and follow the exact printed recovery command.
