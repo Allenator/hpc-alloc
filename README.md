@@ -2,13 +2,13 @@
 
 `hpc-alloc` submits ordinary Slurm batch jobs on Yale YCRC clusters and makes running allocation jobs reachable from a laptop over SSH. It is intended for interactive development on partitions where `salloc` is unavailable, as well as short-lived batch commands whose output should stream back to the caller.
 
-hpc-alloc requires Python 3.11 or newer and keeps all state in its own configuration file and SQLite database.
+It keeps all of its state in its own configuration file and SQLite database, and owns only the jobs it created.
 
 ## How it works
 
 For `hpc-alloc up`, the client submits a sleeper with `sbatch`, waits for Slurm to assign a node, and writes an SSH alias such as `hpc-bouchet.dev`. The alias ProxyJumps through the cluster login host. Login and compute-node connections use OpenSSH multiplexing, so one Duo authentication can serve later polling, SSH, and rsync commands.
 
-For `hpc-alloc run`, the client submits the requested command as a normal batch job. A foreground run follows the output and returns the batch exit status when final accounting provides it. If two exact successful queue observations establish finality before accounting supplies an exit status, it returns 0 for `COMPLETED` and 1 for every other final state. `--detach` leaves the job running for a later `hpc-alloc logs ... -f`.
+For `hpc-alloc run`, the client submits the requested command as a normal batch job. A foreground run follows its output and exits with the batch command's own status, or with one derived from the job's final state when accounting supplies none; `--detach` returns immediately and leaves the job running for a later `hpc-alloc logs ... -f`.
 
 Requirements:
 
@@ -25,9 +25,12 @@ cd hpc-alloc
 hpc-alloc setup --netid YOUR_NETID
 ```
 
-`install.sh` verifies Python, the launcher, the complete bundled skill package, and the complete runtime-module manifest under an isolated Python startup before creating any links. It then links the executable into `~/.local/bin` and the bundled skill into every agent harness it detects: Claude Code at `~/.claude/skills/hpc-alloc` and Codex at `~/.codex/skills/hpc-alloc` (`$CODEX_HOME/skills/hpc-alloc` when set). Both harnesses read the same `skill/` package. Detection looks for the launcher on `PATH` or the harness home directory; pass `--claude` or `--codex` to install for a target regardless of detection, and note that a run detecting no harness at all fails rather than reporting a success that installed no skill. These are symlinks, so keep the checked-out repository at its installed path.
+`install.sh` validates everything before it links anything: Python, the launcher, the bundled skill package, and the runtime-module manifest, all under an isolated Python startup. It then creates symlinks — so keep the checked-out repository where it is — for:
 
-Codex sandboxes commands to the workspace with restricted network access by default, while hpc-alloc needs the network on every cluster-touching command and writes durable state under `~/.config/hpc-alloc/` and `~/.ssh/`. Approve those escalations when Codex requests them, but keep any standing approval to the read-only verbs — `status`, `config`, `avail`, `partitions`, `why`, and `logs`. A blanket `hpc-alloc` approval rule also pre-approves `run` and `ssh`, which execute arbitrary remote commands, along with `sync --delete`, `cancel`, and `down --all`; leave those to prompt each time. A denial that interrupts a submit is an unknown remote outcome, not proof that nothing was submitted, so run `hpc-alloc status` and reconcile any unresolved operation rather than retrying.
+- the launcher, at `~/.local/bin/hpc-alloc`
+- the skill, in every agent harness it finds: Claude Code at `~/.claude/skills/hpc-alloc`, Codex at `~/.codex/skills/hpc-alloc` (or `$CODEX_HOME/skills/hpc-alloc`)
+
+Both harnesses read the same `skill/` package. A harness counts as found when its launcher is on `PATH` or its home directory exists; `--claude` or `--codex` installs for one regardless. Finding none is a failure rather than a success that installed no skill.
 
 `setup` validates and writes the authoritative config, initializes the SQLite state database, finds or creates an SSH key, and adds one `Include` to `~/.ssh/config`. Upload the printed public key at <https://sshkeys.ycrc.yale.edu/>, wait for propagation, then authenticate:
 
@@ -35,9 +38,17 @@ Codex sandboxes commands to the workspace with restricted network access by defa
 hpc-alloc connect
 ```
 
-Stateful commands hold a shared configuration-scope lock, while `setup` holds the exclusive side through its authoritative recheck and all mutations. A forced setup cannot change the NetID, remove a blocker-referenced cluster, or change that cluster's normalized login host while any job is non-final or any operation is unresolved. Same-scope replacement remains allowed. Use `hpc-alloc status`, finish or cancel remaining jobs, and run the printed `hpc-alloc recover OPERATION_ID` commands before changing scope. Once every job is final and every operation resolved, `setup --force` may change it.
+`connect --push` performs the same bootstrap with one Duo push, so expect a phone prompt — and expect it before letting an unattended agent run it.
 
-`connect --push` performs the same bootstrap with one Duo push. Tell the user to expect and approve that push before invoking it from an unattended agent.
+Changing the config later is deliberately constrained. Stateful commands hold a shared configuration-scope lock while `setup` holds the exclusive side, and `setup --force` will not change your NetID, remove a cluster something still references, or move that cluster's login host while any job is non-final or any operation unresolved. Replacing a config within the same scope is always allowed. To change scope, run `hpc-alloc status`, finish or cancel what remains, and reconcile the printed `hpc-alloc recover OPERATION_ID` commands first.
+
+## Running under an agent
+
+The bundled skill teaches Claude Code and Codex how to drive hpc-alloc safely. It loads on demand, so it costs a session nothing until the cluster comes up.
+
+Codex also sandboxes commands to the workspace and restricts network access, while hpc-alloc needs the network on every cluster-touching command and writes durable state under `~/.config/hpc-alloc/` and `~/.ssh/`. Approve those escalations when Codex asks — but keep any standing approval to the read-only verbs: `status`, `config`, `avail`, `partitions`, `why`, and `logs`. A blanket `hpc-alloc` rule would also pre-approve `run` and `ssh`, which execute arbitrary commands on the cluster, along with `sync --delete`, `cancel`, and `down --all`. Leave those to prompt every time; that prompt is the last thing standing between an agent and a cancelled seat. The bundled skill states the same division to the agent, deliberately: it obeys the prompt, while deciding what to pre-approve is yours.
+
+A denial that interrupts a submit is an unknown remote outcome, not proof that nothing was submitted. Run `hpc-alloc status` and reconcile any unresolved operation rather than retrying.
 
 ## Common workflow
 
@@ -74,10 +85,10 @@ Use `up --dry-run` or `run --dry-run` to print a paste-ready submission command 
 
 | Command | Purpose |
 |---|---|
-| `setup [--netid NETID] [--cluster NAME] [--host HOST] [--identity-file PATH] [--force]` | Create the config, state database, key material, and managed SSH include. Existing config requires `--force`. `--force` never re-keys: an `identity_file` already in the config is kept, because the key it names is the one registered with the cluster. Change it deliberately with `--identity-file`; if a configured key has vanished from disk, setup fails rather than silently substituting one that the cluster will reject. |
+| `setup [--netid NETID] [--cluster NAME] [--host HOST] [--identity-file PATH] [--force]` | Create the config, state database, key material, and managed SSH include. Replacing an existing config requires `--force`. |
 | `config [--cluster NAME] [--json]` | Validate config and show the effective resource values without contacting a cluster. |
 | `connect [--cluster NAME] [--reset] [--push]` | Establish or heal the login master and health-check known allocation nodes. |
-| `up [--name NAME] [--cluster NAME] [resources] [--idle-timeout MIN] [--no-wait] [--wait-timeout SEC]` | Submit a persistent sleeper allocation. The default waits for a node and exits 0 once one is ready; if the wait expires with the job still queued it exits 4, and the job stays submitted and tracked. `--no-wait` returns after durable submission acknowledgement without observing the scheduler state. |
+| `up [--name NAME] [--cluster NAME] [resources] [--idle-timeout MIN] [--no-wait] [--wait-timeout SEC]` | Submit a persistent sleeper allocation and wait for its node. `--no-wait` returns as soon as the submission is durable, without observing the scheduler. |
 | `run [--cluster NAME] [resources] [--chdir DIR] [--detach] -- CMD...` | Submit a command. Foreground mode follows output and returns the accounting exit status or the documented final-state fallback. |
 | `status [--json]` | Reconcile locally journaled jobs and classify hpc-alloc-tagged queue rows across all configured clusters. |
 | `why [TARGET] [--cluster NAME] [--json]` | Explain a queued, running, uncertain, or final job selected by name, job ID, or `@operation`. |
@@ -85,10 +96,16 @@ Use `up --dry-run` or `run --dry-run` to print a paste-ready submission command 
 | `cancel (JOBID\|@OPERATION) [--cluster NAME]` | Cancel a managed job only after exact remote identity verification. |
 | `down NAME\|JOBID\|@OPERATION\|--all [--cluster NAME]` | Cancel one or all managed allocation jobs. The target is required: `down` is irreversible, so it never guesses which allocation you meant. |
 | `ssh [--cluster NAME] [NAME\|JOBID\|@OPERATION] [-- CMD...]` | Open an allocation shell or run a command there. |
-| `sync (NAME\|JOBID\|@OPERATION) SRC DST [--cluster NAME] [--pull] [--delete]` | Transfer files with rsync through the allocation alias. rsync expands the remote path through the remote login shell — which is what makes `'~/project'` work — so the remote path is restricted to `A-Za-z0-9_@%+=:,./~-` and a path containing a space, quote, glob, or `$(...)` is rejected rather than silently re-split by that shell. |
-| `avail [--cluster NAME] [-p PARTITION] [--json]` | Summarize idle CPUs and free GPUs for one cluster (idle GRES is not a schedulability guarantee), marking each partition with whether your account may submit to it (`ELIGIBLE` column; `eligible` in `--json`). With `--for` plus a request (`-G/-c/--mem/-t/-C`), probe where that request would start soonest across the eligible partitions — a scheduler dry-run that submits no job, ranked by advisory estimated start; preemptible or short pools are shown but marked, and `--json` carries a `capped` flag when more eligible partitions existed than were probed. |
+| `sync (NAME\|JOBID\|@OPERATION) SRC DST [--cluster NAME] [--pull] [--delete]` | Transfer files with rsync through the allocation alias. `--pull` reverses the direction; `--delete` is destructive and needs explicit intent. |
+| `avail [--cluster NAME] [-p PARTITION] [--for] [--json]` | Summarize idle CPUs and free GPUs for one cluster, marking which partitions your account may submit to. With `--for` plus a request (`-G/-c/--mem/-t/-C`), probe where that request would start soonest. |
 | `partitions [--cluster NAME] [--json]` | Show live partition limits, GRES, and feature data for one cluster, plus whether your account may submit to each (`eligible`). |
 | `recover [OPERATION_ID] [--cluster NAME] [--abandon] [--yes]` | Reconcile ambiguous submit/cancel operations by exact queue or accounting identity, or explicitly abandon one local intent. |
+
+`setup --force` never re-keys. An `identity_file` already in the config is kept, because the key it names is the one registered with the cluster; change it deliberately with `--identity-file`. If a configured key has vanished from disk, setup fails rather than silently substituting one the cluster will reject.
+
+`avail` reports what is idle at this instant, which is not a schedulability guarantee — reserved or higher-priority nodes can still queue you. Each partition carries an eligibility marker (`ELIGIBLE` in the text output, `eligible` in `--json`) so capacity you cannot submit to is not mistaken for yours. `avail --for` goes further and asks the scheduler where a given request would start soonest: a dry run that submits nothing, ranked by an estimate the queue can invalidate a moment later. Preemptible and short pools appear but are marked, since `up` and `run` never auto-select them.
+
+`sync` hands the remote path to rsync, which expands it through the remote login shell — that is what makes `'~/project'` work. The remote path is therefore restricted to `A-Za-z0-9_@%+=:,./~-`, and one containing a space, quote, glob, or `$(...)` is rejected rather than silently re-split by that shell.
 
 Resource flags shared by `up` and `run` are `--cluster`, `-p/--partition`, `-t/--time`, `-c/--cpus`, `--mem`, `-G/--gpus`, `-C/--constraint`, and `--dry-run`. `up` additionally accepts `--idle-timeout`, `--no-wait`, and `--wait-timeout`. Where a flag defaults, it does so quietly: `up --name` is `dev`, `up --wait-timeout` is 1800 seconds, `logs -n` is 100 lines, and `setup --cluster` is `bouchet` — the one `--cluster` anywhere with a default, since every other command resolves it from the config instead. `--idle-timeout` guards against a GPU allocation sitting idle, so it requires `-G/--gpus` and is rejected without it.
 
