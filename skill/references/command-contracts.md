@@ -6,12 +6,12 @@ Use this reference to choose exact invocations and interpret public CLI results.
 
 | Command | Contract |
 |---|---|
-| `hpc-alloc setup --netid NETID [--cluster C] [--host HOST] [--identity-file PATH] [--force]` | Validate and write the authoritative v2 configuration, initialize state, find or create key material, and install the managed SSH include. Require `--force` to replace an existing config. `--force` repairs a NetID or host mistake and never re-keys: a configured `identity_file` is preserved, since that key is the one registered with the cluster. Re-key only with an explicit `--identity-file`. |
+| `hpc-alloc setup --netid NETID [--cluster C] [--host HOST] [--identity-file PATH] [--force]` | Validate and write the authoritative configuration, initialize state, find or create key material, and install the managed SSH include. Require `--force` to replace an existing config. `--force` repairs a NetID or host mistake and never re-keys: a configured `identity_file` is preserved, since that key is the one registered with the cluster. Re-key only with an explicit `--identity-file`. |
 | `hpc-alloc config [--cluster C] [--json]` | Validate configuration and report effective resource values without cluster access. |
 | `hpc-alloc connect [--cluster C] [--reset] [--push]` | Establish or heal login masters and health-check known allocation nodes; use `--push` only after warning the user about one Duo push. |
 | `hpc-alloc up [--name N] [resources] [--idle-timeout MIN] [--no-wait] [--wait-timeout SEC]` | Submit a persistent sleeper allocation. Wait for an active node unless `--no-wait` returns immediately after durable submission acknowledgement. Exit 0 means a node is ready; exit 4 means the wait expired with the job still queued — it is submitted and tracked, so wait rather than resubmit. `--idle-timeout` guards an idle GPU allocation and requires `-G/--gpus`; it is rejected without it. |
 | `hpc-alloc run [resources] [--chdir DIR] [--detach] -- CMD...` | Submit a finite batch command. Follow its operation-scoped log in foreground mode or return after acknowledged submission with `--detach`. |
-| `hpc-alloc status [--json]` | Reconcile locally journaled jobs and classify v2-tagged queue rows across every configured cluster. |
+| `hpc-alloc status [--json]` | Reconcile locally journaled jobs and classify hpc-alloc-tagged queue rows across every configured cluster. |
 | `hpc-alloc why [TARGET] [--cluster C] [--json]` | Diagnose the selected queued, active, inactive, uncertain, or final job and persist any applicable delayed accounting evidence. |
 | `hpc-alloc logs TARGET [--cluster C] [-n LINES] [-f]` | Read or follow an operation-scoped managed log. Wait safely for start with `-f`; never make follow imply cancellation. |
 | `hpc-alloc cancel JOBID\|@OPERATION [--cluster C]` | Cancel a managed allocation or run only after exact live identity verification; reject logical-name selectors. |
@@ -65,7 +65,7 @@ Treat JSON stdout as the stable machine surface and do not parse display text.
 - Read each `discovered` entry through `job_kind` plus `classification`; accept `untracked-owned`, `other-machine`, `unresolved-operation-match`, `duplicate-operation`, `local-final-conflict`, and `operation-identity-conflict` as classification values, and treat its canonical selector as evidence rather than mutation authority.
 - Read each `operations` entry through `operation_id`, target-job `selector`, `kind`, `phase`, `cluster`, `target`, `jobid`, and `detail`.
 - Read `why --json` as one job assessment and diagnosis, `avail --json` as `{ "partitions": { ... } }` where each partition object carries an `eligible` flag (true, false, or null when access data is unavailable), `avail --for --json` as `{ "for": { resolved request }, "probes": [ { "partition", "preemptible", "schedulable", "start", "detail" } ], "capped": bool }` ordered soonest-first, where `capped` is true when more eligible partitions existed than were probed (with an added `error` string, `capped` false, and empty `probes` when the requested GPU type is unknown or unavailable), and `partitions --json` as an array of partition objects, each carrying an `eligible` flag (true, false, or null when access data is unavailable).
-- Reject assumptions about v1 fields such as `allocs`, heuristic `orphan`, `recent`, or legacy JSON aliases.
+- Rely only on the documented JSON fields; do not assume any other keys exist.
 
 ## Exit, stream, and signal policy
 

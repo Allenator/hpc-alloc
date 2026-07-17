@@ -1,4 +1,4 @@
-# Authoritative hpc-alloc v2 configuration (Python 3.11+).
+# Authoritative hpc-alloc configuration (Python 3.11+).
 # Copy to ~/.config/hpc-alloc/config.toml, or let `hpc-alloc setup` create it.
 #
 # Resource precedence:
@@ -20,7 +20,7 @@ identity_file = "~/.ssh/id_ed25519"
 # several clusters are configured.
 cluster = "bouchet"
 
-# Optional resource defaults. These are the v2 built-in values shown here.
+# Optional resource defaults. These are the built-in values shown here.
 partition = "day"
 gpu_partition = "gpu"
 time = "4:00:00"

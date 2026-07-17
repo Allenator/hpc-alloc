@@ -1,4 +1,4 @@
-"""Strict Python 3.11+ TOML configuration for hpc-alloc v2."""
+"""Strict Python 3.11+ TOML configuration for hpc-alloc."""
 
 from __future__ import annotations
 

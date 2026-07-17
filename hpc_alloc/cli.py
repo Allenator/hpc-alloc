@@ -1,4 +1,4 @@
-"""Command-line entry point for hpc-alloc v2."""
+"""Command-line entry point for hpc-alloc."""
 
 from __future__ import annotations
 
@@ -36,11 +36,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command_name", required=True)
 
-    setup = sub.add_parser("setup", help="write v2 configuration and initialize state")
+    setup = sub.add_parser("setup", help="write the configuration and initialize state")
     setup.add_argument("--netid", help="Yale NetID")
     setup.add_argument("--cluster", default="bouchet", help="cluster name")
     setup.add_argument("--host", help="login host (default: <cluster>.ycrc.yale.edu)")
-    setup.add_argument("--force", action="store_true", help="replace the v2 config")
+    setup.add_argument("--force", action="store_true", help="replace the existing config")
     setup.add_argument(
         "--identity-file",
         help="SSH private key to authenticate with (default: keep the configured one)",
@@ -82,7 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
     logs.add_argument("-n", "--lines", type=int, default=100)
     add_cluster_flag(logs)
 
-    cancel = sub.add_parser("cancel", help="cancel an exact v2-owned job")
+    cancel = sub.add_parser("cancel", help="cancel an exact hpc-alloc-owned job")
     cancel.add_argument("target", help="job ID, @operation, or cluster-qualified form")
     add_cluster_flag(cancel)
 

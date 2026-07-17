@@ -14,7 +14,7 @@ Never replay an operation whose remote outcome may be unknown. Preserve the exac
 
 ## Require exact identity
 
-Recognize these v2 identity forms:
+Recognize these identity forms:
 
 ```text
 hpcalloc-v2-<alloc|run>-<32-hex-operation-id>

@@ -673,7 +673,7 @@ class SlurmClient:
 
         Some Slurm accounting deployments retain ``JobName`` but return an
         empty ``Comment`` even though the live queue row contained it.  The
-        persisted v2 job name embeds the full random operation UUID, so that
+        persisted job name embeds the full random operation UUID, so that
         exact name is sufficient only when accounting omitted Comment.  A
         nonempty comment remains authoritative and must match byte-for-byte.
         """
@@ -815,7 +815,7 @@ class SlurmClient:
         *,
         auth: AuthMode = AuthMode.NONINTERACTIVE,
     ) -> AccountingRecord | None:
-        """Find one recent parent record by exact v2 Slurm job name.
+        """Find one recent parent record by exact Slurm job name.
 
         This is the recovery path for an ``sbatch`` that may have committed
         before its reply was lost.  Duplicate exact records are deliberately a

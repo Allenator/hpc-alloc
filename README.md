@@ -2,7 +2,7 @@
 
 `hpc-alloc` submits ordinary Slurm batch jobs on Yale YCRC clusters and makes running allocation jobs reachable from a laptop over SSH. It is intended for interactive development on partitions where `salloc` is unavailable, as well as short-lived batch commands whose output should stream back to the caller.
 
-The v2 implementation is a deliberate clean cut. It requires Python 3.11 or newer and does not read, import, or manage v1 configuration, `state.json`, job names, or Slurm comments.
+hpc-alloc requires Python 3.11 or newer and keeps all state in its own configuration file and SQLite database.
 
 ## How it works
 
@@ -27,7 +27,7 @@ hpc-alloc setup --netid YOUR_NETID
 
 `install.sh` verifies Python, the launcher, the complete bundled skill package, and the complete runtime-module manifest under an isolated Python startup before creating any links. It then links the executable into `~/.local/bin` and the bundled Claude Code skill into `~/.claude/skills/hpc-alloc`. These are symlinks, so keep the checked-out repository at its installed path.
 
-`setup` validates and writes the authoritative v2 config, initializes the SQLite state database, finds or creates an SSH key, and adds one `Include` to `~/.ssh/config`. Upload the printed public key at <https://sshkeys.ycrc.yale.edu/>, wait for propagation, then authenticate:
+`setup` validates and writes the authoritative config, initializes the SQLite state database, finds or creates an SSH key, and adds one `Include` to `~/.ssh/config`. Upload the printed public key at <https://sshkeys.ycrc.yale.edu/>, wait for propagation, then authenticate:
 
 ```bash
 hpc-alloc connect
@@ -37,14 +37,10 @@ Stateful commands hold a shared configuration-scope lock, while `setup` holds th
 
 `connect --push` performs the same bootstrap with one Duo push. Tell the user to expect and approve that push before invoking it from an unattended agent.
 
-### Clean cut from v1
-
-There is no migration path in the executable. A v1 `state.json` is ignored, and jobs carrying a v1 name or comment are not considered owned. Replace an old config with `hpc-alloc setup --force --netid YOUR_NETID` only after the v2 journal has no setup blockers; archive or remove old files separately if they are no longer needed. Existing v1 jobs must be handled outside v2 rather than adopted by a heuristic match.
-
 ## Common workflow
 
 ```bash
-# Inspect local journal entries and exact v2 jobs found on every cluster.
+# Inspect local journal entries and exact hpc-alloc jobs found on every cluster.
 hpc-alloc status
 
 # See available capacity, then create a persistent CPU allocation.
@@ -76,12 +72,12 @@ Use `up --dry-run` or `run --dry-run` to print a paste-ready submission command 
 
 | Command | Purpose |
 |---|---|
-| `setup [--netid NETID] [--cluster NAME] [--host HOST] [--identity-file PATH] [--force]` | Create the v2 config, state database, key material, and managed SSH include. Existing config requires `--force`. `--force` never re-keys: an `identity_file` already in the config is kept, because the key it names is the one registered with the cluster. Change it deliberately with `--identity-file`; if a configured key has vanished from disk, setup fails rather than silently substituting one that the cluster will reject. |
+| `setup [--netid NETID] [--cluster NAME] [--host HOST] [--identity-file PATH] [--force]` | Create the config, state database, key material, and managed SSH include. Existing config requires `--force`. `--force` never re-keys: an `identity_file` already in the config is kept, because the key it names is the one registered with the cluster. Change it deliberately with `--identity-file`; if a configured key has vanished from disk, setup fails rather than silently substituting one that the cluster will reject. |
 | `config [--cluster NAME] [--json]` | Validate config and show the effective resource values without contacting a cluster. |
 | `connect [--cluster NAME] [--reset] [--push]` | Establish or heal the login master and health-check known allocation nodes. |
 | `up [--name NAME] [--cluster NAME] [resources] [--idle-timeout MIN] [--no-wait] [--wait-timeout SEC]` | Submit a persistent sleeper allocation. The default waits for a node and exits 0 once one is ready; if the wait expires with the job still queued it exits 4, and the job stays submitted and tracked. `--no-wait` returns after durable submission acknowledgement without observing the scheduler state. |
 | `run [--cluster NAME] [resources] [--chdir DIR] [--detach] -- CMD...` | Submit a command. Foreground mode follows output and returns the accounting exit status or the documented final-state fallback. |
-| `status [--json]` | Reconcile locally journaled jobs and classify v2-tagged queue rows across all configured clusters. |
+| `status [--json]` | Reconcile locally journaled jobs and classify hpc-alloc-tagged queue rows across all configured clusters. |
 | `why [TARGET] [--cluster NAME] [--json]` | Explain a queued, running, uncertain, or final job selected by name, job ID, or `@operation`. |
 | `logs TARGET [--cluster NAME] [-n LINES] [-f]` | Read or follow a managed job log by convenience or durable selector. |
 | `cancel (JOBID\|@OPERATION) [--cluster NAME]` | Cancel a managed job only after exact remote identity verification. |
@@ -162,7 +158,7 @@ An exact durable selector for a retained final record remains meaningful after a
 
 ## Durable state and recovery
 
-Tool-owned state lives in `~/.config/hpc-alloc/state.db`, a mode-0600 SQLite database using WAL mode. SQLite may create `state.db-wal`, `state.db-shm`, and a rollback journal. Do not edit or copy individual files from an active database. This release uses a clean-cut state schema and provides no migration; archive or remove an older database only after accounting for any still-running remote jobs, then run setup again.
+Tool-owned state lives in `~/.config/hpc-alloc/state.db`, a mode-0600 SQLite database using WAL mode. SQLite may create `state.db-wal`, `state.db-shm`, and a rollback journal. Do not edit or copy individual files from an active database. This release has a fixed state schema and provides no migration tooling; archive or remove an older database only after accounting for any still-running remote jobs, then run setup again.
 
 The database records the machine identity, jobs, lifecycle evidence and its final source, cluster caches, and a durable operation journal. Submission and cancellation follow a prepare/remote-call/acknowledge protocol with short local transactions:
 
@@ -185,7 +181,7 @@ If submission is interrupted before its reservation commits, the transaction rol
 
 With an explicit operation ID, `recover --cluster NAME` validates the requested cluster against the operation's recorded cluster before prompting, changing local state, or contacting a cluster. A mismatch fails closed. Recovering an already-resolved operation reports its durable phase and succeeds; `--abandon` continues to reject resolved operations.
 
-Submission recovery requires the exact operation-derived v2 job name. A live queue match must also contain the complete expected comment. Accounting reads explicitly request full-width identity columns; Bouchet accounting may still omit `Comment`, so an empty accounting comment is accepted only with the exact job name. Any nonempty accounting comment must match the persisted comment byte-for-byte, so truncated or mismatched identities fail closed. If there is still no conclusive match, the operation remains unresolved.
+Submission recovery requires the exact operation-derived job name. A live queue match must also contain the complete expected comment. Accounting reads explicitly request full-width identity columns; Bouchet accounting may still omit `Comment`, so an empty accounting comment is accepted only with the exact job name. Any nonempty accounting comment must match the persisted comment byte-for-byte, so truncated or mismatched identities fail closed. If there is still no conclusive match, the operation remains unresolved.
 
 The cancellation journal records dispatch certainty explicitly. `CANCEL_PENDING` means the guarded remote call was never dispatched, while `AMBIGUOUS` is committed immediately before the one guarded call and means it may have run. Both phases block another cancellation for the same job until they are resolved or explicitly abandoned.
 
@@ -201,7 +197,7 @@ For bulk recovery, locally resolvable cancellations are processed before operati
 
 ### Exact ownership
 
-Each mutation gets a random 32-hex-character operation ID. A v2 Slurm job uses both of these identifiers:
+Each mutation gets a random 32-hex-character operation ID. A Slurm job created by hpc-alloc uses both of these identifiers:
 
 ```text
 job name: hpcalloc-v2-<alloc|run>-<operation_id>
@@ -235,7 +231,7 @@ Progress and recovery notices go to stderr. JSON stdout remains machine-only. Ar
 
 ## JSON contracts
 
-The v2 JSON surfaces are intentionally explicit:
+The JSON surfaces are intentionally explicit:
 
 - `config --json` returns `config_file`, `state_file`, `primary_cluster`, the validated `config`, and `effective` resource values.
 - `status --json` returns exactly three top-level arrays: `jobs`, `discovered`, and `operations`. `jobs` carry a canonical `selector` plus operation, scheduler, lifecycle, terminal, resource, node, and alias fields. A job finalized during reconciliation appears once in `jobs`, not again as a discovered conflict. `discovered` separates `job_kind` (`allocation` or `run`) from `classification` (`untracked-owned`, `other-machine`, `unresolved-operation-match`, `duplicate-operation`, `local-final-conflict`, or `operation-identity-conflict`). `operations` contains unresolved submit/cancel journal rows, their target-job `selector`, and recovery details.
@@ -243,7 +239,7 @@ The v2 JSON surfaces are intentionally explicit:
 - `avail --json` returns `{ "partitions": { ... } }`, where each partition object carries an `eligible` flag (true, false, or null when access data is unavailable); `avail --for --json` returns `{ "for": { resolved request }, "probes": [ { "partition", "schedulable", "start", "detail" } ] }`, ordered soonest-first, and instead carries an `error` string with empty `probes` when the requested `-G TYPE:N` names a GPU type no partition offers.
 - `partitions --json` returns an array of partition objects, each with an `eligible` flag (`true`, `false`, or `null` when access data is unavailable).
 
-Consumers should use `kind` for managed jobs, `job_kind` plus `classification` for discovered rows, and canonical `selector` values for later actions. Do not parse display text. There are no v1 JSON aliases.
+Consumers should use `kind` for managed jobs, `job_kind` plus `classification` for discovered rows, and canonical `selector` values for later actions. Do not parse display text.
 
 ## GPU policy
 

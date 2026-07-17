@@ -1,4 +1,4 @@
-"""Strong v2 Slurm job identity encoding, and the name grammars it rests on.
+"""Strong Slurm job identity encoding, and the name grammars it rests on.
 
 The grammars live here, in the one module with no internal imports, because
 every layer needs them and they must agree exactly.  They used to be written out

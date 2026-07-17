@@ -7,17 +7,15 @@ loop can be patient with errors while still being a good citizen on the wire.
 
 Bounded patience for transient scheduler and transport failures.
 
-v1 wrapped both of its polling loops in bounded retries: roughly two minutes of
-patience for scheduler errors, and a ten-minute reconnect window for transport
-drops.  The v2 rewrite kept only ``SshTransport.run``'s single heal-and-retry,
-which fires solely on an ssh rc-255 or timeout -- so it never retries
-``SchedulerUnavailable`` at all, because a scheduler query that runs and exits
-nonzero leaves ssh itself exiting 0.
-
-The result was that one scheduler restart, a twenty-second laptop sleep, or a
-VPN blip aborted ``up``'s wait and every ``run`` / ``logs -f`` stream outright,
-while the GPU job it was watching kept running and burning its allocation.  This
-module restores the missing budgets in one place so both loops share them.
+``SshTransport.run`` has a single heal-and-retry that fires solely on an ssh
+rc-255 or timeout, so on its own it never retries ``SchedulerUnavailable`` at
+all: a scheduler query that runs and exits nonzero leaves ssh itself exiting 0.
+Without a shared budget, one scheduler restart, a twenty-second laptop sleep, or
+a VPN blip would abort ``up``'s wait and every ``run`` / ``logs -f`` stream
+outright, while the GPU job it was watching kept running and burning its
+allocation.  This module keeps the budgets in one place so both loops share
+them: roughly two minutes of patience for scheduler errors, and a ten-minute
+reconnect window for transport drops.
 """
 
 from __future__ import annotations

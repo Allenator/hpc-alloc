@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Strict offline v2 suite. No cluster, network, credentials, or legacy state required.
+# Strict offline test suite. No cluster, network, credentials, or legacy state required.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -27,4 +27,4 @@ export PYTHONWARNINGS=error
 python3 -m unittest discover -s tests -t . -v
 python3 -m py_compile hpc-alloc hpc_alloc/*.py
 
-echo "all hpc-alloc v2 tests passed"
+echo "all hpc-alloc tests passed"

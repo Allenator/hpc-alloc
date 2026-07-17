@@ -24,7 +24,7 @@ from .models import (
 
 
 INCLUDE_LINE = "Include ~/.config/hpc-alloc/ssh_config"
-_MANAGED_HEADER = "# Managed by hpc-alloc v2 — regenerated; do not edit."
+_MANAGED_HEADER = "# Managed by hpc-alloc — regenerated; do not edit."
 # Built from the shared identifier grammar rather than restating it: an alias is
 # exactly "hpc-<cluster>.<name>", so if the grammar for either widens and this
 # regex does not, every projected stanza silently stops being recognized -- and

@@ -1,11 +1,11 @@
 ---
 name: hpc-alloc
-description: Allocate and use Yale YCRC compute nodes for development, submit CPU/GPU batch commands, synchronize files, diagnose jobs, reconcile ambiguous mutations, and safely release exact v2-owned jobs. Use when a user asks to inspect, allocate, use, recover, or release YCRC cluster resources.
+description: Allocate and use Yale YCRC compute nodes for development, submit CPU/GPU batch commands, synchronize files, diagnose jobs, reconcile ambiguous mutations, and safely release exact hpc-alloc-owned jobs. Use when a user asks to inspect, allocate, use, recover, or release YCRC cluster resources.
 ---
 
-# hpc-alloc v2
+# hpc-alloc
 
-Use `hpc-alloc` from the user's laptop to manage ordinary Slurm batch jobs and SSH access to running allocation jobs. Treat v2 as a clean cut requiring Python 3.11+; do not import or infer identity from v1 configuration, `state.json`, job names, comments, or aliases.
+Use `hpc-alloc` from the user's laptop to manage ordinary Slurm batch jobs and SSH access to running allocation jobs. It requires Python 3.11+ and owns only the jobs it created, identified by the exact durable operation identity it stamped on them; never infer ownership from a configuration file, `state.json`, job name, comment, or alias.
 
 ## Start safely
 
@@ -33,7 +33,7 @@ Treat a host-key change as a hard stop until the user verifies the new key throu
 ## Apply non-negotiable safety rules
 
 - Never run heavy computation on a login node.
-- Never infer ownership from a logical name, numeric job ID, prefix, hostname, or v2-looking tag; require the exact durable operation identity.
+- Never infer ownership from a logical name, numeric job ID, prefix, hostname, or a tag that merely looks like hpc-alloc's; require the exact durable operation identity.
 - Never call `scancel` directly; use `cancel` or `down` so the CLI verifies identity and journals the mutation.
 - Never retry an ambiguous submit or cancellation; use observation-only recovery and preserve the printed operation ID.
 - Never edit or query `~/.config/hpc-alloc/state.db` to bypass the CLI, and never delete or copy one live SQLite sidecar in isolation.

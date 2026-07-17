@@ -1,4 +1,4 @@
-"""Command orchestration for hpc-alloc v2.
+"""Command orchestration for hpc-alloc.
 
 Services in this module may format user output, but transport, Slurm parsing,
 lifecycle policy, and durable transactions remain in their dedicated modules.
@@ -364,7 +364,7 @@ def _render_initial_config(netid: str, cluster: str, host: str, identity_file: s
         f"identity_file = {_toml_string(identity_file)}\n" if identity_file else ""
     )
     return (
-        "# hpc-alloc v2 configuration (Python 3.11+).\n\n"
+        "# hpc-alloc configuration (Python 3.11+).\n\n"
         "[identity]\n"
         f"netid = {_toml_string(netid)}\n\n"
         "[ssh]\n"
@@ -616,7 +616,7 @@ def cmd_setup(args: Any, *, paths: AppPaths, entrypoint: Path) -> int:
         config_exists = paths.config_file.exists()
         if config_exists and not args.force:
             raise ConfigInvalid(
-                "v2 configuration already exists; pass setup --force to replace it",
+                "configuration already exists; pass setup --force to replace it",
                 path=paths.config_file,
             )
 
@@ -1502,7 +1502,7 @@ def cmd_status(
                 )
             )
     if discovered:
-        print("\nDISCOVERED V2 JOBS")
+        print("\nDISCOVERED JOBS")
         for row in discovered:
             print(
                 f"  {row['cluster']}:{row['jobid']} {row['state']} "

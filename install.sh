@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install hpc-alloc v2 by linking the CLI and bundled Claude Code skill.
+# Install hpc-alloc by linking the CLI and bundled Claude Code skill.
 set -euo pipefail
 
 if ! command -v python3 >/dev/null 2>&1; then
@@ -129,6 +129,6 @@ ln -sfn "$here/skill" "$skills_dir/hpc-alloc"
 echo "linked $skills_dir/hpc-alloc -> $here/skill"
 
 echo
-echo "hpc-alloc v2 requires a new authoritative config and SQLite state database."
+echo "hpc-alloc requires an authoritative config and SQLite state database."
 echo "Next: hpc-alloc setup --netid YOUR_NETID"
-echo "      (use --force only to replace an existing config; v1 state is not imported)"
+echo "      (use --force only to replace an existing config)"
