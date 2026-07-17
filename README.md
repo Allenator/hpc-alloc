@@ -279,3 +279,7 @@ Prefer `hpc-alloc run -G TYPE:N -- ...` for GPU work so the GPU is held only whi
 ```
 
 The suite is offline and uses strict Python test doubles and framed-protocol fixtures. It covers configuration validation, SQLite permissions and transactions, concurrent mutation invariants, exact ownership, ambiguous submit/cancel recovery, SSH/Slurm failure classification, lifecycle traces, requeue-aware streaming, multi-cluster selectors, status identity-graph behavior, tracked-only package delivery, and documentation formatting. Release validation must use a Git-index or committed clean-tree export; green tests in a dirty workspace do not prove that newly created package files are included. The suite does not require a cluster, VPN, credentials, or network access.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
