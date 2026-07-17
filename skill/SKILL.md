@@ -30,6 +30,14 @@ Interpret exit 3 from stderr and command context rather than assuming the VPN is
 
 Treat a host-key change as a hard stop until the user verifies the new key through a trusted YCRC channel.
 
+## Expect a sandboxed environment
+
+Every cluster-touching command needs network access, and `setup`, `connect`, and each journaled mutation write durable state outside the working directory, under `~/.config/hpc-alloc/` and `~/.ssh/`. Where the environment restricts the network or confines writes to the workspace, secure that access before dispatching a mutation instead of meeting the limit mid-submit.
+
+Scope any standing approval to the read-only verbs — `status`, `config`, `avail`, `partitions`, `why`, and `logs` — rather than to the bare `hpc-alloc` command. A blanket `hpc-alloc` approval also covers `run` and `ssh`, which execute arbitrary remote commands, and `sync --delete`, `cancel`, and `down --all`, which destroy work; it silently retires the confirmation this skill requires before releasing anything. Let every mutating verb prompt each time.
+
+After a denial, kill, or interrupted mutation, establish what happened from the durable journal rather than from what the command printed. Run `hpc-alloc status` and reconcile every unresolved operation it lists with its printed `hpc-alloc recover OPERATION_ID`. A killed process prints nothing, so silence is never evidence: the operation is journaled before the remote submit is entered, which makes its absence from the journal — not the absence of output — the only proof that nothing was submitted.
+
 ## Apply non-negotiable safety rules
 
 - Never run heavy computation on a login node.
@@ -39,7 +47,7 @@ Treat a host-key change as a hard stop until the user verifies the new key throu
 - Never edit or query `~/.config/hpc-alloc/state.db` to bypass the CLI, and never delete or copy one live SQLite sidecar in isolation.
 - Never infer finality from one queue absence, one scheduler-terminal row, a transport failure, or an unavailable secondary cluster.
 - Never cancel a `discovered` or `other-machine` row merely because it resembles an owned job; treat it as evidence and obtain explicit direction.
-- Assume an ordinary read or follow failure leaves remote work unchanged; treat a transport loss around submit or cancellation as an unknown remote outcome requiring the journal workflow.
+- Assume an ordinary read or follow failure leaves remote work unchanged; treat a transport loss, sandbox denial, or killed command around submit or cancellation as an unknown remote outcome requiring the journal workflow.
 - Preserve walltime-sensitive outputs before the hard deadline; Slurm walltime cannot be extended.
 
 ## Use resources deliberately

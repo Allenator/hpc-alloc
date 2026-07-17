@@ -5,6 +5,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -53,13 +54,43 @@ class InstallerDeliveryTests(unittest.TestCase):
         return installer
 
     @staticmethod
+    def isolated_path(root: Path) -> str:
+        """Build a PATH carrying a supported python3 but no harness launcher.
+
+        Skill targets are detected with `command -v claude|codex`, so a
+        developer machine with either installed would otherwise mask every
+        undetected-harness path under test.
+        """
+
+        bin_dir = root / "isolated-bin"
+        bin_dir.mkdir(exist_ok=True)
+        python = bin_dir / "python3"
+        if not python.exists():
+            python.symlink_to(sys.executable)
+        return os.pathsep.join([str(bin_dir), "/usr/bin", "/bin"])
+
+    @staticmethod
     def run_installer(
-        installer: Path, *, cwd: Path, home: Path
+        installer: Path,
+        *,
+        cwd: Path,
+        home: Path,
+        args: tuple[str, ...] = (),
+        path: str | None = None,
+        codex_home: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        environment = {**os.environ, "HOME": str(home)}
+        # An inherited CODEX_HOME would silently relocate the Codex skill away
+        # from the temporary home every assertion is written against.
+        environment.pop("CODEX_HOME", None)
+        if path is not None:
+            environment["PATH"] = path
+        if codex_home is not None:
+            environment["CODEX_HOME"] = str(codex_home)
         return subprocess.run(
-            ["bash", str(installer)],
+            ["bash", str(installer), *args],
             cwd=cwd,
-            env={**os.environ, "HOME": str(home)},
+            env=environment,
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -72,36 +103,46 @@ class InstallerDeliveryTests(unittest.TestCase):
             raise AssertionError("installer created ~/.local before validation completed")
         if home.joinpath(".claude").exists():
             raise AssertionError("installer created ~/.claude before validation completed")
+        if home.joinpath(".codex").exists():
+            raise AssertionError("installer created ~/.codex before validation completed")
 
     def test_existing_real_skill_directory_is_replaced_not_nested(self) -> None:
         """`ln -sfn SRC DIR` descends into an existing real directory.
 
         It creates DIR/skill *inside* it rather than replacing it, so SKILL.md
-        lands at hpc-alloc/skill/SKILL.md, Claude Code never loads the skill --
-        and the installer still prints "linked" and exits 0.
+        lands at hpc-alloc/skill/SKILL.md, the harness never loads the skill --
+        and the installer still prints "linked" and exits 0.  Every harness is
+        linked through one helper, so each one is held to the guard.
         """
 
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            home = root / "home"
-            source = root / "source"
-            installer = self.copy_complete_source(source)
+        for harness_dir, flag in ((".claude", "--claude"), (".codex", "--codex")):
+            with self.subTest(harness=flag), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                home = root / "home"
+                source = root / "source"
+                installer = self.copy_complete_source(source)
 
-            stale = home / ".claude" / "skills" / "hpc-alloc"
-            stale.mkdir(parents=True)
-            stale.joinpath("SKILL.md").write_text("a stale copied skill\n")
+                stale = home / harness_dir / "skills" / "hpc-alloc"
+                stale.mkdir(parents=True)
+                stale.joinpath("SKILL.md").write_text("a stale copied skill\n")
 
-            result = self.run_installer(installer, cwd=source, home=home)
-            self.assertEqual(result.returncode, 0, result.stderr)
+                result = self.run_installer(
+                    installer,
+                    cwd=source,
+                    home=home,
+                    args=(flag,),
+                    path=self.isolated_path(root),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
 
-            link = home / ".claude" / "skills" / "hpc-alloc"
-            self.assertTrue(link.is_symlink(), "a real directory survived the install")
-            self.assertEqual(link.resolve(), (source / "skill").resolve())
-            self.assertTrue(link.joinpath("SKILL.md").exists())
-            self.assertFalse(
-                link.joinpath("skill").exists(),
-                "installer nested the link inside the existing directory",
-            )
+                link = home / harness_dir / "skills" / "hpc-alloc"
+                self.assertTrue(link.is_symlink(), "a real directory survived the install")
+                self.assertEqual(link.resolve(), (source / "skill").resolve())
+                self.assertTrue(link.joinpath("SKILL.md").exists())
+                self.assertFalse(
+                    link.joinpath("skill").exists(),
+                    "installer nested the link inside the existing directory",
+                )
 
     def test_incomplete_source_fails_before_creating_delivery_links(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -226,7 +267,83 @@ class InstallerDeliveryTests(unittest.TestCase):
                 self.assertIn("hpc-alloc installation is incomplete:", result.stderr)
                 self.assert_no_delivery(home)
 
+    def assert_skill_package_delivered(self, installed_skill: Path, source: Path) -> None:
+        self.assertEqual(installed_skill.resolve(), source.joinpath("skill").resolve())
+        for relative_path in REQUIRED_SKILL_FILES:
+            skill_relative_path = Path(relative_path).relative_to("skill")
+            with self.subTest(relative_path=relative_path):
+                self.assertEqual(
+                    installed_skill.joinpath(skill_relative_path).read_bytes(),
+                    source.joinpath(relative_path).read_bytes(),
+                )
+
     def test_complete_source_is_linked_after_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "complete-source"
+            home = root / "home"
+            home.joinpath(".claude").mkdir(parents=True)
+            installer = self.copy_complete_source(source)
+
+            result = self.run_installer(
+                installer, cwd=root, home=home, path=self.isolated_path(root)
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                home.joinpath(".local", "bin", "hpc-alloc").resolve(),
+                source.joinpath("hpc-alloc").resolve(),
+            )
+            self.assert_skill_package_delivered(
+                home.joinpath(".claude", "skills", "hpc-alloc"), source
+            )
+            self.assertFalse(
+                home.joinpath(".codex").exists(),
+                "installer delivered a skill to an undetected harness",
+            )
+
+    def test_detected_codex_home_receives_the_same_skill_package(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "complete-source"
+            home = root / "home"
+            home.joinpath(".codex").mkdir(parents=True)
+            installer = self.copy_complete_source(source)
+
+            result = self.run_installer(
+                installer, cwd=root, home=home, path=self.isolated_path(root)
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assert_skill_package_delivered(
+                home.joinpath(".codex", "skills", "hpc-alloc"), source
+            )
+            self.assertFalse(
+                home.joinpath(".claude").exists(),
+                "installer delivered a skill to an undetected harness",
+            )
+
+    def test_every_detected_harness_shares_one_skill_package(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "complete-source"
+            home = root / "home"
+            home.joinpath(".claude").mkdir(parents=True)
+            home.joinpath(".codex").mkdir(parents=True)
+            installer = self.copy_complete_source(source)
+
+            result = self.run_installer(
+                installer, cwd=root, home=home, path=self.isolated_path(root)
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for harness_dir in (".claude", ".codex"):
+                with self.subTest(harness=harness_dir):
+                    self.assert_skill_package_delivered(
+                        home.joinpath(harness_dir, "skills", "hpc-alloc"), source
+                    )
+
+    def test_explicit_target_installs_for_an_undetected_harness(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "complete-source"
@@ -234,25 +351,87 @@ class InstallerDeliveryTests(unittest.TestCase):
             home.mkdir()
             installer = self.copy_complete_source(source)
 
-            result = self.run_installer(installer, cwd=root, home=home)
+            result = self.run_installer(
+                installer,
+                cwd=root,
+                home=home,
+                args=("--codex",),
+                path=self.isolated_path(root),
+            )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(
-                home.joinpath(".local", "bin", "hpc-alloc").resolve(),
-                source.joinpath("hpc-alloc").resolve(),
+            self.assert_skill_package_delivered(
+                home.joinpath(".codex", "skills", "hpc-alloc"), source
             )
-            self.assertEqual(
-                home.joinpath(".claude", "skills", "hpc-alloc").resolve(),
-                source.joinpath("skill").resolve(),
+            self.assertFalse(
+                home.joinpath(".claude").exists(),
+                "an explicit target installed for a harness it did not name",
             )
-            installed_skill = home.joinpath(".claude", "skills", "hpc-alloc")
-            for relative_path in REQUIRED_SKILL_FILES:
-                skill_relative_path = Path(relative_path).relative_to("skill")
-                with self.subTest(relative_path=relative_path):
-                    self.assertEqual(
-                        installed_skill.joinpath(skill_relative_path).read_bytes(),
-                        source.joinpath(relative_path).read_bytes(),
-                    )
+
+    def test_codex_home_relocates_the_codex_skill(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "complete-source"
+            home = root / "home"
+            home.mkdir()
+            relocated = root / "codex-home"
+            relocated.mkdir()
+            installer = self.copy_complete_source(source)
+
+            result = self.run_installer(
+                installer,
+                cwd=root,
+                home=home,
+                path=self.isolated_path(root),
+                codex_home=relocated,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assert_skill_package_delivered(
+                relocated.joinpath("skills", "hpc-alloc"), source
+            )
+            self.assertFalse(
+                home.joinpath(".codex").exists(),
+                "installer used the default Codex home despite CODEX_HOME",
+            )
+
+    def test_no_detected_harness_fails_before_creating_delivery_links(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "complete-source"
+            home = root / "home"
+            home.mkdir()
+            installer = self.copy_complete_source(source)
+
+            result = self.run_installer(
+                installer, cwd=root, home=home, path=self.isolated_path(root)
+            )
+
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("found no agent harness", result.stderr)
+            self.assert_no_delivery(home)
+
+    def test_unknown_option_is_rejected_before_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "complete-source"
+            home = root / "home"
+            home.mkdir()
+            installer = self.copy_complete_source(source)
+
+            result = self.run_installer(
+                installer,
+                cwd=root,
+                home=home,
+                args=("--codexx",),
+                path=self.isolated_path(root),
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("unknown option: --codexx", result.stderr)
+            self.assert_no_delivery(home)
 
 
 if __name__ == "__main__":
