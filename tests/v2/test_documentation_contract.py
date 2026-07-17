@@ -47,13 +47,20 @@ from hpc_alloc.cli import build_parser
 from hpc_alloc.commands import _assessment_payload
 from hpc_alloc.lifecycle import (
     _ACTIVE,
+    AssessmentPhase,
     _CANCELLATION_DRAINING,
     _QUEUED,
     _REQUEUEING,
     _STARTED_INACTIVE,
     REQUEUE_ELIGIBLE_FINAL,
 )
-from hpc_alloc.models import FinalSource, JobKind, OperationKind, OperationPhase
+from hpc_alloc.models import (
+    FinalSource,
+    JobKind,
+    JobPhase,
+    OperationKind,
+    OperationPhase,
+)
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -199,6 +206,27 @@ class JsonContractTests(unittest.TestCase):
             self.assert_documented(
                 member.value,
                 f"OperationPhase.{member.name} is never named in the JSON contract",
+            )
+
+    def test_every_job_phase_value_is_documented(self) -> None:
+        """`jobs[].phase` draws on two enums and a literal, so pin the union.
+
+        commands.py:1269 emits an AssessmentPhase; :1333 emits the durable
+        JobPhase when a job has no acknowledged Slurm ID, which is how
+        `SUBMITTING` reaches the wire; :1338 and :1377 force the literal
+        "UNCERTAIN" for a cluster that could not be scanned.  An earlier draft
+        of this file pinned only the enums it happened to import, and
+        `SUBMITTING` was consequently absent from both contracts -- the one
+        value that must never be read as "nothing was submitted".
+        """
+
+        domain = {m.value for m in AssessmentPhase} | {m.value for m in JobPhase}
+        self.assertIn("SUBMITTING", domain, "sanity: the durable phase reaches jobs[]")
+        self.assertIn("UNCERTAIN", domain, "sanity: the forced literal is in the union")
+        for value in sorted(domain):
+            self.assert_documented(
+                value,
+                f"jobs[].phase can be {value!r}; the JSON contract never names it",
             )
 
     def test_avail_for_probe_keys_are_documented(self) -> None:
